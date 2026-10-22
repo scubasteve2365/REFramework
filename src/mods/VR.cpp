@@ -61,6 +61,10 @@
 #include "ManualFlashlight.hpp"
 //#include "TemporalUpscaler.hpp"
 #include "VR.hpp"
+
+#if defined(PRAGMATA)
+#include "vr/PragmataHud.hpp"
+#endif
 #include <MinHook.h>
 
 bool inside_on_end = false;
@@ -318,6 +322,50 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
     if (vr->m_in_lightshaft) {
         //return original_func(camera, result);
     }
+
+#if defined(PRAGMATA)
+    // PragmataVR: per-panel zoom/offset and eye selection for Pragmata's 3D HUD (pragmatavr_hud.ini).
+    {
+        const auto tune = pragmatavr::HudTuning::get().tune();
+
+        if (tune->enabled) {
+            bool left = (vr->m_frame_count % 2) == vr->m_left_eye_interval;
+
+            switch (tune->eye_mode) {
+            case pragmatavr::EyeMode::Swapped: left = !left; break;
+            case pragmatavr::EyeMode::Left: left = true; break;
+            case pragmatavr::EyeMode::Right: left = false; break;
+            default: break;
+            }
+
+            Matrix4x4f m{};
+            {
+                std::shared_lock _{vr->get_runtime()->eyes_mtx};
+                m = vr->get_runtime()->projections[(uint32_t)(left ? VRRuntime::Eye::LEFT : VRRuntime::Eye::RIGHT)];
+            }
+
+            float zoom = tune->zoom;
+            float x = 0.0f;
+            float y = 0.0f;
+
+            if (const auto it = tune->elements.find(pragmatavr::g_current_gui_hash); it != tune->elements.end()) {
+                zoom *= it->second.zoom;
+                x = it->second.x;
+                y = it->second.y;
+            }
+
+            x += left ? tune->depth_shift : -tune->depth_shift;
+            pragmatavr::adjust_projection(m, zoom, x, y);
+
+            if (tune->log_elements) {
+                pragmatavr::HudTuning::get().note_element(pragmatavr::g_current_gui_hash, pragmatavr::g_current_gui_name);
+            }
+
+            *result = m;
+            return result;
+        }
+    }
+#endif
 
     // Get the projection matrix for the correct eye
     // For some reason we need to flip the projection matrix here?
@@ -3382,6 +3430,11 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         const auto name = utility::re_game_object::get_name(game_object);
         const auto name_hash = utility::hash(name);
 
+#if defined(PRAGMATA)
+        pragmatavr::g_current_gui_hash = name_hash;
+        pragmatavr::g_current_gui_name = name;
+#endif
+
         switch (name_hash) {
         // Don't mess with this, causes weird black boxes on the sides of the screen
         case "GUI_PillarBox"_fnv:
@@ -3899,6 +3952,10 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 }
 
 void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) {
+#if defined(PRAGMATA)
+    pragmatavr::g_current_gui_hash = 0;
+    pragmatavr::g_current_gui_name.clear();
+#endif
     
 
     //spdlog::info("VR: on_gui_draw_element");
