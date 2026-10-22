@@ -1789,9 +1789,59 @@ std::optional<std::string> VR::hijack_camera() {
         
         // Pattern scan for the native function call
         auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
+        size_t call_displacement_offset = 4;
+
+#if defined(PRAGMATA)
+        // PragmataVR: Pragmata's GUICamera.get_ProjectionMatrix is a small wrapper that moves the
+        // camera from R8 to RCX with the "4C 89 C1" encoding of mov rcx, r8, so the stock
+        // "49 8B C8 E8" scan never matches and the GUI camera keeps the flat-screen projection.
+        // That leaves Pragmata's 3D HUD panels (hacking panel, health, weapon wheel, tutorials)
+        // far out at the edges of each eye. Based on the TokyoTKO/WinterWolf V18 fix, made
+        // tolerant of small layout changes after game patches.
+        {
+            std::string bytes{};
+            const auto code = reinterpret_cast<const uint8_t*>(func);
+            for (size_t i = 0; i < 0x40; ++i) {
+                bytes += fmt::format("{:02x}", code[i]);
+            }
+            spdlog::info("[PragmataVR] GUICamera wrapper bytes: {}", bytes);
+        }
+
+        if (!ref) {
+            // Exact wrapper seen on the 2026-09 build: push rsi; sub rsp,20; mov rsi,rcx;
+            // mov rcx,r8; mov rdx,rsi; call native; mov rax,rsi; add rsp,20; pop rsi; ret
+            auto exact = utility::scan((uintptr_t)func, 0x20,
+                "56 48 83 EC 20 48 89 CE 4C 89 C1 48 89 F2 E8 ? ? ? ? 48 89 F0 48 83 C4 20 5E C3");
+
+            if (exact && *exact == (uintptr_t)func) {
+                ref = exact;
+                call_displacement_offset = 15;
+                spdlog::info("[PragmataVR] GUICamera wrapper matched exact pattern");
+            } else {
+                // Looser fallback: "mov rcx, r8" (4C 89 C1) followed within 16 bytes by a call.
+                auto mov = utility::scan((uintptr_t)func, 0x40, "4C 89 C1");
+
+                if (mov) {
+                    for (uintptr_t p = *mov + 3; p < *mov + 3 + 16; ++p) {
+                        if (*reinterpret_cast<const uint8_t*>(p) == 0xE8) {
+                            ref = p;
+                            call_displacement_offset = 1;
+                            spdlog::info("[PragmataVR] GUICamera wrapper matched loose pattern, call at +0x{:x}", p - (uintptr_t)func);
+                            break;
+                        }
+                    }
+                }
+
+                if (!ref) {
+                    spdlog::error("[PragmataVR] GUICamera wrapper not recognized; GUI projection left unhooked");
+                }
+            }
+        }
+#endif
 
         if (ref) {
-            auto native_func = utility::calculate_absolute(*ref + 4);
+            auto native_func = utility::calculate_absolute(*ref + call_displacement_offset);
+            spdlog::info("[VR] GUICamera native projection target: {:x}", native_func);
 
             if (native_func != get_projection_matrix) {
                 // Hook the native function
@@ -1799,6 +1849,8 @@ std::optional<std::string> VR::hijack_camera() {
 
                 if (g_projection_matrix_hook2->create()) {
                     spdlog::info("Hooked via.gui.GUICamera.get_ProjectionMatrix");
+                } else {
+                    spdlog::error("[VR] Failed to hook via.gui.GUICamera.get_ProjectionMatrix native target");
                 }
             } else {
                 spdlog::info("Did not hook via.gui.GUICamera.get_ProjectionMatrix, same as via.Camera.get_ProjectionMatrix");
