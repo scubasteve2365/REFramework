@@ -3,26 +3,70 @@ on:
   push:
     branches: [pragmatavr]
   workflow_dispatch:
+permissions:
+  contents: write
 env:
   BUILD_TYPE: Release
 jobs:
   build-pragmata:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           submodules: recursive
 
+      - name: Report toolchain
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -format json | ConvertFrom-Json
+          foreach ($v in $vs) { Write-Output "::notice::VS found: $($v.displayName) $($v.installationVersion) at $($v.installationPath)" }
+          Write-Output "::notice::$(cmake --version | Select-Object -First 1)"
+          Write-Output "::notice::$((cmake --help | Select-String 'Visual Studio') -join ' | ')"
+
       - name: Configure CMake
-        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+        run: |
+          $gens = @("Visual Studio 17 2022", "Visual Studio 18 2026")
+          $ok = $false
+          foreach ($g in $gens) {
+            if (Test-Path build) { Remove-Item -Recurse -Force build }
+            cmake -S . -B build -G "$g" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" *>&1 | Tee-Object -FilePath configure.log
+            if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Output "::notice::Configured with $g"; break }
+            Write-Output "::warning::Configure failed with generator $g"
+            Get-Content configure.log | Select-String -Pattern 'Error|error|not find|Could not|failed' | Select-Object -First 15 | ForEach-Object { Write-Output "::warning::$($_.Line)" }
+          }
+          if (-not $ok) { exit 1 }
 
       - name: Build
-        run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target PRAGMATA
+        run: |
+          cmake --build build --config ${{env.BUILD_TYPE}} --target PRAGMATA *>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build.log | Select-String -Pattern ': error|fatal error|error C|error LNK|error MSB' | Select-Object -First 25 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+            exit 1
+          }
 
       - name: Upload dinput8.dll
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: PRAGMATA-dinput8
-          path: ${{github.workspace}}/build/bin/PRAGMATA/dinput8.dll
+          path: build/bin/PRAGMATA/dinput8.dll
           if-no-files-found: error
+
+      - name: Publish dinput8.dll to the pragmatavr-builds branch
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $dir = "$env:RUNNER_TEMP\out"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item build/bin/PRAGMATA/dinput8.dll "$dir\dinput8.dll"
+          Set-Content -Path "$dir\BUILD.txt" -Value "source commit ${{ github.sha }}`nrun ${{ github.run_id }}`n$(Get-FileHash "$dir\dinput8.dll" -Algorithm SHA256 | Select-Object -ExpandProperty Hash)"
+          Set-Location $dir
+          git init -q
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout -q -b pragmatavr-builds
+          git add -A
+          git commit -q -m "PRAGMATA dinput8.dll from $sha"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" pragmatavr-builds
+          Write-Output "::notice::Published dinput8.dll from $sha"
