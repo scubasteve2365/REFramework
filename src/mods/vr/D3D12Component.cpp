@@ -107,43 +107,61 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
     const float src_w = (float)(src.right - src.left);
     const float src_h = (float)(src.bottom - src.top);
 
-    // Destination: centered on this eye's forward direction, menu_width of the eye image wide.
+    // Destination: a panel fixed in the room where the menu was opened (menu distance / width / up-down settings),
+    // seen from this eye's real pose. The panel's center and its right / up edges are projected into this eye, and
+    // the menu is drawn as a rectangle with that size and roll, so it stays put when the head turns, tilts or moves.
     Matrix4x4f proj{};
     {
         std::shared_lock _{vr->get_runtime()->eyes_mtx};
         proj = vr->get_runtime()->projections[left ? 0 : 1];
     }
 
-    // Menu direction in head space: straight ahead, or the room anchor when the HUD is fixed in the room.
-    const glm::vec4 dir = hud.lock_rotation() * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
-    const glm::vec4 clip = proj * dir;
-    if (clip.w <= 1e-4f) {
-        return; // the menu's spot in the room is behind the viewer
+    const auto st = hud.head_state();
+    if (!st.valid) {
+        return;
     }
 
-    const float cx_ndc = clip.x / clip.w;
-    const float cy_ndc = clip.y / clip.w;
-    if (std::fabs(cx_ndc) > 1.6f || std::fabs(cy_ndc) > 1.6f) {
-        return; // well outside this eye's view
-    }
+    const float menu_dist = tune->menu[pragmatavr::MenuDistance];
+    const float half_w = tune->menu[pragmatavr::MenuWidth] * 0.5f;
+    const float half_h = half_w * (src_h / src_w);
+    const auto plane = pragmatavr::make_plane(st.menu, 0.0f, tune->menu[pragmatavr::MenuPitch], menu_dist, half_w, half_h);
+    const glm::mat4 view_proj = glm::mat4{proj} * pragmatavr::eye_view(st.head, vr->get_eye_transform(left ? 0 : 1));
 
     const float bb_w = (float)bb_desc.Width;
     const float bb_h = (float)bb_desc.Height;
-    const float cx = (cx_ndc + 1.0f) * 0.5f * bb_w;
-    const float cy = (1.0f - cy_ndc) * 0.5f * bb_h;
 
-    float dst_w = tune->menu_width * bb_w;
-    float dst_h = dst_w * (src_h / src_w);
-    if (dst_h > bb_h * 0.85f) {
-        dst_h = bb_h * 0.85f;
-        dst_w = dst_h * (src_w / src_h);
+    bool visible = true;
+    const auto to_screen = [&](const glm::vec3& p) {
+        const glm::vec4 c = view_proj * glm::vec4{p, 1.0f};
+        if (c.w <= 1e-4f) {
+            visible = false;
+            return glm::vec2{0.0f};
+        }
+        return glm::vec2{(c.x / c.w + 1.0f) * 0.5f * bb_w, (1.0f - c.y / c.w) * 0.5f * bb_h};
+    };
+
+    const glm::vec2 c = to_screen(plane.center);
+    const glm::vec2 r0 = to_screen(plane.center - plane.right);
+    const glm::vec2 r1 = to_screen(plane.center + plane.right);
+    const glm::vec2 u0 = to_screen(plane.center - plane.up);
+    const glm::vec2 u1 = to_screen(plane.center + plane.up);
+    if (!visible) {
+        return; // the menu's spot in the room is behind this eye
     }
 
-    RECT dst{};
-    dst.left = (LONG)(cx - dst_w * 0.5f);
-    dst.top = (LONG)(cy - dst_h * 0.5f);
-    dst.right = (LONG)(cx + dst_w * 0.5f);
-    dst.bottom = (LONG)(cy + dst_h * 0.5f);
+    if (c.x < -bb_w || c.x > bb_w * 2.0f || c.y < -bb_h || c.y > bb_h * 2.0f) {
+        return; // well outside this eye's view
+    }
+
+    const glm::vec2 across = r1 - r0;
+    const glm::vec2 down = u0 - u1; // screen y grows downward
+    const float dst_w = glm::length(across);
+    const float dst_h = glm::length(down);
+    if (dst_w < 1.0f || dst_h < 1.0f) {
+        return;
+    }
+
+    const float roll = std::atan2(across.y, across.x);
 
     m.cmds.wait(INFINITE);
     auto cl = m.cmds.cmd_list.Get();
@@ -174,7 +192,9 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
 
     m.batch->SetViewport(viewport);
     m.batch->Begin(cl, DirectX::DX12::SpriteSortMode::SpriteSortMode_Immediate);
-    m.batch->Draw(m.imgui_ctx.get_srv_gpu(), DirectX::XMUINT2{(uint32_t)rt_desc.Width, (uint32_t)rt_desc.Height}, dst, &src, DirectX::Colors::White);
+    m.batch->Draw(m.imgui_ctx.get_srv_gpu(), DirectX::XMUINT2{(uint32_t)rt_desc.Width, (uint32_t)rt_desc.Height},
+        DirectX::XMFLOAT2{c.x, c.y}, &src, DirectX::Colors::White, roll,
+        DirectX::XMFLOAT2{src_w * 0.5f, src_h * 0.5f}, DirectX::XMFLOAT2{dst_w / src_w, dst_h / src_h});
     m.batch->End();
 
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

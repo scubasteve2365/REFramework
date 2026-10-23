@@ -343,7 +343,11 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
             const auto eye_to_head = vr->get_eye_transform(left ? 0 : 1);
             Matrix4x4f m{};
 
-            if (pragmatavr::screen_projection(m, flat, eye_proj, eye_to_head, pragmatavr::HudTuning::get().lock_rotation(), *tune)) {
+            const auto st = pragmatavr::HudTuning::get().head_state();
+            const auto view = pragmatavr::eye_view(st.head, eye_to_head);
+            const auto plane = pragmatavr::hud_plane(*tune, st.hud, flat);
+
+            if (st.valid && pragmatavr::screen_projection(m, flat, eye_proj, view, plane)) {
                 *result = m;
             } else {
                 *result = Matrix4x4f{0.0f}; // the virtual screen is behind this eye: draw nothing
@@ -3340,7 +3344,8 @@ void VR::on_present() {
     pragmatavr::HudTuning::get().poll_keys();
     pragmatavr::HudTuning::get().poll_pad();
     if (is_hmd_active()) {
-        pragmatavr::HudTuning::get().update_head(get_rotation(0));
+        const auto hmd_pos = get_position(0);
+        pragmatavr::HudTuning::get().update_head(get_rotation(0), glm::vec3{hmd_pos.x, hmd_pos.y, hmd_pos.z});
     }
 #endif
     

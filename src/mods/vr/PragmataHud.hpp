@@ -91,7 +91,6 @@ struct HudTune {
     float y_sign{1.0f};
     bool log_elements{true};
     bool hack_locked{true};
-    float menu_width{0.42f}; // menu width as a fraction of the eye image width
     bool hud_fixed{true};    // 3D HUD panels and the menu stay fixed in the room instead of following the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
@@ -101,6 +100,10 @@ struct HudTune {
     int layout_mode{1};
     std::array<float, 4> screen{70.0f, 2.0f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
     std::array<bool, 4> screen_invert{};
+
+    // Mod menu placement: a panel fixed in the room where it was opened.
+    std::array<float, 3> menu{2.5f, 1.1f, -5.0f}; // distance (m), width (m), up/down (deg)
+    std::array<bool, 3> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
 
     HudTune() {
@@ -162,10 +165,23 @@ inline constexpr std::array<float, 4> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f};
 inline constexpr std::array<float, 4> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f};
 inline constexpr std::array<float, 4> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f};
 
+inline constexpr int GROUP_MENU = 101;
+enum MenuField : int {
+    MenuDistance = 0,
+    MenuWidth = 1,
+    MenuPitch = 2,
+};
+inline constexpr std::array<const char*, 3> MENU_KEYS{"distance", "width", "pitch"};
+inline constexpr std::array<float, 3> MENU_MIN{0.8f, 0.3f, -40.0f};
+inline constexpr std::array<float, 3> MENU_MAX{8.0f, 4.0f, 40.0f};
+inline constexpr std::array<float, 3> MENU_STEP{0.1f, 0.05f, 1.0f};
+inline constexpr std::array<float, 3> MENU_STEP_BIG{0.5f, 0.25f, 5.0f};
+
 enum MenuAction : int {
     ActionNone = 0,
     ActionToggleLayout,
     ActionResetScreen,
+    ActionResetMenu,
     ActionToggleHudFixed,
     ActionRecenter,
     ActionToggleLockInvert,
@@ -304,12 +320,25 @@ public:
         if (pressed(XINPUT_GAMEPAD_B)) handle_key(VK_BACK, big);
     }
 
-    // ---- Fixed-in-room HUD ----
-    // update_head is called once per presented frame with the HMD rotation (rotation only).
-    // lock_rotation() is the view-space rotation that keeps the 3D HUD and the menu fixed relative to an
-    // anchor (the head's yaw when last recentered): head^-1 * anchor. Identity when the HUD follows the head.
+    // ---- Head tracking for the fixed HUD and the menu ----
+    // update_head is called once per presented frame with the HMD pose in tracking space.
+    // The game-screen HUD and the mod menu are real planes in tracking space (anchor pose + offsets), seen from each
+    // eye's actual pose, so they stay put when the head turns, tilts or moves.
     std::atomic<bool> recenter_requested{false};
     std::atomic<bool> recenter_if_far{false};
+    std::atomic<bool> menu_place_requested{false};
+
+    struct Pose {
+        glm::mat4 rot{1.0f};
+        glm::vec3 pos{0.0f};
+    };
+
+    struct HeadState {
+        Pose head{};
+        Pose hud{};
+        Pose menu{};
+        bool valid{false};
+    };
 
     static Matrix4x4f yaw_only(const Matrix4x4f& r) {
         const glm::vec4 f = r * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
@@ -317,31 +346,50 @@ public:
         return glm::rotate(glm::mat4{1.0f}, yaw, glm::vec3{0.0f, 1.0f, 0.0f});
     }
 
-    void update_head(const Matrix4x4f& hmd_rotation) {
-        Matrix4x4f hmd = hmd_rotation;
+    void update_head(const Matrix4x4f& hmd_rotation, const glm::vec3& hmd_position) {
+        glm::mat4 hmd = hmd_rotation;
         hmd[3] = glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
 
         std::scoped_lock _{m_head_mtx};
+        m_state.head = Pose{hmd, hmd_position};
 
         bool recenter = recenter_requested.exchange(false) || !m_anchor_valid;
 
         if (recenter_if_far.exchange(false) && m_anchor_valid) {
             const glm::vec4 head_fwd = yaw_only(hmd) * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
-            const glm::vec4 anchor_fwd = m_anchor * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
+            const glm::vec4 anchor_fwd = m_state.hud.rot * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
             if (glm::dot(glm::vec3{head_fwd}, glm::vec3{anchor_fwd}) < 0.7f) { // more than about 45 degrees away
                 recenter = true;
             }
         }
 
         if (recenter) {
-            m_anchor = yaw_only(hmd);
+            m_state.hud = Pose{yaw_only(hmd), hmd_position};
             m_anchor_valid = true;
             spdlog::info("[PragmataVR] HUD recentered");
         }
 
-        m_lock = glm::transpose(hmd) * m_anchor;
+        if (menu_place_requested.exchange(false) || !m_menu_valid) {
+            m_state.menu = Pose{yaw_only(hmd), hmd_position};
+            m_menu_valid = true;
+        }
+
+        m_state.valid = true;
+        m_lock = glm::transpose(hmd) * m_state.hud.rot; // per-panel layout (rotation only)
     }
 
+    // Current poses. When the HUD follows the head, its anchor is the head itself.
+    HeadState head_state() {
+        const auto t = tune();
+        std::scoped_lock _{m_head_mtx};
+        HeadState st = m_state;
+        if (!t->hud_fixed) {
+            st.hud = st.head;
+        }
+        return st;
+    }
+
+    // Per-panel layout only: view-space rotation head^-1 * anchor (identity when following the head).
     Matrix4x4f lock_rotation() {
         const auto t = tune();
         if (!t->hud_fixed) {
@@ -371,6 +419,15 @@ public:
 
     static std::filesystem::path data_dir() {
         return REFramework::get_persistent_dir("reframework/data");
+    }
+
+    static std::string format_menu(const HudTune& t, int field) {
+        switch (field) {
+        case MenuDistance: return fmt::format("{:.1f} m", t.menu[0]);
+        case MenuWidth: return fmt::format("{:.2f} m", t.menu[1]);
+        case MenuPitch: return fmt::format("{:+.0f} deg", t.menu[2]);
+        default: return {};
+        }
     }
 
     static std::string format_screen(const HudTune& t, int field) {
@@ -423,6 +480,12 @@ private:
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Left / right");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down");
         add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen to defaults");
+
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "Mod menu (fixed where it opens)");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Menu distance");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuWidth, ActionNone, "Menu size (width)");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Menu up / down");
+        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement");
 
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "View");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position");
@@ -487,7 +550,6 @@ private:
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += fmt::format("hack_locked={}\n", t.hack_locked ? 1 : 0);
-        s += fmt::format("menu_width={:.3f}\n", t.menu_width);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
@@ -497,6 +559,11 @@ private:
         for (int i = 0; i < 4; ++i) {
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
             s += fmt::format("screen.{}.invert={}\n", SCREEN_KEYS[i], t.screen_invert[i] ? 1 : 0);
+        }
+        s += "# menu.distance and menu.width in meters, menu.pitch in degrees.\n";
+        for (int i = 0; i < 3; ++i) {
+            s += fmt::format("menu.{}={:.2f}\n", MENU_KEYS[i], t.menu[i]);
+            s += fmt::format("menu.{}.invert={}\n", MENU_KEYS[i], t.menu_invert[i] ? 1 : 0);
         }
 
         for (int g = 0; g < GroupCount; ++g) {
@@ -608,7 +675,6 @@ private:
                 else if (key == "y_sign") t->y_sign = val < 0.0f ? -1.0f : 1.0f;
                 else if (key == "log_elements") t->log_elements = val != 0.0f;
                 else if (key == "hack_locked") t->hack_locked = val != 0.0f;
-                else if (key == "menu_width") t->menu_width = std::clamp(val, 0.15f, 0.9f);
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
@@ -621,6 +687,16 @@ private:
             const bool is_invert = rest.size() > 7 && rest.substr(rest.size() - 7) == ".invert";
             if (is_invert) {
                 rest = rest.substr(0, rest.size() - 7);
+            }
+
+            if (group_key == "menu") {
+                for (int i = 0; i < 3; ++i) {
+                    if (rest == MENU_KEYS[i]) {
+                        if (is_invert) t->menu_invert[i] = val != 0.0f;
+                        else t->menu[i] = std::clamp(val, MENU_MIN[i], MENU_MAX[i]);
+                    }
+                }
+                continue;
             }
 
             if (group_key == "screen") {
@@ -742,6 +818,7 @@ private:
                 block_pad_briefly();
             } else {
                 recenter_if_far = true;
+                menu_place_requested = true;
             }
             spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
             play_click(true);
@@ -782,6 +859,13 @@ private:
         if (vk == VK_RETURN) {
             switch (row.kind) {
             case MenuRow::Kind::Value: {
+                if (row.group == GROUP_MENU) {
+                    auto& minv = t->menu_invert[row.field];
+                    minv = !minv;
+                    commit(t);
+                    play_click(true);
+                    return;
+                }
                 if (row.group == GROUP_SCREEN) {
                     auto& inv = t->screen_invert[row.field];
                     inv = !inv;
@@ -831,7 +915,15 @@ private:
                 }
                 return;
             case MenuRow::Kind::Action:
-                if (row.action == ActionResetScreen) {
+                if (row.action == ActionResetMenu) {
+                    const auto inverts = t->menu_invert;
+                    t->menu = HudTune{}.menu;
+                    t->menu_invert = inverts;
+                    commit(t);
+                    menu_place_requested = true;
+                    spdlog::info("[PragmataVR] Menu: reset menu placement");
+                    play_click(true);
+                } else if (row.action == ActionResetScreen) {
                     const auto inverts = t->screen_invert;
                     t->screen = HudTune{}.screen;
                     t->screen_invert = inverts;
@@ -851,6 +943,7 @@ private:
                     play_click(true);
                 } else if (row.action == ActionRecenter) {
                     recenter_requested = true;
+                    menu_place_requested = true;
                     spdlog::info("[PragmataVR] Menu: recenter HUD");
                     play_click(true);
                 } else if (row.action == ActionSnapshot) {
@@ -867,6 +960,23 @@ private:
         }
 
         if ((vk != VK_LEFT && vk != VK_RIGHT) || row.kind != MenuRow::Kind::Value) {
+            return;
+        }
+
+        if (row.group == GROUP_MENU) {
+            int mdir = vk == VK_RIGHT ? 1 : -1;
+            if (t->menu_invert[row.field]) {
+                mdir = -mdir;
+            }
+            auto& v = t->menu[row.field];
+            const float nv = std::clamp(v + mdir * (shift ? MENU_STEP_BIG[row.field] : MENU_STEP[row.field]),
+                MENU_MIN[row.field], MENU_MAX[row.field]);
+            const bool mok = nv != v;
+            v = nv;
+            if (mok) {
+                commit(t);
+            }
+            play_click(mok);
             return;
         }
 
@@ -951,58 +1061,68 @@ private:
     std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
     std::vector<MenuRow> m_rows{};
     std::mutex m_head_mtx{};
-    Matrix4x4f m_anchor{1.0f};
+    HeadState m_state{};
     Matrix4x4f m_lock{1.0f};
     bool m_anchor_valid{false};
+    bool m_menu_valid{false};
     WORD m_pad_prev{0};
     int m_stick_prev{0};
     std::chrono::steady_clock::time_point m_last_chord{};
     std::atomic<std::chrono::steady_clock::time_point> m_block_pad_until{};
 };
 
-// Game-screen HUD: maps the game's flat GUI projection (NDC -1..1, its own 16:9 layout) onto a rectangle in the eye's
-// image. The rectangle is a virtual screen width_deg wide, distance meters away, at yaw/pitch from straight ahead,
-// rotated by `lock` (fixed-in-room anchor or identity), seen from this eye's pose (eye_to_head) with its projection.
-// Returns false if the screen's center is behind this eye.
-inline bool screen_projection(Matrix4x4f& out, const Matrix4x4f& flat, const Matrix4x4f& eye_proj, const Matrix4x4f& eye_to_head,
-    const Matrix4x4f& lock, const HudTune& t)
-{
-    const float yaw = glm::radians(t.screen[ScreenYaw]);
-    const float pitch = glm::radians(t.screen[ScreenPitch]);
-    const float dist = t.screen[ScreenDistance];
+// A flat panel in tracking space: center, and right/up vectors scaled to the panel's half width / half height.
+struct Plane {
+    glm::vec3 center{0.0f};
+    glm::vec3 right{0.0f};
+    glm::vec3 up{0.0f};
+};
 
-    const glm::mat4 aim = glm::rotate(glm::mat4{1.0f}, -yaw, glm::vec3{0.0f, 1.0f, 0.0f}) *
-                          glm::rotate(glm::mat4{1.0f}, pitch, glm::vec3{1.0f, 0.0f, 0.0f});
+// Panel `dist` meters from the anchor, turned yaw_deg right and pitch_deg up from the anchor's forward direction.
+inline Plane make_plane(const HudTuning::Pose& anchor, float yaw_deg, float pitch_deg, float dist, float half_w, float half_h) {
+    const glm::mat4 aim = glm::rotate(glm::mat4{1.0f}, -glm::radians(yaw_deg), glm::vec3{0.0f, 1.0f, 0.0f}) *
+                          glm::rotate(glm::mat4{1.0f}, glm::radians(pitch_deg), glm::vec3{1.0f, 0.0f, 0.0f});
+    const glm::mat4 r = anchor.rot * aim;
 
-    const glm::vec4 center_head = lock * (aim * glm::vec4{0.0f, 0.0f, -dist, 1.0f});
-    const glm::vec4 center_eye = glm::inverse(eye_to_head) * glm::vec4{glm::vec3{center_head}, 1.0f};
-    const glm::vec4 clip = eye_proj * center_eye;
+    Plane p{};
+    p.center = anchor.pos + glm::vec3{r * glm::vec4{0.0f, 0.0f, -dist, 0.0f}};
+    p.right = glm::vec3{r * glm::vec4{1.0f, 0.0f, 0.0f, 0.0f}} * half_w;
+    p.up = glm::vec3{r * glm::vec4{0.0f, 1.0f, 0.0f, 0.0f}} * half_h;
+    return p;
+}
 
-    if (clip.w <= 1e-4f) {
+// Tracking space -> this eye's view space.
+inline glm::mat4 eye_view(const HudTuning::Pose& head, const Matrix4x4f& eye_to_head) {
+    const glm::mat4 head_world = glm::translate(glm::mat4{1.0f}, head.pos) * head.rot;
+    return glm::inverse(head_world * glm::mat4{eye_to_head});
+}
+
+// Game-screen HUD: the game's flat GUI clip space (x, y in -1..1 over its own 16:9 layout) is mapped onto `plane`
+// and projected into this eye: point = center + right * (x/w) + up * (y/w). As a matrix on flat clip coordinates
+// that is B = [right, up, 0, center], so out = eye_proj * view * B * flat. Returns false if the panel's center is
+// behind this eye.
+inline bool screen_projection(Matrix4x4f& out, const Matrix4x4f& flat, const Matrix4x4f& eye_proj, const glm::mat4& view, const Plane& plane) {
+    const glm::vec4 c = eye_proj * view * glm::vec4{plane.center, 1.0f};
+    if (c.w <= 1e-4f) {
         return false;
     }
 
-    const float cx = clip.x / clip.w;
-    const float cy = clip.y / clip.w;
+    glm::mat4 B{0.0f};
+    B[0] = glm::vec4{plane.right, 0.0f};
+    B[1] = glm::vec4{plane.up, 0.0f};
+    B[2] = glm::vec4{0.0f};
+    B[3] = glm::vec4{plane.center, 1.0f};
 
-    // Physical half size of the virtual screen, in meters. Height follows the game's own aspect (flat[1][1] / flat[0][0]).
+    out = eye_proj * view * B * glm::mat4{flat};
+    return true;
+}
+
+// Game-screen HUD plane from the current settings and anchor.
+inline Plane hud_plane(const HudTune& t, const HudTuning::Pose& anchor, const Matrix4x4f& flat) {
+    const float dist = t.screen[ScreenDistance];
     const float half_w = dist * std::tan(glm::radians(t.screen[ScreenWidth]) * 0.5f);
     const float flat_aspect = flat[0][0] != 0.0f ? std::fabs(flat[1][1] / flat[0][0]) : (16.0f / 9.0f);
-    const float half_h = half_w / flat_aspect;
-
-    // NDC per meter at the screen's depth: d(x/w)/dx = P00 / w.
-    const float sx = half_w * eye_proj[0][0] / clip.w;
-    const float sy = half_h * eye_proj[1][1] / clip.w;
-
-    // T maps flat clip space to eye clip space: x' = sx*x + cx*w, y' = sy*y + cy*w; z and w unchanged.
-    glm::mat4 T{1.0f};
-    T[0][0] = sx;
-    T[1][1] = sy;
-    T[3][0] = cx;
-    T[3][1] = cy;
-
-    out = T * flat;
-    return true;
+    return make_plane(anchor, t.screen[ScreenYaw], t.screen[ScreenPitch], dist, half_w, half_w / flat_aspect);
 }
 
 inline void adjust_projection(Matrix4x4f& m, float zoom, float x, float y) {
