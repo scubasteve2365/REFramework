@@ -11,9 +11,11 @@
 // size, x/y position and a per-eye gap, applied to each panel's GUI view just before it draws and
 // restored right after (VR::on_pre_gui_draw_element / on_gui_draw_element).
 //
-// Values live in reframework/data/pragmatavr_hud.ini. The VR mod menu (F1) edits them in the headset:
-//   F1 open/close, Up/Down select, Left/Right change (hold Shift for big steps), Enter = toggle the
-//   invert box on value rows or run the action on button rows, Backspace = close.
+// Values live in reframework/data/pragmatavr_hud.ini. The VR mod menu edits them in the headset.
+//   Gamepad: click both thumbsticks = open/close, D-pad or left stick = move/change, RB held = big steps,
+//            A = invert box / action, B = close. The game does not see the pad while the menu is open
+//            (if it reads the pad through XInput, see pragmata_xinput_get_state in VR.cpp).
+//   Keyboard: F1 open/close, arrows, Shift = big steps, Enter, Backspace.
 // Pause = snapshot of both eye images. No other hotkeys.
 //
 // Menu drawing: VR::on_frame draws an ImGui window (ImGui frames render into REFramework's IMGUI
@@ -23,8 +25,10 @@
 // Included from VR.cpp (after its includes) and from vr/D3D12Component.cpp.
 
 #include <Windows.h>
+#include <Xinput.h>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -191,6 +195,86 @@ public:
         }
     }
 
+    // Gamepad menu input. get_state points at the real XInputGetState (the hook trampoline when the
+    // game's XInput is hooked), so the menu still sees the pad while the game is being fed zeros.
+    using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
+    std::atomic<XInputGetStateFn> xinput_get_state{nullptr};
+
+    // True while the game should not see the pad: menu open, and a short time after it closes so the
+    // closing press does not leak into the game.
+    bool should_block_pad() const {
+        if (menu_open.load()) {
+            return true;
+        }
+        return std::chrono::steady_clock::now() < m_block_pad_until.load();
+    }
+
+    void poll_pad() {
+        auto get_state = xinput_get_state.load();
+        if (get_state == nullptr) {
+            return;
+        }
+
+        XINPUT_STATE st{};
+        bool have = false;
+        for (DWORD i = 0; i < 4; ++i) {
+            if (get_state(i, &st) == ERROR_SUCCESS) {
+                have = true;
+                break;
+            }
+        }
+
+        WORD buttons = 0;
+        float lx = 0.0f;
+        float ly = 0.0f;
+        if (have) {
+            buttons = st.Gamepad.wButtons;
+            lx = st.Gamepad.sThumbLX / 32767.0f;
+            ly = st.Gamepad.sThumbLY / 32767.0f;
+        }
+
+        const WORD prev = m_pad_prev;
+        m_pad_prev = buttons;
+        const auto pressed = [&](WORD b) { return (buttons & b) != 0 && (prev & b) == 0; };
+
+        // Left stick as a second D-pad: one step each time it is pushed past 60% and released.
+        int stick_dir = 0; // 1 up, 2 down, 3 left, 4 right
+        if (ly > 0.6f) stick_dir = 1;
+        else if (ly < -0.6f) stick_dir = 2;
+        else if (lx < -0.6f) stick_dir = 3;
+        else if (lx > 0.6f) stick_dir = 4;
+        const int prev_stick = m_stick_prev;
+        if (std::fabs(lx) < 0.3f && std::fabs(ly) < 0.3f) {
+            m_stick_prev = 0;
+        } else if (stick_dir != 0) {
+            m_stick_prev = stick_dir;
+        }
+        const bool stick_new = stick_dir != 0 && prev_stick == 0;
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool both_sticks = (buttons & XINPUT_GAMEPAD_LEFT_THUMB) && (buttons & XINPUT_GAMEPAD_RIGHT_THUMB);
+        const bool both_sticks_prev = (prev & XINPUT_GAMEPAD_LEFT_THUMB) && (prev & XINPUT_GAMEPAD_RIGHT_THUMB);
+
+        if (both_sticks && !both_sticks_prev && now - m_last_chord > std::chrono::milliseconds(300)) {
+            m_last_chord = now;
+            handle_key(VK_F1, false);
+            return;
+        }
+
+        if (!menu_open.load()) {
+            return;
+        }
+
+        const bool big = (buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+
+        if (pressed(XINPUT_GAMEPAD_DPAD_UP) || (stick_new && stick_dir == 1)) handle_key(VK_UP, big);
+        if (pressed(XINPUT_GAMEPAD_DPAD_DOWN) || (stick_new && stick_dir == 2)) handle_key(VK_DOWN, big);
+        if (pressed(XINPUT_GAMEPAD_DPAD_LEFT) || (stick_new && stick_dir == 3)) handle_key(VK_LEFT, big);
+        if (pressed(XINPUT_GAMEPAD_DPAD_RIGHT) || (stick_new && stick_dir == 4)) handle_key(VK_RIGHT, big);
+        if (pressed(XINPUT_GAMEPAD_A)) handle_key(VK_RETURN, big);
+        if (pressed(XINPUT_GAMEPAD_B)) handle_key(VK_BACK, big);
+    }
+
     // ---- Menu state, read by VR::on_frame (draw) and D3D12Component::on_frame (composite) ----
     std::atomic<bool> menu_open{false};
     std::atomic<int> menu_selected{0};
@@ -288,7 +372,7 @@ private:
     static std::string to_text(const HudTune& t) {
         std::string s{};
         s += "# PragmataVR 3D HUD tuning. Saved changes apply within about a second, no restart needed.\n";
-        s += "# The VR mod menu (F1) rewrites this file whenever a value changes.\n";
+        s += "# The VR mod menu (both thumbsticks or F1) rewrites this file whenever a value changes.\n";
         s += "# Menu: F1 open/close, Up/Down select, Left/Right change (Shift = big steps), Enter = invert box or action,\n";
         s += "#   Backspace close. Pause = snapshot of both eyes.\n";
         s += "# <group>.size / .x / .y / .gap: hack, vitals, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
@@ -488,6 +572,10 @@ private:
         }
     }
 
+    void block_pad_briefly() {
+        m_block_pad_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    }
+
     void request_snapshot() {
         if (snapshot_frames_left.load() > 0) {
             play_click(false);
@@ -525,6 +613,9 @@ private:
 
         if (vk == VK_F1) {
             menu_open = !menu_open.load();
+            if (!menu_open.load()) {
+                block_pad_briefly();
+            }
             spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
             play_click(true);
             return;
@@ -537,6 +628,7 @@ private:
         switch (vk) {
         case VK_BACK:
             menu_open = false;
+            block_pad_briefly();
             spdlog::info("[PragmataVR] Menu closed");
             play_click(true);
             return;
@@ -598,6 +690,7 @@ private:
                     request_snapshot();
                 } else if (row.action == ActionClose) {
                     menu_open = false;
+                    block_pad_briefly();
                     play_click(true);
                 }
                 return;
@@ -671,6 +764,10 @@ private:
     std::array<bool, KEYS.size()> m_key_down{};
     std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
     std::vector<MenuRow> m_rows{};
+    WORD m_pad_prev{0};
+    int m_stick_prev{0};
+    std::chrono::steady_clock::time_point m_last_chord{};
+    std::atomic<std::chrono::steady_clock::time_point> m_block_pad_until{};
 };
 
 inline void adjust_projection(Matrix4x4f& m, float zoom, float x, float y) {

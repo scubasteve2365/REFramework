@@ -3121,6 +3121,64 @@ void VR::update_camera_data(int frame_count) {
 }
 
 #if defined(PRAGMATA)
+// PragmataVR: hide the gamepad from the game while the HUD menu is open (XInput games only).
+namespace {
+std::unique_ptr<FunctionHook> g_pragmata_xinput_hook{};
+std::atomic<uint64_t> g_pragmata_xinput_game_calls{0};
+
+DWORD WINAPI pragmata_xinput_get_state(DWORD index, XINPUT_STATE* state) {
+    auto original = g_pragmata_xinput_hook->get_original<decltype(pragmata_xinput_get_state)>();
+    const auto result = original(index, state);
+    g_pragmata_xinput_game_calls++;
+
+    if (result == ERROR_SUCCESS && state != nullptr && pragmatavr::HudTuning::get().should_block_pad()) {
+        state->Gamepad = XINPUT_GAMEPAD{};
+    }
+
+    return result;
+}
+
+void pragmata_setup_gamepad() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    auto& hud = pragmatavr::HudTuning::get();
+    HMODULE xinput = GetModuleHandleW(L"xinput1_4.dll");
+    if (xinput == nullptr) {
+        xinput = LoadLibraryW(L"xinput1_4.dll");
+    }
+
+    auto get_state = xinput != nullptr ? (pragmatavr::HudTuning::XInputGetStateFn)GetProcAddress(xinput, "XInputGetState") : nullptr;
+    if (get_state == nullptr) {
+        spdlog::error("[PragmataVR] XInputGetState not found; gamepad menu control unavailable");
+        return;
+    }
+
+    g_pragmata_xinput_hook = std::make_unique<FunctionHook>((uintptr_t)get_state, (uintptr_t)&pragmata_xinput_get_state);
+    if (g_pragmata_xinput_hook->create()) {
+        hud.xinput_get_state = g_pragmata_xinput_hook->get_original<decltype(pragmata_xinput_get_state)>();
+        spdlog::info("[PragmataVR] Hooked XInputGetState; the game will not see the pad while the HUD menu is open");
+    } else {
+        g_pragmata_xinput_hook.reset();
+        hud.xinput_get_state = get_state;
+        spdlog::warn("[PragmataVR] Could not hook XInputGetState; menu works but the game will also see menu button presses");
+    }
+}
+
+void pragmata_report_xinput_use() {
+    static auto start = std::chrono::steady_clock::now();
+    static bool reported = false;
+    if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(60)) {
+        reported = true;
+        spdlog::info("[PragmataVR] Game XInputGetState calls in the first minute: {}{}", g_pragmata_xinput_game_calls.load(),
+            g_pragmata_xinput_game_calls.load() == 0 ? " (game reads the pad another way; menu buttons will also reach the game)" : "");
+    }
+}
+} // namespace
+
 // PragmataVR: in-headset HUD menu. Drawn into REFramework's ImGui frame here; D3D12Component::on_frame
 // copies this window's rectangle into each eye image.
 void VR::on_frame() {
@@ -3157,8 +3215,9 @@ void VR::on_frame() {
         const ImVec4 selected_color{0.35f, 1.0f, 0.45f, 1.0f};
 
         ImGui::TextColored(title_color, "PRAGMATA VR  -  HUD MENU");
-        ImGui::TextColored(locked_color, "Up/Down select   Left/Right change (Shift = bigger steps)");
-        ImGui::TextColored(locked_color, "Enter = invert box / do action   F1 or Backspace = close");
+        ImGui::TextColored(locked_color, "D-pad Up/Down select   Left/Right change   hold RB = bigger steps");
+        ImGui::TextColored(locked_color, "A = invert box / do action   B or both sticks = close");
+        ImGui::TextColored(locked_color, "Keyboard: arrows, Shift, Enter, Backspace, F1");
         ImGui::Separator();
 
         for (int i = 0; i < (int)rows.size(); ++i) {
@@ -3212,7 +3271,10 @@ void VR::on_frame() {
 
 void VR::on_present() {
 #if defined(PRAGMATA)
+    pragmata_setup_gamepad();
+    pragmata_report_xinput_use();
     pragmatavr::HudTuning::get().poll_keys();
+    pragmatavr::HudTuning::get().poll_pad();
 #endif
     
 
