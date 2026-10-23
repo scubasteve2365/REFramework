@@ -1,23 +1,26 @@
 #pragma once
 
-// PragmataVR: tuning for Pragmata's 3D HUD panels.
+// PragmataVR: tuning and in-headset menu for Pragmata's 3D HUD panels.
 //
 // Pragmata draws its combat HUD (hacking panel, health, stamina, weapon wheel, tutorials) as
 // World-mode GUI views seen through the game's GUI camera. REFramework feeds that camera the
 // headset projection (see VR::hijack_camera), which brings the panels into view, but at the game's
 // flat-screen layout scale.
 //
-// Build 3 tunes the panels in three groups (hacking circle, health/stamina/weapon wheel, tutorial):
-//   size, x/y position and a per-eye gap, applied to each panel's GUI view just before it draws and
-//   restored right after. Values live in reframework/data/pragmatavr_hud.ini, which is re-read when
-//   it changes and rewritten when a hotkey changes a value.
-// Hotkeys (game window focused, no key repeat):
-//   F5/F6 eye gap, F7/F8 size, F9/F10 left/right, F11/F12 up/down
-//   no modifier = hacking circle, Shift = health/stamina/weapon wheel, Ctrl = tutorial
-//   Pause = snapshot of both eyes, Shift+Pause = reset everything to defaults
-// A short click confirms each press; a low buzz means a limit was reached.
+// The panels are tuned in three groups (hacking circle, health/stamina/weapon wheel, tutorial):
+// size, x/y position and a per-eye gap, applied to each panel's GUI view just before it draws and
+// restored right after (VR::on_pre_gui_draw_element / on_gui_draw_element).
 //
-// Included from VR.cpp (after its includes) and from vr/D3D12Component.cpp (snapshot only).
+// Values live in reframework/data/pragmatavr_hud.ini. The VR mod menu (F1) edits them in the headset:
+//   F1 open/close, Up/Down select, Left/Right change (hold Shift for big steps), Enter = toggle the
+//   invert box on value rows or run the action on button rows, Backspace = close.
+// Pause = snapshot of both eye images. No other hotkeys.
+//
+// Menu drawing: VR::on_frame draws an ImGui window (ImGui frames render into REFramework's IMGUI
+// render target while the headset is active); D3D12Component::on_frame copies that window's rectangle
+// into each eye image, centered on the eye's forward direction, before the eye is sent to the headset.
+//
+// Included from VR.cpp (after its includes) and from vr/D3D12Component.cpp.
 
 #include <Windows.h>
 
@@ -41,10 +44,10 @@
 namespace pragmatavr {
 
 enum class EyeMode : int {
-    Current = 0, // the eye REFramework says is being rendered
-    Swapped = 1, // the other eye
-    Left = 2,    // always the left eye's projection
-    Right = 3,   // always the right eye's projection
+    Current = 0,
+    Swapped = 1,
+    Left = 2,
+    Right = 3,
 };
 
 enum Group : int {
@@ -54,25 +57,49 @@ enum Group : int {
     GroupCount = 3,
 };
 
+enum Field : int {
+    FieldSize = 0,
+    FieldX = 1,
+    FieldY = 2,
+    FieldGap = 3,
+    FieldCount = 4,
+};
+
 inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "vitals", "tutorial"};
-inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"hacking circle", "health/stamina/weapon wheel", "tutorial"};
+inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health / stamina / weapon wheel", "Tutorial box"};
+inline constexpr std::array<const char*, FieldCount> FIELD_KEYS{"size", "x", "y", "gap"};
 
 struct GroupTune {
     float size{1.0f}; // multiplies the panel's own scale
     float x{0.0f};    // layout units (1920 x 1080 basis). For vitals this is "spread": + moves outward
-    float y{0.0f};    // layout units, + is up
-    float gap{0.0f};  // per-eye horizontal shift: left eye +gap, right eye -gap (+ pulls the images together)
+    float y{0.0f};    // layout units
+    float gap{0.0f};  // per-eye horizontal shift: left eye +gap, right eye -gap
+    std::array<bool, FieldCount> invert{};
 };
 
 struct HudTune {
     bool enabled{true};
     EyeMode eye_mode{EyeMode::Current};
-    float zoom{1.0f};        // whole GUI camera projection zoom (all 3D panels)
-    float depth_shift{0.0f}; // whole GUI camera projection per-eye shift, NDC units
-    float y_sign{1.0f};      // flips the meaning of up/down if the game's layout y runs the other way
+    float zoom{1.0f};
+    float depth_shift{0.0f};
+    float y_sign{1.0f};
     bool log_elements{true};
+    bool hack_locked{true};
+    float menu_width{0.42f}; // menu width as a fraction of the eye image width
     std::array<GroupTune, GroupCount> groups{};
+
+    HudTune() {
+        // Steve's tuned hacking circle (Pimax Dream Air, 2026-10-23).
+        groups[GroupHack].size = 0.9322f;
+        groups[GroupHack].x = -275.0f;
+        groups[GroupHack].y = -75.0f;
+        groups[GroupHack].gap = 12.0f;
+    }
 };
+
+inline GroupTune default_group(int g) {
+    return HudTune{}.groups[g];
+}
 
 // Which group a GUI GameObject belongs to, and its side for the vitals "spread" (-1 left, +1 right).
 inline int group_for(std::string_view name, float& side) {
@@ -85,19 +112,36 @@ inline int group_for(std::string_view name, float& side) {
     return -1;
 }
 
-// Set in VR::on_pre_gui_draw_element, cleared in VR::on_gui_draw_element.
 inline thread_local size_t g_current_gui_hash = 0;
 inline thread_local std::string g_current_gui_name{};
 
 inline void play_click(bool ok) {
     std::thread([ok]() {
         if (ok) {
-            Beep(1400, 35);
+            Beep(1400, 30);
         } else {
-            Beep(220, 180);
+            Beep(220, 160);
         }
     }).detach();
 }
+
+// One row of the VR mod menu.
+struct MenuRow {
+    enum class Kind { Header, Value, Toggle, Action };
+    Kind kind{Kind::Header};
+    int group{-1};
+    int field{-1};
+    int action{0};
+    std::string label{};
+};
+
+enum MenuAction : int {
+    ActionNone = 0,
+    ActionToggleHackLock,
+    ActionResetGroup,
+    ActionSnapshot,
+    ActionClose,
+};
 
 class HudTuning {
 public:
@@ -120,17 +164,16 @@ public:
         }
     }
 
-    // Called once per presented frame. Edge-triggered, ignores key repeat, only while the game has focus.
+    // Called once per presented frame. Edge-triggered, no key repeat, only while the game has focus.
     void poll_keys() {
         DWORD fg_pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
         const bool focused = fg_pid == GetCurrentProcessId();
 
-        static constexpr std::array<int, 9> keys{VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_PAUSE};
         const auto now = std::chrono::steady_clock::now();
 
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const bool down = (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
+        for (size_t i = 0; i < KEYS.size(); ++i) {
+            const bool down = (GetAsyncKeyState(KEYS[i]) & 0x8000) != 0;
             const bool was_down = m_key_down[i];
             m_key_down[i] = down;
 
@@ -138,19 +181,28 @@ public:
                 continue;
             }
 
-            if (now - m_last_press[i] < std::chrono::milliseconds(150)) {
+            if (now - m_last_press[i] < std::chrono::milliseconds(120)) {
                 continue;
             }
 
             m_last_press[i] = now;
-
             const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            handle_key(keys[i], shift, ctrl);
+            handle_key(KEYS[i], shift);
         }
     }
 
-    // Snapshot request state, consumed by D3D12Component::on_frame.
+    // ---- Menu state, read by VR::on_frame (draw) and D3D12Component::on_frame (composite) ----
+    std::atomic<bool> menu_open{false};
+    std::atomic<int> menu_selected{0};
+    std::atomic<float> menu_rect_x{0.0f};
+    std::atomic<float> menu_rect_y{0.0f};
+    std::atomic<float> menu_rect_w{0.0f};
+    std::atomic<float> menu_rect_h{0.0f};
+    std::atomic<bool> menu_rect_valid{false};
+
+    const std::vector<MenuRow>& menu_rows() const { return m_rows; }
+
+    // ---- Snapshot request state, consumed by D3D12Component::on_frame ----
     std::atomic<int> snapshot_frames_left{0};
     std::atomic<bool> snapshot_left_done{false};
     std::atomic<bool> snapshot_right_done{false};
@@ -160,10 +212,64 @@ public:
         return REFramework::get_persistent_dir("reframework/data");
     }
 
+    // Text for one value row, e.g. "Size  0.93", used by the menu.
+    static std::string format_value(const GroupTune& gt, int group, int field) {
+        switch (field) {
+        case FieldSize: return fmt::format("{:.2f}x", gt.size);
+        case FieldX: return fmt::format("{:+.0f}", gt.x);
+        case FieldY: return fmt::format("{:+.0f}", gt.y);
+        case FieldGap: return fmt::format("{:+.0f}", gt.gap);
+        default: return {};
+        }
+    }
+
 private:
+    static constexpr std::array<int, 8> KEYS{VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_BACK, VK_PAUSE};
+
     HudTuning() {
         m_tune = std::make_shared<HudTune>();
         m_key_down.fill(false);
+        build_rows();
+    }
+
+    void build_rows() {
+        m_rows.clear();
+
+        const auto add = [&](MenuRow::Kind kind, int group, int field, int action, std::string label) {
+            MenuRow r{};
+            r.kind = kind;
+            r.group = group;
+            r.field = field;
+            r.action = action;
+            r.label = std::move(label);
+            m_rows.push_back(std::move(r));
+        };
+
+        for (int g = 0; g < GroupCount; ++g) {
+            add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_LABELS[g]);
+
+            if (g == GroupHack) {
+                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Locked (Enter to unlock)");
+            }
+
+            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size");
+            add(MenuRow::Kind::Value, g, FieldX, ActionNone, g == GroupVitals ? "Toward / away from center" : "Left / right");
+            add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down");
+            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap (double image)");
+            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, g == GroupHack ? "Restore locked-in values" : "Reset to defaults");
+        }
+
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "Other");
+        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot (both eyes)");
+        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu");
+
+        // Start on the first selectable row.
+        for (int i = 0; i < (int)m_rows.size(); ++i) {
+            if (m_rows[i].kind != MenuRow::Kind::Header) {
+                menu_selected = i;
+                break;
+            }
+        }
     }
 
     static std::filesystem::path path() {
@@ -182,22 +288,21 @@ private:
     static std::string to_text(const HudTune& t) {
         std::string s{};
         s += "# PragmataVR 3D HUD tuning. Saved changes apply within about a second, no restart needed.\n";
-        s += "# The hotkeys rewrite this file, so edits made while the game runs are kept only until the next key press.\n";
-        s += "# Hotkeys: F5/F6 eye gap, F7/F8 size, F9/F10 left/right, F11/F12 up/down.\n";
-        s += "#   No modifier = hacking circle, Shift = health/stamina/weapon wheel, Ctrl = tutorial.\n";
-        s += "#   Pause = snapshot of both eyes, Shift+Pause = reset to defaults.\n";
-        s += "# enabled: 1 = use these settings, 0 = plain headset projection, no panel changes.\n";
-        s += "# eye_mode: 0 = current eye, 1 = swapped eyes, 2 = left eye for both, 3 = right eye for both.\n";
-        s += "# zoom / depth_shift: whole 3D HUD projection (all panels together).\n";
-        s += "# <group>.size / .x / .y / .gap: hack, vitals, tutorial. x/y in layout units (1920x1080 basis).\n";
-        s += "# vitals.x is a spread: + moves health and weapon wheel outward, - moves them toward the center.\n";
-        s += "# gap: + moves the left eye image right and the right eye image left.\n";
+        s += "# The VR mod menu (F1) rewrites this file whenever a value changes.\n";
+        s += "# Menu: F1 open/close, Up/Down select, Left/Right change (Shift = big steps), Enter = invert box or action,\n";
+        s += "#   Backspace close. Pause = snapshot of both eyes.\n";
+        s += "# <group>.size / .x / .y / .gap: hack, vitals, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
+        s += "# vitals.x is a spread: + moves health and weapon wheel outward, - toward the center.\n";
+        s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
+        s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
         s += fmt::format("enabled={}\n", t.enabled ? 1 : 0);
         s += fmt::format("eye_mode={}\n", (int)t.eye_mode);
         s += fmt::format("zoom={:.4f}\n", t.zoom);
         s += fmt::format("depth_shift={:.4f}\n", t.depth_shift);
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
+        s += fmt::format("hack_locked={}\n", t.hack_locked ? 1 : 0);
+        s += fmt::format("menu_width={:.3f}\n", t.menu_width);
 
         for (int g = 0; g < GroupCount; ++g) {
             const auto& gt = t.groups[g];
@@ -205,6 +310,10 @@ private:
             s += fmt::format("{}.x={:.2f}\n", GROUP_KEYS[g], gt.x);
             s += fmt::format("{}.y={:.2f}\n", GROUP_KEYS[g], gt.y);
             s += fmt::format("{}.gap={:.2f}\n", GROUP_KEYS[g], gt.gap);
+
+            for (int f = 0; f < FieldCount; ++f) {
+                s += fmt::format("{}.{}.invert={}\n", GROUP_KEYS[g], FIELD_KEYS[f], gt.invert[f] ? 1 : 0);
+            }
         }
 
         return s;
@@ -303,11 +412,17 @@ private:
                 else if (key == "depth_shift") t->depth_shift = std::clamp(val, -1.0f, 1.0f);
                 else if (key == "y_sign") t->y_sign = val < 0.0f ? -1.0f : 1.0f;
                 else if (key == "log_elements") t->log_elements = val != 0.0f;
+                else if (key == "hack_locked") t->hack_locked = val != 0.0f;
+                else if (key == "menu_width") t->menu_width = std::clamp(val, 0.15f, 0.9f);
                 continue;
             }
 
             const auto group_key = key.substr(0, dot);
-            const auto field = key.substr(dot + 1);
+            auto rest = key.substr(dot + 1);
+            const bool is_invert = rest.size() > 7 && rest.substr(rest.size() - 7) == ".invert";
+            if (is_invert) {
+                rest = rest.substr(0, rest.size() - 7);
+            }
 
             for (int g = 0; g < GroupCount; ++g) {
                 if (group_key != GROUP_KEYS[g]) {
@@ -315,15 +430,30 @@ private:
                 }
 
                 auto& gt = t->groups[g];
-                if (field == "size") gt.size = std::clamp(val, MIN_SIZE, MAX_SIZE);
-                else if (field == "x") gt.x = std::clamp(val, -MAX_MOVE, MAX_MOVE);
-                else if (field == "y") gt.y = std::clamp(val, -MAX_MOVE, MAX_MOVE);
-                else if (field == "gap") gt.gap = std::clamp(val, -MAX_GAP, MAX_GAP);
+
+                for (int fi = 0; fi < FieldCount; ++fi) {
+                    if (rest != FIELD_KEYS[fi]) {
+                        continue;
+                    }
+
+                    if (is_invert) {
+                        gt.invert[fi] = val != 0.0f;
+                        continue;
+                    }
+
+                    switch (fi) {
+                    case FieldSize: gt.size = std::clamp(val, MIN_SIZE, MAX_SIZE); break;
+                    case FieldX: gt.x = std::clamp(val, -MAX_MOVE, MAX_MOVE); break;
+                    case FieldY: gt.y = std::clamp(val, -MAX_MOVE, MAX_MOVE); break;
+                    case FieldGap: gt.gap = std::clamp(val, -MAX_GAP, MAX_GAP); break;
+                    default: break;
+                    }
+                }
             }
         }
 
-        spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini: enabled={} eye_mode={} zoom={} depth_shift={} hack(size={} x={} y={} gap={}) vitals(size={} x={} y={} gap={}) tutorial(size={} x={} y={} gap={})",
-            t->enabled, (int)t->eye_mode, t->zoom, t->depth_shift,
+        spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini: hack_locked={} hack(size={} x={} y={} gap={}) vitals(size={} x={} y={} gap={}) tutorial(size={} x={} y={} gap={})",
+            t->hack_locked,
             t->groups[0].size, t->groups[0].x, t->groups[0].y, t->groups[0].gap,
             t->groups[1].size, t->groups[1].x, t->groups[1].y, t->groups[1].gap,
             t->groups[2].size, t->groups[2].x, t->groups[2].y, t->groups[2].gap);
@@ -334,109 +464,202 @@ private:
         m_loaded_once = true;
     }
 
-    void handle_key(int vk, bool shift, bool ctrl) {
-        if (vk == VK_PAUSE) {
-            if (shift) {
-                auto t = std::make_shared<HudTune>();
-                write_file(*t);
-                {
-                    std::scoped_lock _{m_mtx};
-                    m_tune = t;
-                }
-                spdlog::info("[PragmataVR] Hotkey: reset all HUD tuning to defaults");
-                play_click(true);
+    void commit(const std::shared_ptr<HudTune>& t) {
+        write_file(*t);
+        std::scoped_lock _{m_mtx};
+        m_tune = t;
+    }
+
+    std::shared_ptr<HudTune> copy_current() {
+        std::scoped_lock _{m_mtx};
+        return std::make_shared<HudTune>(*m_tune);
+    }
+
+    void move_selection(int dir) {
+        const int n = (int)m_rows.size();
+        int i = menu_selected.load();
+
+        for (int step = 0; step < n; ++step) {
+            i = (i + dir + n) % n;
+            if (m_rows[i].kind != MenuRow::Kind::Header) {
+                menu_selected = i;
                 return;
             }
+        }
+    }
 
-            if (snapshot_frames_left.load() > 0) {
-                play_click(false);
-                return;
-            }
+    void request_snapshot() {
+        if (snapshot_frames_left.load() > 0) {
+            play_click(false);
+            return;
+        }
 
-            const auto stamp = std::chrono::system_clock::now();
-            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(stamp.time_since_epoch()).count();
-            snapshot_stem = fmt::format("snapshot_{}", secs);
-            snapshot_left_done = false;
-            snapshot_right_done = false;
-            snapshot_frames_left = 8; // capture both eyes within the next few frames
+        const auto stamp = std::chrono::system_clock::now();
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(stamp.time_since_epoch()).count();
+        snapshot_stem = fmt::format("snapshot_{}", secs);
+        snapshot_left_done = false;
+        snapshot_right_done = false;
 
-            std::error_code ec{};
-            std::filesystem::create_directories(data_dir() / "snapshots", ec);
+        std::error_code ec{};
+        std::filesystem::create_directories(data_dir() / "snapshots", ec);
+        {
+            std::ofstream f{data_dir() / "snapshots" / (snapshot_stem + "_settings.txt")};
+            std::shared_ptr<const HudTune> cur{};
             {
-                std::ofstream f{data_dir() / "snapshots" / (snapshot_stem + "_settings.txt")};
-                std::shared_ptr<const HudTune> cur{};
-                {
-                    std::scoped_lock _{m_mtx};
-                    cur = m_tune;
-                }
-                f << to_text(*cur);
+                std::scoped_lock _{m_mtx};
+                cur = m_tune;
             }
+            f << to_text(*cur);
+        }
 
-            spdlog::info("[PragmataVR] Hotkey: snapshot requested ({})", snapshot_stem);
+        snapshot_frames_left = 8;
+        spdlog::info("[PragmataVR] Snapshot requested ({})", snapshot_stem);
+        play_click(true);
+    }
+
+    void handle_key(int vk, bool shift) {
+        if (vk == VK_PAUSE) {
+            request_snapshot();
+            return;
+        }
+
+        if (vk == VK_F1) {
+            menu_open = !menu_open.load();
+            spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
             play_click(true);
             return;
         }
 
-        const int group = ctrl ? GroupTutorial : (shift ? GroupVitals : GroupHack);
-
-        std::shared_ptr<const HudTune> cur{};
-        {
-            std::scoped_lock _{m_mtx};
-            cur = m_tune;
+        if (!menu_open.load()) {
+            return;
         }
 
-        auto t = std::make_shared<HudTune>(*cur);
-        auto& gt = t->groups[group];
-        bool ok = true;
-        const char* what = "";
+        switch (vk) {
+        case VK_BACK:
+            menu_open = false;
+            spdlog::info("[PragmataVR] Menu closed");
+            play_click(true);
+            return;
+        case VK_UP:
+            move_selection(-1);
+            play_click(true);
+            return;
+        case VK_DOWN:
+            move_selection(1);
+            play_click(true);
+            return;
+        default:
+            break;
+        }
 
+        const int sel = menu_selected.load();
+        if (sel < 0 || sel >= (int)m_rows.size()) {
+            return;
+        }
+
+        const auto& row = m_rows[sel];
+        auto t = copy_current();
+
+        if (vk == VK_RETURN) {
+            switch (row.kind) {
+            case MenuRow::Kind::Value: {
+                if (row.group == GroupHack && t->hack_locked) {
+                    play_click(false);
+                    return;
+                }
+                auto& inv = t->groups[row.group].invert[row.field];
+                inv = !inv;
+                commit(t);
+                spdlog::info("[PragmataVR] Menu: {} {} invert = {}", GROUP_KEYS[row.group], FIELD_KEYS[row.field], inv);
+                play_click(true);
+                return;
+            }
+            case MenuRow::Kind::Toggle:
+                if (row.action == ActionToggleHackLock) {
+                    t->hack_locked = !t->hack_locked;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: hacking circle {}", t->hack_locked ? "locked" : "unlocked");
+                    play_click(true);
+                }
+                return;
+            case MenuRow::Kind::Action:
+                if (row.action == ActionResetGroup) {
+                    if (row.group == GroupHack && t->hack_locked) {
+                        play_click(false);
+                        return;
+                    }
+                    const auto inverts = t->groups[row.group].invert;
+                    t->groups[row.group] = default_group(row.group);
+                    t->groups[row.group].invert = inverts;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: reset {}", GROUP_KEYS[row.group]);
+                    play_click(true);
+                } else if (row.action == ActionSnapshot) {
+                    request_snapshot();
+                } else if (row.action == ActionClose) {
+                    menu_open = false;
+                    play_click(true);
+                }
+                return;
+            default:
+                return;
+            }
+        }
+
+        if ((vk != VK_LEFT && vk != VK_RIGHT) || row.kind != MenuRow::Kind::Value) {
+            return;
+        }
+
+        if (row.group == GroupHack && t->hack_locked) {
+            play_click(false);
+            return;
+        }
+
+        auto& gt = t->groups[row.group];
+        int dir = vk == VK_RIGHT ? 1 : -1;
+        if (gt.invert[row.field]) {
+            dir = -dir;
+        }
+
+        bool ok = true;
         const auto step = [&](float& v, float delta, float lo, float hi) {
             const float nv = std::clamp(v + delta, lo, hi);
             ok = nv != v;
             v = nv;
         };
 
-        switch (vk) {
-        case VK_F5: step(gt.gap, GAP_STEP, -MAX_GAP, MAX_GAP); what = "eye gap +"; break;
-        case VK_F6: step(gt.gap, -GAP_STEP, -MAX_GAP, MAX_GAP); what = "eye gap -"; break;
-        case VK_F7: {
-            const float nv = std::clamp(gt.size / SIZE_STEP, MIN_SIZE, MAX_SIZE);
+        switch (row.field) {
+        case FieldSize: {
+            const float factor = shift ? SIZE_STEP_BIG : SIZE_STEP;
+            const float nv = std::clamp(dir > 0 ? gt.size * factor : gt.size / factor, MIN_SIZE, MAX_SIZE);
             ok = nv != gt.size;
             gt.size = nv;
-            what = "smaller";
             break;
         }
-        case VK_F8: {
-            const float nv = std::clamp(gt.size * SIZE_STEP, MIN_SIZE, MAX_SIZE);
-            ok = nv != gt.size;
-            gt.size = nv;
-            what = "bigger";
-            break;
-        }
-        case VK_F9: step(gt.x, -MOVE_STEP, -MAX_MOVE, MAX_MOVE); what = group == GroupVitals ? "toward center" : "left"; break;
-        case VK_F10: step(gt.x, MOVE_STEP, -MAX_MOVE, MAX_MOVE); what = group == GroupVitals ? "away from center" : "right"; break;
-        case VK_F11: step(gt.y, MOVE_STEP, -MAX_MOVE, MAX_MOVE); what = "up"; break;
-        case VK_F12: step(gt.y, -MOVE_STEP, -MAX_MOVE, MAX_MOVE); what = "down"; break;
+        case FieldX: step(gt.x, dir * (shift ? MOVE_STEP_BIG : MOVE_STEP), -MAX_MOVE, MAX_MOVE); break;
+        case FieldY: step(gt.y, dir * (shift ? MOVE_STEP_BIG : MOVE_STEP), -MAX_MOVE, MAX_MOVE); break;
+        case FieldGap: step(gt.gap, dir * (shift ? GAP_STEP_BIG : GAP_STEP), -MAX_GAP, MAX_GAP); break;
         default: return;
         }
 
         if (ok) {
-            write_file(*t);
-            std::scoped_lock _{m_mtx};
-            m_tune = t;
+            commit(t);
         }
 
-        spdlog::info("[PragmataVR] Hotkey: {} {} -> size={:.3f} x={:.1f} y={:.1f} gap={:.1f}{}",
-            GROUP_LABELS[group], what, gt.size, gt.x, gt.y, gt.gap, ok ? "" : " (limit)");
+        spdlog::info("[PragmataVR] Menu: {} {} -> size={:.3f} x={:.1f} y={:.1f} gap={:.1f}{}",
+            GROUP_KEYS[row.group], FIELD_KEYS[row.field], gt.size, gt.x, gt.y, gt.gap, ok ? "" : " (limit)");
         play_click(ok);
     }
 
-    static constexpr float SIZE_STEP = 1.08f;
+    static constexpr float SIZE_STEP = 1.04f;
+    static constexpr float SIZE_STEP_BIG = 1.20f;
     static constexpr float MIN_SIZE = 0.2f;
     static constexpr float MAX_SIZE = 5.0f;
-    static constexpr float MOVE_STEP = 25.0f;
+    static constexpr float MOVE_STEP = 10.0f;
+    static constexpr float MOVE_STEP_BIG = 50.0f;
     static constexpr float MAX_MOVE = 2000.0f;
-    static constexpr float GAP_STEP = 3.0f;
+    static constexpr float GAP_STEP = 1.0f;
+    static constexpr float GAP_STEP_BIG = 5.0f;
     static constexpr float MAX_GAP = 300.0f;
 
     std::mutex m_mtx{};
@@ -445,11 +668,11 @@ private:
     std::chrono::steady_clock::time_point m_last_check{};
     bool m_loaded_once{false};
     std::unordered_map<size_t, bool> m_logged{};
-    std::array<bool, 9> m_key_down{};
-    std::array<std::chrono::steady_clock::time_point, 9> m_last_press{};
+    std::array<bool, KEYS.size()> m_key_down{};
+    std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
+    std::vector<MenuRow> m_rows{};
 };
 
-// Applies zoom and offset to a perspective projection matrix (glm, column-major).
 inline void adjust_projection(Matrix4x4f& m, float zoom, float x, float y) {
     m[0][0] *= zoom;
     m[1][1] *= zoom;

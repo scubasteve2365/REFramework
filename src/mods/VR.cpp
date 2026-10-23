@@ -3120,6 +3120,96 @@ void VR::update_camera_data(int frame_count) {
     }
 }
 
+#if defined(PRAGMATA)
+// PragmataVR: in-headset HUD menu. Drawn into REFramework's ImGui frame here; D3D12Component::on_frame
+// copies this window's rectangle into each eye image.
+void VR::on_frame() {
+    auto& hud = pragmatavr::HudTuning::get();
+
+    if (!hud.menu_open.load() || !is_hmd_active()) {
+        hud.menu_rect_valid = false;
+        return;
+    }
+
+    const auto tune = hud.tune();
+    const auto& rows = hud.menu_rows();
+    const int sel = hud.menu_selected.load();
+    auto& io = ImGui::GetIO();
+
+    ImGui::SetNextWindowPos(ImVec2{io.DisplaySize.x * 0.25f, io.DisplaySize.y * 0.15f}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.94f);
+
+    const auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    if (ImGui::Begin("PragmataVR HUD menu", nullptr, flags)) {
+        ImGui::SetWindowFontScale(1.6f);
+
+        const float fs = ImGui::GetFontSize();
+        const float col_value = fs * 17.0f;
+        const float col_invert = fs * 23.0f;
+
+        const ImVec4 title_color{0.45f, 0.85f, 1.0f, 1.0f};
+        const ImVec4 header_color{1.0f, 0.85f, 0.35f, 1.0f};
+        const ImVec4 normal_color{0.92f, 0.92f, 0.92f, 1.0f};
+        const ImVec4 locked_color{0.5f, 0.5f, 0.5f, 1.0f};
+        const ImVec4 selected_color{0.35f, 1.0f, 0.45f, 1.0f};
+
+        ImGui::TextColored(title_color, "PRAGMATA VR  -  HUD MENU");
+        ImGui::TextColored(locked_color, "Up/Down select   Left/Right change (Shift = bigger steps)");
+        ImGui::TextColored(locked_color, "Enter = invert box / do action   F1 or Backspace = close");
+        ImGui::Separator();
+
+        for (int i = 0; i < (int)rows.size(); ++i) {
+            const auto& row = rows[i];
+            const bool selected = i == sel;
+
+            if (row.kind == pragmatavr::MenuRow::Kind::Header) {
+                ImGui::Spacing();
+                ImGui::TextColored(header_color, "%s", row.label.c_str());
+                continue;
+            }
+
+            const bool locked = row.group == pragmatavr::GroupHack && tune->hack_locked &&
+                row.kind != pragmatavr::MenuRow::Kind::Toggle;
+            const auto color = selected ? selected_color : (locked ? locked_color : normal_color);
+            const char* marker = selected ? ">" : " ";
+
+            switch (row.kind) {
+            case pragmatavr::MenuRow::Kind::Value: {
+                const auto& gt = tune->groups[row.group];
+                ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
+                ImGui::SameLine(col_value);
+                ImGui::TextColored(color, "%s", pragmatavr::HudTuning::format_value(gt, row.group, row.field).c_str());
+                ImGui::SameLine(col_invert);
+                ImGui::TextColored(color, "[%s] invert", gt.invert[row.field] ? "x" : " ");
+                break;
+            }
+            case pragmatavr::MenuRow::Kind::Toggle:
+                ImGui::TextColored(color, "%s  %s", marker,
+                    tune->hack_locked ? "LOCKED - Enter to unlock" : "UNLOCKED - Enter to lock");
+                break;
+            case pragmatavr::MenuRow::Kind::Action:
+            default:
+                ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
+                break;
+            }
+        }
+
+        const auto pos = ImGui::GetWindowPos();
+        const auto size = ImGui::GetWindowSize();
+        hud.menu_rect_x = pos.x;
+        hud.menu_rect_y = pos.y;
+        hud.menu_rect_w = size.x;
+        hud.menu_rect_h = size.y;
+        hud.menu_rect_valid = size.x > 1.0f && size.y > 1.0f;
+    }
+
+    ImGui::End();
+}
+#endif
+
 void VR::on_present() {
 #if defined(PRAGMATA)
     pragmatavr::HudTuning::get().poll_keys();

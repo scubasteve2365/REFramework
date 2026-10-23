@@ -12,7 +12,173 @@
 #if defined(PRAGMATA)
 #include <wincodec.h>
 #include <../../directxtk12-src/Inc/ScreenGrab.h>
+#include <../../directxtk12-src/Inc/DescriptorHeap.h>
 #include "PragmataHud.hpp"
+
+namespace {
+// PragmataVR: copies the VR mod menu (drawn by ImGui into REFramework's IMGUI render target) into the
+// eye image, centered on the eye's forward direction, so the menu is readable in the headset.
+struct PragmataMenuCompositor {
+    std::unique_ptr<DirectX::DX12::SpriteBatch> batch{};
+    DXGI_FORMAT batch_format{DXGI_FORMAT_UNKNOWN};
+    d3d12::TextureContext imgui_ctx{};
+    ID3D12Resource* imgui_res{nullptr};
+    std::unique_ptr<DirectX::DescriptorHeap> bb_rtv_heap{};
+    std::array<ID3D12Resource*, 8> bb_res{};
+    d3d12::CommandContext cmds{};
+    bool cmds_ready{false};
+    bool failed{false};
+};
+
+PragmataMenuCompositor g_pragmata_menu{};
+
+void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, bool left) {
+    auto& hud = pragmatavr::HudTuning::get();
+    auto& m = g_pragmata_menu;
+
+    if (m.failed || backbuffer == nullptr || !hud.menu_open.load() || !hud.menu_rect_valid.load()) {
+        return;
+    }
+
+    auto& imgui_rt = g_framework->get_rendertarget_d3d12();
+    if (imgui_rt == nullptr) {
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    auto device = hook->get_device();
+    auto queue = hook->get_command_queue();
+    const auto bb_desc = backbuffer->GetDesc();
+    const auto rt_desc = imgui_rt->GetDesc();
+
+    try {
+        if (m.batch == nullptr || m.batch_format != bb_desc.Format) {
+            DirectX::ResourceUploadBatch upload{device};
+            upload.Begin();
+            DirectX::RenderTargetState output_state{bb_desc.Format, DXGI_FORMAT_UNKNOWN};
+            DirectX::SpriteBatchPipelineStateDescription pd{output_state};
+            m.batch = std::make_unique<DirectX::DX12::SpriteBatch>(device, upload, pd);
+            upload.End(queue).wait();
+            m.batch_format = bb_desc.Format;
+            spdlog::info("[PragmataVR] Menu compositor ready for back buffer format {}", (int)bb_desc.Format);
+        }
+
+        if (m.imgui_res != imgui_rt.Get()) {
+            m.imgui_ctx.setup(device, imgui_rt.Get(), std::nullopt, std::nullopt, L"PragmataVR menu source");
+            m.imgui_res = imgui_rt.Get();
+        }
+
+        if (m.bb_rtv_heap == nullptr) {
+            m.bb_rtv_heap = std::make_unique<DirectX::DescriptorHeap>(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, m.bb_res.size());
+        }
+
+        const auto slot = bb_index % m.bb_res.size();
+        if (m.bb_res[slot] != backbuffer) {
+            device->CreateRenderTargetView(backbuffer, nullptr, m.bb_rtv_heap->GetCpuHandle(slot));
+            m.bb_res[slot] = backbuffer;
+        }
+
+        if (!m.cmds_ready) {
+            m.cmds_ready = m.cmds.setup(L"PragmataVR menu");
+            if (!m.cmds_ready) {
+                m.failed = true;
+                return;
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("[PragmataVR] Menu compositor setup failed: {}", e.what());
+        m.failed = true;
+        return;
+    } catch (...) {
+        spdlog::error("[PragmataVR] Menu compositor setup failed");
+        m.failed = true;
+        return;
+    }
+
+    const auto tune = hud.tune();
+
+    // Source: the menu window's rectangle in the ImGui render target.
+    RECT src{};
+    src.left = (LONG)std::clamp(hud.menu_rect_x.load(), 0.0f, (float)rt_desc.Width - 1.0f);
+    src.top = (LONG)std::clamp(hud.menu_rect_y.load(), 0.0f, (float)rt_desc.Height - 1.0f);
+    src.right = (LONG)std::clamp(hud.menu_rect_x.load() + hud.menu_rect_w.load(), (float)src.left + 1.0f, (float)rt_desc.Width);
+    src.bottom = (LONG)std::clamp(hud.menu_rect_y.load() + hud.menu_rect_h.load(), (float)src.top + 1.0f, (float)rt_desc.Height);
+
+    const float src_w = (float)(src.right - src.left);
+    const float src_h = (float)(src.bottom - src.top);
+
+    // Destination: centered on this eye's forward direction, menu_width of the eye image wide.
+    Matrix4x4f proj{};
+    {
+        std::shared_lock _{vr->get_runtime()->eyes_mtx};
+        proj = vr->get_runtime()->projections[left ? 0 : 1];
+    }
+
+    float cx_ndc = 0.0f;
+    float cy_ndc = 0.0f;
+    if (proj[2][3] != 0.0f) {
+        cx_ndc = std::clamp(proj[2][0] / proj[2][3], -0.5f, 0.5f);
+        cy_ndc = std::clamp(proj[2][1] / proj[2][3], -0.5f, 0.5f);
+    }
+
+    const float bb_w = (float)bb_desc.Width;
+    const float bb_h = (float)bb_desc.Height;
+    const float cx = (cx_ndc + 1.0f) * 0.5f * bb_w;
+    const float cy = (1.0f - cy_ndc) * 0.5f * bb_h;
+
+    float dst_w = tune->menu_width * bb_w;
+    float dst_h = dst_w * (src_h / src_w);
+    if (dst_h > bb_h * 0.85f) {
+        dst_h = bb_h * 0.85f;
+        dst_w = dst_h * (src_w / src_h);
+    }
+
+    RECT dst{};
+    dst.left = (LONG)(cx - dst_w * 0.5f);
+    dst.top = (LONG)(cy - dst_h * 0.5f);
+    dst.right = (LONG)(cx + dst_w * 0.5f);
+    dst.bottom = (LONG)(cy + dst_h * 0.5f);
+
+    m.cmds.wait(INFINITE);
+    auto cl = m.cmds.cmd_list.Get();
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = backbuffer;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cl->ResourceBarrier(1, &barrier);
+
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = bb_w;
+    viewport.Height = bb_h;
+    viewport.MinDepth = D3D12_MIN_DEPTH;
+    viewport.MaxDepth = D3D12_MAX_DEPTH;
+
+    D3D12_RECT scissor{0, 0, (LONG)bb_desc.Width, (LONG)bb_desc.Height};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = m.bb_rtv_heap->GetCpuHandle(bb_index % m.bb_res.size());
+
+    cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cl->RSSetViewports(1, &viewport);
+    cl->RSSetScissorRects(1, &scissor);
+
+    ID3D12DescriptorHeap* heaps[] = {m.imgui_ctx.srv_heap->Heap()};
+    cl->SetDescriptorHeaps(1, heaps);
+
+    m.batch->SetViewport(viewport);
+    m.batch->Begin(cl, DirectX::DX12::SpriteSortMode::SpriteSortMode_Immediate);
+    m.batch->Draw(m.imgui_ctx.get_srv_gpu(), DirectX::XMUINT2{(uint32_t)rt_desc.Width, (uint32_t)rt_desc.Height}, dst, &src, DirectX::Colors::White);
+    m.batch->End();
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cl->ResourceBarrier(1, &barrier);
+
+    m.cmds.has_commands = true;
+    m.cmds.execute();
+}
+} // namespace
 #endif
 
 namespace vrmod {
@@ -107,6 +273,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
         }
     }
+
+    // PragmataVR mod menu into this eye's image (after the snapshot, so snapshots show the game only).
+    pragmata_composite_menu(vr, backbuffer.Get(), backbuffer_index, (frame_count % 2) == vr->m_left_eye_interval);
 #endif
 
     

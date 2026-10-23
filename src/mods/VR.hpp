@@ -119,6 +119,9 @@ public:
     void on_pre_imgui_frame() override;
     void on_present() override;
     void on_post_present() override;
+#if defined(PRAGMATA)
+    void on_frame() override; // PragmataVR: draws the in-headset HUD menu
+#endif
     void on_update_transform(RETransform* transform) override;
     void on_update_camera_controller(RopewayPlayerCameraController* controller) override;
     bool on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) override;
