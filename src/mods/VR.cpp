@@ -328,6 +328,38 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
     {
         const auto tune = pragmatavr::HudTuning::get().tune();
 
+        if (tune->enabled && tune->layout_mode == 1) {
+            // Game-screen HUD: keep the game's own flat GUI projection and map it onto a virtual screen in each eye.
+            original_func(camera, result);
+            const Matrix4x4f flat = *result;
+            const bool left = (vr->m_frame_count % 2) == vr->m_left_eye_interval;
+
+            Matrix4x4f eye_proj{};
+            {
+                std::shared_lock _{vr->get_runtime()->eyes_mtx};
+                eye_proj = vr->get_runtime()->projections[(uint32_t)(left ? VRRuntime::Eye::LEFT : VRRuntime::Eye::RIGHT)];
+            }
+
+            const auto eye_to_head = vr->get_eye_transform(left ? 0 : 1);
+            Matrix4x4f m{};
+
+            if (pragmatavr::screen_projection(m, flat, eye_proj, eye_to_head, pragmatavr::HudTuning::get().lock_rotation(), *tune)) {
+                *result = m;
+            } else {
+                *result = Matrix4x4f{0.0f}; // the virtual screen is behind this eye: draw nothing
+            }
+
+            if (tune->log_elements) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    spdlog::info("[PragmataVR] Game-screen HUD active: flat projection [0][0]={} [1][1]={}", flat[0][0], flat[1][1]);
+                }
+            }
+
+            return result;
+        }
+
         if (tune->enabled) {
             bool left = (vr->m_frame_count % 2) == vr->m_left_eye_interval;
 
@@ -3240,6 +3272,16 @@ void VR::on_frame() {
 
             switch (row.kind) {
             case pragmatavr::MenuRow::Kind::Value: {
+                if (row.group == pragmatavr::GROUP_SCREEN) {
+                    const bool off = tune->layout_mode != 1;
+                    const auto scolor = selected ? selected_color : (off ? locked_color : normal_color);
+                    ImGui::TextColored(scolor, "%s  %s", marker, row.label.c_str());
+                    ImGui::SameLine(col_value);
+                    ImGui::TextColored(scolor, "%s", pragmatavr::HudTuning::format_screen(*tune, row.field).c_str());
+                    ImGui::SameLine(col_invert);
+                    ImGui::TextColored(scolor, "[%s] invert", tune->screen_invert[row.field] ? "x" : " ");
+                    break;
+                }
                 const auto& gt = tune->groups[row.group];
                 ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
                 ImGui::SameLine(col_value);
@@ -3251,6 +3293,9 @@ void VR::on_frame() {
             case pragmatavr::MenuRow::Kind::Toggle: {
                 const char* text = "";
                 switch (row.action) {
+                case pragmatavr::ActionToggleLayout:
+                    text = tune->layout_mode == 1 ? "HUD layout: GAME SCREEN, one panel (A for per-panel)" : "HUD layout: PER-PANEL, old (A for game screen)";
+                    break;
                 case pragmatavr::ActionToggleHudFixed:
                     text = tune->hud_fixed ? "HUD position: FIXED in the room (A to change)" : "HUD position: FOLLOWS your head (A to change)";
                     break;

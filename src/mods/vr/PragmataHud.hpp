@@ -95,14 +95,18 @@ struct HudTune {
     bool hud_fixed{true};    // 3D HUD panels and the menu stay fixed in the room instead of following the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
+
+    // HUD layout. 1 = "game screen": the game's own flat 16:9 HUD layout (its GUI camera projection) is shown as
+    // one virtual screen floating in front of the player, like the DS3 VR HUD panel. 0 = per-panel (Builds 2-6).
+    int layout_mode{1};
+    std::array<float, 4> screen{70.0f, 2.0f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
+    std::array<bool, 4> screen_invert{};
     std::array<GroupTune, GroupCount> groups{};
 
     HudTune() {
-        // Steve's tuned hacking circle (Pimax Dream Air, 2026-10-23).
-        groups[GroupHack].size = 0.9322f;
-        groups[GroupHack].x = -275.0f;
-        groups[GroupHack].y = -75.0f;
-        groups[GroupHack].gap = 12.0f;
+        // Per-panel adjustments start neutral in the game-screen layout. Steve's per-panel hacking circle values
+        // from 2026-10-23 (size 0.9322, x -275, y -75, gap 12) are kept in HACKING_CIRCLE_LOCKED.txt.
+        hack_locked = false;
     }
 };
 
@@ -144,8 +148,24 @@ struct MenuRow {
     std::string label{};
 };
 
+// Pseudo-group for the HUD screen rows, and its fields.
+inline constexpr int GROUP_SCREEN = 100;
+enum ScreenField : int {
+    ScreenWidth = 0,
+    ScreenDistance = 1,
+    ScreenYaw = 2,
+    ScreenPitch = 3,
+};
+inline constexpr std::array<const char*, 4> SCREEN_KEYS{"width", "distance", "yaw", "pitch"};
+inline constexpr std::array<float, 4> SCREEN_MIN{20.0f, 0.5f, -60.0f, -45.0f};
+inline constexpr std::array<float, 4> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f};
+inline constexpr std::array<float, 4> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f};
+inline constexpr std::array<float, 4> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f};
+
 enum MenuAction : int {
     ActionNone = 0,
+    ActionToggleLayout,
+    ActionResetScreen,
     ActionToggleHudFixed,
     ActionRecenter,
     ActionToggleLockInvert,
@@ -353,6 +373,16 @@ public:
         return REFramework::get_persistent_dir("reframework/data");
     }
 
+    static std::string format_screen(const HudTune& t, int field) {
+        switch (field) {
+        case ScreenWidth: return fmt::format("{:.0f} deg", t.screen[0]);
+        case ScreenDistance: return fmt::format("{:.1f} m", t.screen[1]);
+        case ScreenYaw: return fmt::format("{:+.0f} deg", t.screen[2]);
+        case ScreenPitch: return fmt::format("{:+.0f} deg", t.screen[3]);
+        default: return {};
+        }
+    }
+
     // Text for one value row, e.g. "Size  0.93", used by the menu.
     static std::string format_value(const GroupTune& gt, int group, int field) {
         switch (field) {
@@ -385,6 +415,14 @@ private:
             r.label = std::move(label);
             m_rows.push_back(std::move(r));
         };
+
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "HUD screen (the game's whole HUD as one panel)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLayout, "HUD layout");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Size (width)");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "Distance");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Left / right");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down");
+        add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen to defaults");
 
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "View");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position");
@@ -453,6 +491,13 @@ private:
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
+        s += "# layout_mode: 1 = game screen (whole HUD as one panel), 0 = per-panel.\n";
+        s += "# screen.width in degrees, screen.distance in meters, screen.yaw / screen.pitch in degrees.\n";
+        s += fmt::format("layout_mode={}\n", t.layout_mode);
+        for (int i = 0; i < 4; ++i) {
+            s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
+            s += fmt::format("screen.{}.invert={}\n", SCREEN_KEYS[i], t.screen_invert[i] ? 1 : 0);
+        }
 
         for (int g = 0; g < GroupCount; ++g) {
             const auto& gt = t.groups[g];
@@ -567,6 +612,7 @@ private:
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
+                else if (key == "layout_mode") t->layout_mode = val != 0.0f ? 1 : 0;
                 continue;
             }
 
@@ -575,6 +621,16 @@ private:
             const bool is_invert = rest.size() > 7 && rest.substr(rest.size() - 7) == ".invert";
             if (is_invert) {
                 rest = rest.substr(0, rest.size() - 7);
+            }
+
+            if (group_key == "screen") {
+                for (int i = 0; i < 4; ++i) {
+                    if (rest == SCREEN_KEYS[i]) {
+                        if (is_invert) t->screen_invert[i] = val != 0.0f;
+                        else t->screen[i] = std::clamp(val, SCREEN_MIN[i], SCREEN_MAX[i]);
+                    }
+                }
+                continue;
             }
 
             for (int g = 0; g < GroupCount; ++g) {
@@ -726,6 +782,14 @@ private:
         if (vk == VK_RETURN) {
             switch (row.kind) {
             case MenuRow::Kind::Value: {
+                if (row.group == GROUP_SCREEN) {
+                    auto& inv = t->screen_invert[row.field];
+                    inv = !inv;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: screen {} invert = {}", SCREEN_KEYS[row.field], inv);
+                    play_click(true);
+                    return;
+                }
                 if (row.group == GroupHack && t->hack_locked) {
                     play_click(false);
                     return;
@@ -738,7 +802,12 @@ private:
                 return;
             }
             case MenuRow::Kind::Toggle:
-                if (row.action == ActionToggleHudFixed) {
+                if (row.action == ActionToggleLayout) {
+                    t->layout_mode = t->layout_mode == 1 ? 0 : 1;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: HUD layout {}", t->layout_mode == 1 ? "game screen" : "per-panel");
+                    play_click(true);
+                } else if (row.action == ActionToggleHudFixed) {
                     t->hud_fixed = !t->hud_fixed;
                     commit(t);
                     recenter_requested = true;
@@ -762,7 +831,14 @@ private:
                 }
                 return;
             case MenuRow::Kind::Action:
-                if (row.action == ActionResetGroup) {
+                if (row.action == ActionResetScreen) {
+                    const auto inverts = t->screen_invert;
+                    t->screen = HudTune{}.screen;
+                    t->screen_invert = inverts;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: reset HUD screen");
+                    play_click(true);
+                } else if (row.action == ActionResetGroup) {
                     if (row.group == GroupHack && t->hack_locked) {
                         play_click(false);
                         return;
@@ -791,6 +867,25 @@ private:
         }
 
         if ((vk != VK_LEFT && vk != VK_RIGHT) || row.kind != MenuRow::Kind::Value) {
+            return;
+        }
+
+        if (row.group == GROUP_SCREEN) {
+            int sdir = vk == VK_RIGHT ? 1 : -1;
+            if (t->screen_invert[row.field]) {
+                sdir = -sdir;
+            }
+            auto& v = t->screen[row.field];
+            const float nv = std::clamp(v + sdir * (shift ? SCREEN_STEP_BIG[row.field] : SCREEN_STEP[row.field]),
+                SCREEN_MIN[row.field], SCREEN_MAX[row.field]);
+            const bool sok = nv != v;
+            v = nv;
+            if (sok) {
+                commit(t);
+            }
+            spdlog::info("[PragmataVR] Menu: screen width={:.0f} distance={:.2f} yaw={:.0f} pitch={:.0f}{}",
+                t->screen[0], t->screen[1], t->screen[2], t->screen[3], sok ? "" : " (limit)");
+            play_click(sok);
             return;
         }
 
@@ -864,6 +959,51 @@ private:
     std::chrono::steady_clock::time_point m_last_chord{};
     std::atomic<std::chrono::steady_clock::time_point> m_block_pad_until{};
 };
+
+// Game-screen HUD: maps the game's flat GUI projection (NDC -1..1, its own 16:9 layout) onto a rectangle in the eye's
+// image. The rectangle is a virtual screen width_deg wide, distance meters away, at yaw/pitch from straight ahead,
+// rotated by `lock` (fixed-in-room anchor or identity), seen from this eye's pose (eye_to_head) with its projection.
+// Returns false if the screen's center is behind this eye.
+inline bool screen_projection(Matrix4x4f& out, const Matrix4x4f& flat, const Matrix4x4f& eye_proj, const Matrix4x4f& eye_to_head,
+    const Matrix4x4f& lock, const HudTune& t)
+{
+    const float yaw = glm::radians(t.screen[ScreenYaw]);
+    const float pitch = glm::radians(t.screen[ScreenPitch]);
+    const float dist = t.screen[ScreenDistance];
+
+    const glm::mat4 aim = glm::rotate(glm::mat4{1.0f}, -yaw, glm::vec3{0.0f, 1.0f, 0.0f}) *
+                          glm::rotate(glm::mat4{1.0f}, pitch, glm::vec3{1.0f, 0.0f, 0.0f});
+
+    const glm::vec4 center_head = lock * (aim * glm::vec4{0.0f, 0.0f, -dist, 1.0f});
+    const glm::vec4 center_eye = glm::inverse(eye_to_head) * glm::vec4{glm::vec3{center_head}, 1.0f};
+    const glm::vec4 clip = eye_proj * center_eye;
+
+    if (clip.w <= 1e-4f) {
+        return false;
+    }
+
+    const float cx = clip.x / clip.w;
+    const float cy = clip.y / clip.w;
+
+    // Physical half size of the virtual screen, in meters. Height follows the game's own aspect (flat[1][1] / flat[0][0]).
+    const float half_w = dist * std::tan(glm::radians(t.screen[ScreenWidth]) * 0.5f);
+    const float flat_aspect = flat[0][0] != 0.0f ? std::fabs(flat[1][1] / flat[0][0]) : (16.0f / 9.0f);
+    const float half_h = half_w / flat_aspect;
+
+    // NDC per meter at the screen's depth: d(x/w)/dx = P00 / w.
+    const float sx = half_w * eye_proj[0][0] / clip.w;
+    const float sy = half_h * eye_proj[1][1] / clip.w;
+
+    // T maps flat clip space to eye clip space: x' = sx*x + cx*w, y' = sy*y + cy*w; z and w unchanged.
+    glm::mat4 T{1.0f};
+    T[0][0] = sx;
+    T[1][1] = sy;
+    T[3][0] = cx;
+    T[3][1] = cy;
+
+    out = T * flat;
+    return true;
+}
 
 inline void adjust_projection(Matrix4x4f& m, float zoom, float x, float y) {
     m[0][0] *= zoom;
