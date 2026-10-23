@@ -114,11 +114,17 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
         proj = vr->get_runtime()->projections[left ? 0 : 1];
     }
 
-    float cx_ndc = 0.0f;
-    float cy_ndc = 0.0f;
-    if (proj[2][3] != 0.0f) {
-        cx_ndc = std::clamp(proj[2][0] / proj[2][3], -0.5f, 0.5f);
-        cy_ndc = std::clamp(proj[2][1] / proj[2][3], -0.5f, 0.5f);
+    // Menu direction in head space: straight ahead, or the room anchor when the HUD is fixed in the room.
+    const glm::vec4 dir = hud.lock_rotation() * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
+    const glm::vec4 clip = proj * dir;
+    if (clip.w <= 1e-4f) {
+        return; // the menu's spot in the room is behind the viewer
+    }
+
+    const float cx_ndc = clip.x / clip.w;
+    const float cy_ndc = clip.y / clip.w;
+    if (std::fabs(cx_ndc) > 1.6f || std::fabs(cy_ndc) > 1.6f) {
+        return; // well outside this eye's view
     }
 
     const float bb_w = (float)bb_desc.Width;

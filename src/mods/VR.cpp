@@ -347,6 +347,9 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
             const float x = left ? tune->depth_shift : -tune->depth_shift;
             pragmatavr::adjust_projection(m, tune->zoom, x, 0.0f);
 
+            // Fixed-in-room HUD: rotate the GUI camera's view space against the head.
+            m = m * pragmatavr::HudTuning::get().lock_rotation();
+
             if (tune->log_elements) {
                 pragmatavr::HudTuning::get().note_element(pragmatavr::g_current_gui_hash, pragmatavr::g_current_gui_name);
             }
@@ -3245,10 +3248,26 @@ void VR::on_frame() {
                 ImGui::TextColored(color, "[%s] invert", gt.invert[row.field] ? "x" : " ");
                 break;
             }
-            case pragmatavr::MenuRow::Kind::Toggle:
-                ImGui::TextColored(color, "%s  %s", marker,
-                    tune->hack_locked ? "LOCKED - Enter to unlock" : "UNLOCKED - Enter to lock");
+            case pragmatavr::MenuRow::Kind::Toggle: {
+                const char* text = "";
+                switch (row.action) {
+                case pragmatavr::ActionToggleHudFixed:
+                    text = tune->hud_fixed ? "HUD position: FIXED in the room (A to change)" : "HUD position: FOLLOWS your head (A to change)";
+                    break;
+                case pragmatavr::ActionToggleLockInvert:
+                    text = tune->lock_invert ? "Fixed HUD direction: FLIPPED (A if the HUD moves with your head)" : "Fixed HUD direction: normal (A if the HUD moves with your head)";
+                    break;
+                case pragmatavr::ActionToggleGhost:
+                    text = tune->hide_ghost ? "Ghost / double layer: HIDDEN (A to show)" : "Ghost / double layer: SHOWN (A to hide)";
+                    break;
+                case pragmatavr::ActionToggleHackLock:
+                default:
+                    text = tune->hack_locked ? "LOCKED - A to unlock" : "UNLOCKED - A to lock";
+                    break;
+                }
+                ImGui::TextColored(color, "%s  %s", marker, text);
                 break;
+            }
             case pragmatavr::MenuRow::Kind::Action:
             default:
                 ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
@@ -3275,6 +3294,9 @@ void VR::on_present() {
     pragmata_report_xinput_use();
     pragmatavr::HudTuning::get().poll_keys();
     pragmatavr::HudTuning::get().poll_pad();
+    if (is_hmd_active()) {
+        pragmatavr::HudTuning::get().update_head(get_rotation(0));
+    }
 #endif
     
 

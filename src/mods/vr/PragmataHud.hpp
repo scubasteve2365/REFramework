@@ -44,6 +44,8 @@
 #include <vector>
 
 #include <spdlog/spdlog.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace pragmatavr {
 
@@ -90,6 +92,9 @@ struct HudTune {
     bool log_elements{true};
     bool hack_locked{true};
     float menu_width{0.42f}; // menu width as a fraction of the eye image width
+    bool hud_fixed{true};    // 3D HUD panels and the menu stay fixed in the room instead of following the head
+    bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
+    bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     std::array<GroupTune, GroupCount> groups{};
 
     HudTune() {
@@ -141,6 +146,10 @@ struct MenuRow {
 
 enum MenuAction : int {
     ActionNone = 0,
+    ActionToggleHudFixed,
+    ActionRecenter,
+    ActionToggleLockInvert,
+    ActionToggleGhost,
     ActionToggleHackLock,
     ActionResetGroup,
     ActionSnapshot,
@@ -275,6 +284,54 @@ public:
         if (pressed(XINPUT_GAMEPAD_B)) handle_key(VK_BACK, big);
     }
 
+    // ---- Fixed-in-room HUD ----
+    // update_head is called once per presented frame with the HMD rotation (rotation only).
+    // lock_rotation() is the view-space rotation that keeps the 3D HUD and the menu fixed relative to an
+    // anchor (the head's yaw when last recentered): head^-1 * anchor. Identity when the HUD follows the head.
+    std::atomic<bool> recenter_requested{false};
+    std::atomic<bool> recenter_if_far{false};
+
+    static Matrix4x4f yaw_only(const Matrix4x4f& r) {
+        const glm::vec4 f = r * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
+        const float yaw = std::atan2(-f.x, -f.z);
+        return glm::rotate(glm::mat4{1.0f}, yaw, glm::vec3{0.0f, 1.0f, 0.0f});
+    }
+
+    void update_head(const Matrix4x4f& hmd_rotation) {
+        Matrix4x4f hmd = hmd_rotation;
+        hmd[3] = glm::vec4{0.0f, 0.0f, 0.0f, 1.0f};
+
+        std::scoped_lock _{m_head_mtx};
+
+        bool recenter = recenter_requested.exchange(false) || !m_anchor_valid;
+
+        if (recenter_if_far.exchange(false) && m_anchor_valid) {
+            const glm::vec4 head_fwd = yaw_only(hmd) * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
+            const glm::vec4 anchor_fwd = m_anchor * glm::vec4{0.0f, 0.0f, -1.0f, 0.0f};
+            if (glm::dot(glm::vec3{head_fwd}, glm::vec3{anchor_fwd}) < 0.7f) { // more than about 45 degrees away
+                recenter = true;
+            }
+        }
+
+        if (recenter) {
+            m_anchor = yaw_only(hmd);
+            m_anchor_valid = true;
+            spdlog::info("[PragmataVR] HUD recentered");
+        }
+
+        m_lock = glm::transpose(hmd) * m_anchor;
+    }
+
+    Matrix4x4f lock_rotation() {
+        const auto t = tune();
+        if (!t->hud_fixed) {
+            return glm::mat4{1.0f};
+        }
+
+        std::scoped_lock _{m_head_mtx};
+        return t->lock_invert ? glm::transpose(m_lock) : m_lock;
+    }
+
     // ---- Menu state, read by VR::on_frame (draw) and D3D12Component::on_frame (composite) ----
     std::atomic<bool> menu_open{false};
     std::atomic<int> menu_selected{0};
@@ -328,6 +385,12 @@ private:
             r.label = std::move(label);
             m_rows.push_back(std::move(r));
         };
+
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "View");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position");
+        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD in front of me");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost / double layer");
 
         for (int g = 0; g < GroupCount; ++g) {
             add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_LABELS[g]);
@@ -387,6 +450,9 @@ private:
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += fmt::format("hack_locked={}\n", t.hack_locked ? 1 : 0);
         s += fmt::format("menu_width={:.3f}\n", t.menu_width);
+        s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
+        s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
+        s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
 
         for (int g = 0; g < GroupCount; ++g) {
             const auto& gt = t.groups[g];
@@ -498,6 +564,9 @@ private:
                 else if (key == "log_elements") t->log_elements = val != 0.0f;
                 else if (key == "hack_locked") t->hack_locked = val != 0.0f;
                 else if (key == "menu_width") t->menu_width = std::clamp(val, 0.15f, 0.9f);
+                else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
+                else if (key == "lock_invert") t->lock_invert = val != 0.0f;
+                else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 continue;
             }
 
@@ -615,6 +684,8 @@ private:
             menu_open = !menu_open.load();
             if (!menu_open.load()) {
                 block_pad_briefly();
+            } else {
+                recenter_if_far = true;
             }
             spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
             play_click(true);
@@ -667,7 +738,23 @@ private:
                 return;
             }
             case MenuRow::Kind::Toggle:
-                if (row.action == ActionToggleHackLock) {
+                if (row.action == ActionToggleHudFixed) {
+                    t->hud_fixed = !t->hud_fixed;
+                    commit(t);
+                    recenter_requested = true;
+                    spdlog::info("[PragmataVR] Menu: HUD {}", t->hud_fixed ? "fixed in room" : "follows head");
+                    play_click(true);
+                } else if (row.action == ActionToggleLockInvert) {
+                    t->lock_invert = !t->lock_invert;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: fixed HUD direction {}", t->lock_invert ? "flipped" : "normal");
+                    play_click(true);
+                } else if (row.action == ActionToggleGhost) {
+                    t->hide_ghost = !t->hide_ghost;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
+                    play_click(true);
+                } else if (row.action == ActionToggleHackLock) {
                     t->hack_locked = !t->hack_locked;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: hacking circle {}", t->hack_locked ? "locked" : "unlocked");
@@ -685,6 +772,10 @@ private:
                     t->groups[row.group].invert = inverts;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset {}", GROUP_KEYS[row.group]);
+                    play_click(true);
+                } else if (row.action == ActionRecenter) {
+                    recenter_requested = true;
+                    spdlog::info("[PragmataVR] Menu: recenter HUD");
                     play_click(true);
                 } else if (row.action == ActionSnapshot) {
                     request_snapshot();
@@ -764,6 +855,10 @@ private:
     std::array<bool, KEYS.size()> m_key_down{};
     std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
     std::vector<MenuRow> m_rows{};
+    std::mutex m_head_mtx{};
+    Matrix4x4f m_anchor{1.0f};
+    Matrix4x4f m_lock{1.0f};
+    bool m_anchor_valid{false};
     WORD m_pad_prev{0};
     int m_stick_prev{0};
     std::chrono::steady_clock::time_point m_last_chord{};
