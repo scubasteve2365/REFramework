@@ -344,18 +344,8 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
                 m = vr->get_runtime()->projections[(uint32_t)(left ? VRRuntime::Eye::LEFT : VRRuntime::Eye::RIGHT)];
             }
 
-            float zoom = tune->zoom;
-            float x = 0.0f;
-            float y = 0.0f;
-
-            if (const auto it = tune->elements.find(pragmatavr::g_current_gui_hash); it != tune->elements.end()) {
-                zoom *= it->second.zoom;
-                x = it->second.x;
-                y = it->second.y;
-            }
-
-            x += left ? tune->depth_shift : -tune->depth_shift;
-            pragmatavr::adjust_projection(m, zoom, x, y);
+            const float x = left ? tune->depth_shift : -tune->depth_shift;
+            pragmatavr::adjust_projection(m, tune->zoom, x, 0.0f);
 
             if (tune->log_elements) {
                 pragmatavr::HudTuning::get().note_element(pragmatavr::g_current_gui_hash, pragmatavr::g_current_gui_name);
@@ -3131,6 +3121,9 @@ void VR::update_camera_data(int frame_count) {
 }
 
 void VR::on_present() {
+#if defined(PRAGMATA)
+    pragmatavr::HudTuning::get().poll_keys();
+#endif
     
 
     static bool btn1 = false;
@@ -3413,6 +3406,17 @@ struct GUIRestoreData {
 
 thread_local std::vector<std::unique_ptr<GUIRestoreData>> g_elements_to_reset{};
 
+#if defined(PRAGMATA)
+struct PragmataPanelRestore {
+    REComponent* view{nullptr};
+    REManagedObject* child{nullptr};
+    Vector4f position{};
+    Vector4f scale{};
+};
+
+thread_local std::vector<PragmataPanelRestore> g_pragmata_panel_restore{};
+#endif
+
 bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) {
     
 
@@ -3433,6 +3437,53 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 #if defined(PRAGMATA)
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
+
+        // PragmataVR: per-group size, position and per-eye gap for Pragmata's World-mode 3D HUD panels.
+        // Applied to the panel's GUI view just before it draws, restored in on_gui_draw_element.
+        {
+            float side = 0.0f;
+            const int group = pragmatavr::group_for(name, side);
+
+            if (group >= 0) {
+                const auto tune = pragmatavr::HudTuning::get().tune();
+                auto pview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
+
+                if (tune->enabled && pview != nullptr &&
+                    sdk::call_object_func<uint32_t>(pview, "get_ViewType", context, pview) == (uint32_t)via::gui::ViewType::World)
+                {
+                    const auto& gt = tune->groups[group];
+                    const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
+                    const float dx = (group == pragmatavr::GroupVitals ? gt.x * side : gt.x) + eye_shift;
+                    const float dy = gt.y * tune->y_sign;
+
+                    PragmataPanelRestore restore{};
+                    restore.view = pview;
+                    restore.position = sdk::call_object_func_easy<Vector4f>(pview, "get_Position");
+
+                    Vector3f new_position{ restore.position.x + dx, restore.position.y + dy, restore.position.z };
+                    sdk::call_object_func<void*>(pview, "set_Position", context, pview, &new_position);
+
+                    if (gt.size != 1.0f) {
+                        auto pchild = sdk::call_object_func<REManagedObject*>(pview, "get_Child", context, pview);
+
+                        if (pchild != nullptr) {
+                            restore.child = pchild;
+                            restore.scale = sdk::call_object_func_easy<Vector4f>(pchild, "get_Scale");
+
+                            Vector4f new_scale{ restore.scale.x * gt.size, restore.scale.y * gt.size, restore.scale.z, 1.0f };
+                            sdk::call_object_func<void*>(pchild, "set_Scale", context, pchild, &new_scale);
+                        }
+                    }
+
+                    g_pragmata_panel_restore.push_back(restore);
+
+                    static thread_local std::unordered_map<size_t, bool> logged_panels{};
+                    if (logged_panels.emplace(name_hash, true).second) {
+                        spdlog::info("[PragmataVR] Tuning 3D HUD panel {} in group {}", name, pragmatavr::GROUP_KEYS[group]);
+                    }
+                }
+            }
+        }
 #endif
 
         switch (name_hash) {
@@ -3955,6 +4006,21 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
 #if defined(PRAGMATA)
     pragmatavr::g_current_gui_hash = 0;
     pragmatavr::g_current_gui_name.clear();
+
+    if (!g_pragmata_panel_restore.empty()) {
+        auto pcontext = sdk::get_thread_context();
+
+        for (auto& r : g_pragmata_panel_restore) {
+            Vector3f original_position{ r.position.x, r.position.y, r.position.z };
+            sdk::call_object_func<void*>(r.view, "set_Position", pcontext, r.view, &original_position);
+
+            if (r.child != nullptr) {
+                sdk::call_object_func<void*>(r.child, "set_Scale", pcontext, r.child, &r.scale);
+            }
+        }
+
+        g_pragmata_panel_restore.clear();
+    }
 #endif
     
 

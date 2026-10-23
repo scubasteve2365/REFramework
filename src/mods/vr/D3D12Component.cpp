@@ -9,6 +9,12 @@
 
 #include "D3D12Component.hpp"
 
+#if defined(PRAGMATA)
+#include <wincodec.h>
+#include <../../directxtk12-src/Inc/ScreenGrab.h>
+#include "PragmataHud.hpp"
+#endif
+
 namespace vrmod {
 vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     if (m_openvr.left_eye_tex[0].texture == nullptr || m_force_reset) {
@@ -64,6 +70,44 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
 
     const auto frame_count = vr->m_render_frame_count;
+
+#if defined(PRAGMATA)
+    // PragmataVR snapshot (Pause key): save this frame's eye image, then the other eye's next frame.
+    {
+        auto& hud = pragmatavr::HudTuning::get();
+
+        if (hud.snapshot_frames_left.load() > 0) {
+            const bool left = (frame_count % 2) == vr->m_left_eye_interval;
+            auto& done = left ? hud.snapshot_left_done : hud.snapshot_right_done;
+
+            if (!done.load()) {
+                done = true;
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+                const auto dir = pragmatavr::HudTuning::data_dir() / "snapshots";
+                const auto png = dir / (hud.snapshot_stem + (left ? "_left.png" : "_right.png"));
+
+                auto hr = DirectX::SaveWICTextureToFile(command_queue, backbuffer.Get(), GUID_ContainerFormatPng, png.wstring().c_str(),
+                    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT, &GUID_WICPixelFormat24bppBGR);
+
+                if (SUCCEEDED(hr)) {
+                    spdlog::info("[PragmataVR] Snapshot saved: {}", png.string());
+                } else {
+                    const auto dds = dir / (hud.snapshot_stem + (left ? "_left.dds" : "_right.dds"));
+                    hr = DirectX::SaveDDSTextureToFile(command_queue, backbuffer.Get(), dds.wstring().c_str(),
+                        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT);
+                    spdlog::info("[PragmataVR] Snapshot PNG failed, DDS {}: {}", SUCCEEDED(hr) ? "saved" : "failed too", dds.string());
+                }
+            }
+
+            if (hud.snapshot_left_done.load() && hud.snapshot_right_done.load()) {
+                hud.snapshot_frames_left = 0;
+            } else {
+                hud.snapshot_frames_left--;
+            }
+        }
+    }
+#endif
 
     
     //#############################
