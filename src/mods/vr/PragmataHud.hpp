@@ -124,6 +124,7 @@ struct HudTune {
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
+    bool pin_hud{true};      // Build 13: hold each HUD panel still in the GUI camera's space (off = the game moves it)
 
     // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
     // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
@@ -164,6 +165,10 @@ inline int group_for(std::string_view name) {
     if (name == "ui2201Gui" || name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     return -1;
 }
+
+// The GUI camera the 3D HUD is drawn through (set by the projection hook every frame). Used to pin each HUD panel
+// in that camera's space (Build 13).
+inline std::atomic<void*> g_gui_camera{nullptr};
 
 inline thread_local size_t g_current_gui_hash = 0;
 inline thread_local std::string g_current_gui_name{};
@@ -285,6 +290,8 @@ enum MenuAction : int {
     ActionResetGroup,
     ActionSnapshot,
     ActionToggleScaleCenter,
+    ActionTogglePin,
+    ActionSnapshotSeries,
     ActionClose,
 };
 
@@ -311,6 +318,8 @@ public:
 
     // Called once per presented frame. Edge-triggered, no key repeat, only while the game has focus.
     void poll_keys() {
+        poll_snapshot_series();
+
         DWORD fg_pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &fg_pid);
         const bool focused = fg_pid == GetCurrentProcessId();
@@ -421,6 +430,7 @@ public:
     // The game-screen HUD and the mod menu are real planes in tracking space (anchor pose + offsets), seen from each
     // eye's actual pose, so they stay put when the head turns, tilts or moves.
     std::atomic<bool> recenter_requested{false};
+    std::atomic<int> pin_generation{0};
     std::atomic<bool> recenter_if_far{false};
     std::atomic<bool> menu_place_requested{false};
 
@@ -462,6 +472,7 @@ public:
         if (recenter) {
             m_state.hud = Pose{yaw_only(hmd), hmd_position};
             m_anchor_valid = true;
+            pin_generation++; // HUD panels take their resting place again
             spdlog::info("[PragmataVR] HUD recentered");
         }
 
@@ -592,6 +603,8 @@ private:
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "SOUND AND TOOLS", "");
         add(MenuRow::Kind::Value, GROUP_MENU, MenuClickVolume, ActionNone, "Click volume", "A = edit. Volume of the menu click sounds (0 = off)");
         add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
+        add(MenuRow::Kind::Action, -1, -1, ActionSnapshotSeries, "Snapshot series",
+            "A = close the menu, wait 3 s, then 5 snapshots 1 s apart (move your head to record HUD motion)");
         add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
 
         // ==== GAME HUD SETTINGS (lower band) ====
@@ -616,6 +629,8 @@ private:
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room (default), or HUD follows your head");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionTogglePin, "HUD motion",
+            "A = PINNED holds each HUD element still (recenter to reset), GAME lets the game sway it");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
             "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
@@ -688,6 +703,8 @@ private:
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
+        s += "# pin_hud = 1: each HUD panel is held still in the GUI camera's space (the game's own HUD motion is removed).\n";
+        s += fmt::format("pin_hud={}\n", t.pin_hud ? 1 : 0);
         s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
         s += "# menu.click_volume = click sound level (0 = off, 0.50 = half, 1.00 = full).\n";
         for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
@@ -830,6 +847,7 @@ private:
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
+                else if (key == "pin_hud") t->pin_hud = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -995,6 +1013,27 @@ private:
         // Coming in from the right, land on the INV box (the nearest thing on that side).
         menu_on_invert = dir < 0 && m_rows[best].kind == MenuRow::Kind::Value;
         return true;
+    }
+
+    // Snapshot series (Build 13): 5 snapshots one second apart, starting 3 seconds after the menu closes, so head
+    // movement can be recorded with the HUD showing and the menu out of the way.
+    int m_series_left{0};
+    std::chrono::steady_clock::time_point m_series_next{};
+
+    void poll_snapshot_series() {
+        if (m_series_left <= 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < m_series_next || snapshot_frames_left.load() > 0) {
+            return;
+        }
+        request_snapshot();
+        --m_series_left;
+        m_series_next = now + std::chrono::seconds(1);
+        if (m_series_left == 0) {
+            spdlog::info("[PragmataVR] Snapshot series finished");
+        }
     }
 
     void block_pad_briefly() {
@@ -1166,6 +1205,12 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
                     play_click(true);
+                } else if (row.action == ActionTogglePin) {
+                    t->pin_hud = !t->pin_hud;
+                    commit(t);
+                    pin_generation++;
+                    spdlog::info("[PragmataVR] Menu: HUD motion {}", t->pin_hud ? "pinned" : "game");
+                    play_click(true);
                 } else if (row.action == ActionToggleScaleCenter) {
                     t->scale_about_center = !t->scale_about_center;
                     commit(t);
@@ -1214,6 +1259,15 @@ private:
                     play_click(true);
                 } else if (row.action == ActionSnapshot) {
                     request_snapshot();
+                } else if (row.action == ActionSnapshotSeries) {
+                    m_series_left = 5;
+                    m_series_next = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+                    menu_open = false;
+                    menu_editing = false;
+                    menu_on_invert = false;
+                    block_pad_briefly();
+                    spdlog::info("[PragmataVR] Snapshot series: 5 snapshots starting in 3 s");
+                    play_click(true);
                 } else if (row.action == ActionClose) {
                     menu_open = false;
                     block_pad_briefly();

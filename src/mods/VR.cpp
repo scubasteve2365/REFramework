@@ -329,6 +329,7 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
     // PragmataVR: per-panel zoom/offset and eye selection for Pragmata's 3D HUD (pragmatavr_hud.ini).
     {
         const auto tune = pragmatavr::HudTuning::get().tune();
+        pragmatavr::g_gui_camera = (void*)camera;
 
         if (tune->enabled && tune->layout_mode == 1) {
             // Game-screen HUD: keep the game's own flat GUI projection and map it onto a virtual screen in each eye.
@@ -3302,6 +3303,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionTogglePin:
+            v.value = t.pin_hud ? "PINNED" : "GAME";
+            v.value_color = t.pin_hud ? ACCENT : AMBER;
+            break;
         case pragmatavr::ActionToggleScaleCenter:
             v.value = t.scale_about_center ? "ELEMENT CENTER" : "PANEL ORIGIN";
             v.value_color = t.scale_about_center ? ACCENT : AMBER;
@@ -3466,7 +3471,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 12");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 13");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3553,7 +3558,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 12"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 12");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 13"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 13");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4057,7 +4062,46 @@ struct PragmataPanelRestore {
     REComponent* view{nullptr};
     Vector4f position{};
     std::vector<PragmataChildRestore> children{};
+    RETransform* transform{nullptr}; // Build 13 pin: the panel's world matrix, put back after the draw
+    Matrix4x4f world{};
 };
+
+// PragmataVR Build 13: hold each HUD panel still. Pragmata moves its 3D HUD panels itself (they sway and lag behind
+// camera motion, and the camera follows the headset in VR), so even with the room-fixed projection they drifted with
+// head movement and changed depth between eyes. Each panel's pose relative to the GUI camera (R = camera^-1 * world)
+// is captured while it settles (its first second on screen, and the first second after each recenter), then every
+// draw puts the panel at camera * R. What the GPU sees through the camera is then the same every frame and in both
+// eyes, and the projection hook alone places it in the room. Captured on left-eye frames only.
+namespace pragmata_pin {
+struct Entry {
+    Matrix4x4f rest{1.0f};
+    int generation{-1};
+    std::chrono::steady_clock::time_point settle_until{};
+    std::chrono::steady_clock::time_point last_seen{};
+    std::chrono::steady_clock::time_point last_log{};
+    int logs{0};
+};
+
+std::mutex g_mtx{};
+std::unordered_map<size_t, Entry> g_pins{};
+
+std::optional<Matrix4x4f> gui_camera_world() {
+    auto cam = (REManagedObject*)pragmatavr::g_gui_camera.load();
+    if (cam == nullptr) {
+        return std::nullopt;
+    }
+    static auto component_t = sdk::find_type_definition("via.Component");
+    auto td = utility::re_managed_object::get_type_definition(cam);
+    if (td == nullptr || component_t == nullptr || !td->is_a(component_t)) {
+        return std::nullopt;
+    }
+    auto go = utility::re_component::get_game_object((REComponent*)cam);
+    if (go == nullptr || go->transform == nullptr) {
+        return std::nullopt;
+    }
+    return go->transform->worldTransform;
+}
+} // namespace pragmata_pin
 
 thread_local std::vector<PragmataPanelRestore> g_pragmata_panel_restore{};
 
@@ -4251,6 +4295,52 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     PragmataPanelRestore restore{};
                     restore.view = pview;
                     restore.position = sdk::call_object_func_easy<Vector4f>(pview, "get_Position");
+
+                    // Build 13: pin the panel in the GUI camera's space (see pragmata_pin).
+                    if (tune->pin_hud && game_object->transform != nullptr) {
+                        auto& world = game_object->transform->worldTransform;
+                        const auto cam = pragmata_pin::gui_camera_world();
+                        const Matrix4x4f cam_m = cam ? *cam : Matrix4x4f{1.0f};
+                        const Matrix4x4f rel = glm::inverse(cam_m) * world;
+                        const auto now = std::chrono::steady_clock::now();
+                        const int gen = pragmatavr::HudTuning::get().pin_generation.load();
+                        const bool capture_eye = is_left_eye();
+
+                        Matrix4x4f rest{};
+                        {
+                            std::scoped_lock _{pragmata_pin::g_mtx};
+                            auto& e = pragmata_pin::g_pins[name_hash];
+                            const bool reappeared = now - e.last_seen > std::chrono::milliseconds(500);
+                            if (e.generation != gen || reappeared) {
+                                if (e.generation != gen) {
+                                    e.logs = 0; // log the motion again after each recenter
+                                }
+                                e.generation = gen;
+                                e.settle_until = now + std::chrono::milliseconds(1000);
+                                e.rest = rel;
+                            }
+                            if (capture_eye && now < e.settle_until) {
+                                e.rest = rel; // still settling: follow the game
+                            }
+                            e.last_seen = now;
+                            rest = e.rest;
+
+                            // Diagnostics: how the game moves this panel and the camera, twice a second, 40 lines per
+                            // panel after each capture.
+                            if (capture_eye && tune->log_elements && e.logs < 40 && now - e.last_log > std::chrono::milliseconds(500)) {
+                                e.last_log = now;
+                                e.logs++;
+                                const auto hmd = get_position(0);
+                                spdlog::info("[PragmataVR] Pin {}: cam {} pos ({:.3f}, {:.3f}, {:.3f}) fwd ({:.2f}, {:.2f}, {:.2f}) | panel rel ({:.3f}, {:.3f}, {:.3f}) rest ({:.3f}, {:.3f}, {:.3f}) | hmd ({:.3f}, {:.3f}, {:.3f})",
+                                    name, cam ? "ok" : "MISSING", cam_m[3].x, cam_m[3].y, cam_m[3].z, cam_m[2].x, cam_m[2].y, cam_m[2].z,
+                                    rel[3].x, rel[3].y, rel[3].z, rest[3].x, rest[3].y, rest[3].z, hmd.x, hmd.y, hmd.z);
+                            }
+                        }
+
+                        restore.transform = game_object->transform;
+                        restore.world = world;
+                        world = cam_m * rest;
+                    }
 
                     // Element center, found before anything is changed this draw (values are restored after each draw).
                     const bool centered = group != pragmatavr::GroupHack && tune->scale_about_center;
@@ -4835,6 +4925,10 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
         auto pcontext = sdk::get_thread_context();
 
         for (auto& r : g_pragmata_panel_restore) {
+            if (r.transform != nullptr) {
+                r.transform->worldTransform = r.world;
+            }
+
             Vector3f original_position{ r.position.x, r.position.y, r.position.z };
             sdk::call_object_func<void*>(r.view, "set_Position", pcontext, r.view, &original_position);
 
