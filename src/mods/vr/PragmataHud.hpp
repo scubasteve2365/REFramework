@@ -124,13 +124,12 @@ struct HudTune {
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
-    bool pin_hud{true};      // Build 13: hold each HUD panel still in the GUI camera's space (off = the game moves it)
 
     // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
     // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
     // always uses 0 (the ini value is ignored; the game-screen code is kept for reference).
     int layout_mode{0};
-    std::array<float, 4> screen{70.0f, 2.0f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
+    std::array<float, 4> screen{70.0f, 1.5f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
     std::array<bool, 4> screen_invert{};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
@@ -165,10 +164,6 @@ inline int group_for(std::string_view name) {
     if (name == "ui2201Gui" || name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     return -1;
 }
-
-// The GUI camera the 3D HUD is drawn through (set by the projection hook every frame). Used to pin each HUD panel
-// in that camera's space (Build 13).
-inline std::atomic<void*> g_gui_camera{nullptr};
 
 inline thread_local size_t g_current_gui_hash = 0;
 inline thread_local std::string g_current_gui_name{};
@@ -290,7 +285,6 @@ enum MenuAction : int {
     ActionResetGroup,
     ActionSnapshot,
     ActionToggleScaleCenter,
-    ActionTogglePin,
     ActionSnapshotSeries,
     ActionClose,
 };
@@ -430,7 +424,6 @@ public:
     // The game-screen HUD and the mod menu are real planes in tracking space (anchor pose + offsets), seen from each
     // eye's actual pose, so they stay put when the head turns, tilts or moves.
     std::atomic<bool> recenter_requested{false};
-    std::atomic<int> pin_generation{0};
     std::atomic<bool> recenter_if_far{false};
     std::atomic<bool> menu_place_requested{false};
 
@@ -472,7 +465,6 @@ public:
         if (recenter) {
             m_state.hud = Pose{yaw_only(hmd), hmd_position};
             m_anchor_valid = true;
-            pin_generation++; // HUD panels take their resting place again
             spdlog::info("[PragmataVR] HUD recentered");
         }
 
@@ -629,8 +621,8 @@ private:
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room (default), or HUD follows your head");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionTogglePin, "HUD motion",
-            "A = PINNED holds each HUD element still (recenter to reset), GAME lets the game sway it");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
+            "A = edit. How far away the room-fixed HUD sits (meters). Sizes look the same at any distance");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
             "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
@@ -703,8 +695,8 @@ private:
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
-        s += "# pin_hud = 1: each HUD panel is held still in the GUI camera's space (the game's own HUD motion is removed).\n";
-        s += fmt::format("pin_hud={}\n", t.pin_hud ? 1 : 0);
+        s += "# screen.distance = HUD distance in meters (the room-fixed HUD is shown as a panel this far in front of you).\n";
+        s += fmt::format("screen.distance={:.2f}\n", t.screen[ScreenDistance]);
         s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
         s += "# menu.click_volume = click sound level (0 = off, 0.50 = half, 1.00 = full).\n";
         for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
@@ -847,7 +839,6 @@ private:
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
-                else if (key == "pin_hud") t->pin_hud = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1204,12 +1195,6 @@ private:
                     t->hide_ghost = !t->hide_ghost;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
-                    play_click(true);
-                } else if (row.action == ActionTogglePin) {
-                    t->pin_hud = !t->pin_hud;
-                    commit(t);
-                    pin_generation++;
-                    spdlog::info("[PragmataVR] Menu: HUD motion {}", t->pin_hud ? "pinned" : "game");
                     play_click(true);
                 } else if (row.action == ActionToggleScaleCenter) {
                     t->scale_about_center = !t->scale_about_center;
