@@ -3290,6 +3290,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleScaleCenter:
+            v.value = t.scale_about_center ? "ELEMENT CENTER" : "PANEL ORIGIN";
+            v.value_color = t.scale_about_center ? ACCENT : AMBER;
+            break;
         case pragmatavr::ActionToggleHackLock:
         default:
             v.value = t.hack_locked ? "LOCKED" : "UNLOCKED";
@@ -3412,7 +3416,7 @@ void VR::on_frame() {
     // ---- Measure: column widths fit every label, value and header in both bands ----
     float value_w = 0.0f;
     for (const char* s : {"GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
-             "+2000", "-2000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "5.00x"}) {
+             "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN"}) {
         value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
 
@@ -3447,7 +3451,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 10");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 11");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3507,7 +3511,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 10"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 10");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 11"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 11");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3981,14 +3985,138 @@ struct GUIRestoreData {
 thread_local std::vector<std::unique_ptr<GUIRestoreData>> g_elements_to_reset{};
 
 #if defined(PRAGMATA)
-struct PragmataPanelRestore {
-    REComponent* view{nullptr};
-    REManagedObject* child{nullptr};
+struct PragmataChildRestore {
+    REManagedObject* obj{nullptr};
     Vector4f position{};
     Vector4f scale{};
+    bool restore_position{false};
+};
+
+struct PragmataPanelRestore {
+    REComponent* view{nullptr};
+    Vector4f position{};
+    std::vector<PragmataChildRestore> children{};
 };
 
 thread_local std::vector<PragmataPanelRestore> g_pragmata_panel_restore{};
+
+// PragmataVR Build 11: where an element really is inside its panel.
+// Pragmata lays these HUD panels out like a full game screen, with the element (health bar, weapon wheel, tutorial box)
+// placed out toward a corner of that canvas. Scaling the panel's root around its origin (Builds 3-6) therefore also
+// pushed the element away from the center by the same factor, so a big enough element ended up out of view. Here the
+// panel's GUI tree is walked (local position and scale only, no rotation) and the center of the box around its visible
+// leaf objects is used as the point to grow around. Results are cached per panel and refreshed every 16 frames.
+namespace pragmata_pivot {
+struct Entry {
+    Vector2f pivot{0.0f, 0.0f};
+    bool valid{false};
+    int frame{-1000};
+    bool logged{false};
+};
+
+std::mutex g_mtx{};
+std::unordered_map<size_t, Entry> g_cache{};
+
+bool is_visible(REManagedObject* o, sdk::VMContext* ctx) {
+    auto td = utility::re_managed_object::get_type_definition(o);
+    if (td == nullptr) {
+        return true;
+    }
+    auto m = td->get_method("get_Visible");
+    if (m == nullptr) {
+        return true;
+    }
+    return m->call<bool>(ctx, o);
+}
+
+struct Walk {
+    sdk::VMContext* ctx{};
+    Vector2f lo{(std::numeric_limits<float>::max)(), (std::numeric_limits<float>::max)()};
+    Vector2f hi{-(std::numeric_limits<float>::max)(), -(std::numeric_limits<float>::max)()};
+    int leaves{0};
+    int nodes{0};
+    std::string dump{};
+    bool want_dump{false};
+
+    void add(const Vector2f& p) {
+        lo = glm::min(lo, p);
+        hi = glm::max(hi, p);
+        ++leaves;
+    }
+
+    // obj's children, placed with the parent's accumulated offset and scale.
+    void children(REManagedObject* obj, const Vector2f& offset, const Vector2f& scale, int depth) {
+        if (depth > 14) {
+            return;
+        }
+        auto c = sdk::call_object_func<REManagedObject*>(obj, "get_Child", ctx, obj);
+        for (int n = 0; c != nullptr && n < 256 && nodes < 1024; ++n) {
+            ++nodes;
+            const bool vis = is_visible(c, ctx);
+            const auto p4 = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+            const auto s4 = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+            const Vector2f p = offset + scale * Vector2f{p4.x, p4.y};
+            const Vector2f sc = scale * Vector2f{s4.x, s4.y};
+            const auto first_child = sdk::call_object_func<REManagedObject*>(c, "get_Child", ctx, c);
+
+            if (want_dump && dump.size() < 6000) {
+                auto td = utility::re_managed_object::get_type_definition(c);
+                dump += fmt::format("\n    {:>{}}{} vis={} pos=({:.0f},{:.0f}) scale=({:.2f},{:.2f}) -> ({:.0f},{:.0f})",
+                    "", depth * 2, td != nullptr ? td->get_full_name() : std::string{"?"}, vis ? 1 : 0, p4.x, p4.y, s4.x, s4.y, p.x, p.y);
+            }
+
+            if (vis) {
+                if (first_child == nullptr) {
+                    add(p); // a drawn piece (texture, text, rect)
+                } else {
+                    children(c, p, sc, depth + 1);
+                }
+            }
+            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+        }
+    }
+};
+
+// Center of the element's visible pieces, in the space the view's top-level children are positioned in.
+std::optional<Vector2f> get(size_t hash, const std::string& name, REComponent* view, sdk::VMContext* ctx, int frame) {
+    {
+        std::scoped_lock _{g_mtx};
+        auto& e = g_cache[hash];
+        if (frame - e.frame >= 0 && frame - e.frame < 16) {
+            return e.valid ? std::optional<Vector2f>{e.pivot} : std::nullopt;
+        }
+    }
+
+    bool want_dump = false;
+    {
+        std::scoped_lock _{g_mtx};
+        want_dump = !g_cache[hash].logged;
+    }
+
+    Walk w{};
+    w.ctx = ctx;
+    w.want_dump = want_dump;
+    w.children((REManagedObject*)view, Vector2f{0.0f, 0.0f}, Vector2f{1.0f, 1.0f}, 0);
+
+    Entry out{};
+    out.frame = frame;
+    if (w.leaves > 0) {
+        out.pivot = (w.lo + w.hi) * 0.5f;
+        out.valid = true;
+    }
+
+    std::scoped_lock _{g_mtx};
+    auto& e = g_cache[hash];
+    out.logged = e.logged;
+    if (want_dump && out.valid) {
+        out.logged = true;
+        spdlog::info("[PragmataVR] Element center for {}: ({:.0f}, {:.0f}) from {} visible pieces of {} objects, box ({:.0f},{:.0f})-({:.0f},{:.0f}). Tree:{}",
+            name, out.pivot.x, out.pivot.y, w.leaves, w.nodes, w.lo.x, w.lo.y, w.hi.x, w.hi.y, w.dump);
+    }
+    e = out;
+    return out.valid ? std::optional<Vector2f>{out.pivot} : std::nullopt;
+}
+} // namespace pragmata_pivot
 #endif
 
 bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) {
@@ -4012,11 +4140,10 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
 
-        // PragmataVR: per-group size, position and per-eye gap for Pragmata's World-mode 3D HUD panels.
+        // PragmataVR: per-element size, position and per-eye gap for Pragmata's World-mode 3D HUD panels.
         // Applied to the panel's GUI view just before it draws, restored in on_gui_draw_element.
         {
-            float side = 0.0f;
-            const int group = pragmatavr::group_for(name, side);
+            const int group = pragmatavr::group_for(name);
 
             if (group >= 0) {
                 const auto tune = pragmatavr::HudTuning::get().tune();
@@ -4027,33 +4154,65 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 {
                     const auto& gt = tune->groups[group];
                     const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
-                    const float dx = (group == pragmatavr::GroupVitals ? gt.x * side : gt.x) + eye_shift;
+                    const float dx = gt.x + eye_shift;
                     const float dy = gt.y * tune->y_sign;
 
                     PragmataPanelRestore restore{};
                     restore.view = pview;
                     restore.position = sdk::call_object_func_easy<Vector4f>(pview, "get_Position");
 
+                    // Element center, found before anything is changed this draw (values are restored after each draw).
+                    const bool centered = group != pragmatavr::GroupHack && tune->scale_about_center;
+                    std::optional<Vector2f> pivot{};
+                    if (centered && gt.size != 1.0f) {
+                        pivot = pragmata_pivot::get(name_hash, name, pview, context, m_frame_count);
+                    }
+
                     Vector3f new_position{ restore.position.x + dx, restore.position.y + dy, restore.position.z };
                     sdk::call_object_func<void*>(pview, "set_Position", context, pview, &new_position);
 
                     if (gt.size != 1.0f) {
-                        auto pchild = sdk::call_object_func<REManagedObject*>(pview, "get_Child", context, pview);
+                        if (pivot) {
+                            // Grow every top-level piece of the panel around the element's center:
+                            // position -> center + size * (position - center), scale -> size * scale.
+                            const float k = gt.size;
+                            auto c = sdk::call_object_func<REManagedObject*>(pview, "get_Child", context, pview);
+                            for (int n = 0; c != nullptr && n < 64; ++n) {
+                                PragmataChildRestore cr{};
+                                cr.obj = c;
+                                cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+                                cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+                                cr.restore_position = true;
 
-                        if (pchild != nullptr) {
-                            restore.child = pchild;
-                            restore.scale = sdk::call_object_func_easy<Vector4f>(pchild, "get_Scale");
+                                Vector3f p{ pivot->x + k * (cr.position.x - pivot->x), pivot->y + k * (cr.position.y - pivot->y), cr.position.z };
+                                Vector4f sc{ cr.scale.x * k, cr.scale.y * k, cr.scale.z, 1.0f };
+                                sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
+                                sdk::call_object_func<void*>(c, "set_Scale", context, c, &sc);
+                                restore.children.push_back(cr);
 
-                            Vector4f new_scale{ restore.scale.x * gt.size, restore.scale.y * gt.size, restore.scale.z, 1.0f };
-                            sdk::call_object_func<void*>(pchild, "set_Scale", context, pchild, &new_scale);
+                                c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
+                            }
+                        } else {
+                            // Builds 3-6 behaviour (the hacking circle was tuned with this): scale the first child.
+                            auto pchild = sdk::call_object_func<REManagedObject*>(pview, "get_Child", context, pview);
+
+                            if (pchild != nullptr) {
+                                PragmataChildRestore cr{};
+                                cr.obj = pchild;
+                                cr.scale = sdk::call_object_func_easy<Vector4f>(pchild, "get_Scale");
+
+                                Vector4f new_scale{ cr.scale.x * gt.size, cr.scale.y * gt.size, cr.scale.z, 1.0f };
+                                sdk::call_object_func<void*>(pchild, "set_Scale", context, pchild, &new_scale);
+                                restore.children.push_back(cr);
+                            }
                         }
                     }
 
-                    g_pragmata_panel_restore.push_back(restore);
+                    g_pragmata_panel_restore.push_back(std::move(restore));
 
                     static thread_local std::unordered_map<size_t, bool> logged_panels{};
                     if (logged_panels.emplace(name_hash, true).second) {
-                        spdlog::info("[PragmataVR] Tuning 3D HUD panel {} in group {}", name, pragmatavr::GROUP_KEYS[group]);
+                        spdlog::info("[PragmataVR] Tuning 3D HUD panel {} as {}", name, pragmatavr::GROUP_KEYS[group]);
                     }
                 }
             }
@@ -4588,8 +4747,12 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
             Vector3f original_position{ r.position.x, r.position.y, r.position.z };
             sdk::call_object_func<void*>(r.view, "set_Position", pcontext, r.view, &original_position);
 
-            if (r.child != nullptr) {
-                sdk::call_object_func<void*>(r.child, "set_Scale", pcontext, r.child, &r.scale);
+            for (auto& cr : r.children) {
+                sdk::call_object_func<void*>(cr.obj, "set_Scale", pcontext, cr.obj, &cr.scale);
+                if (cr.restore_position) {
+                    Vector3f p{ cr.position.x, cr.position.y, cr.position.z };
+                    sdk::call_object_func<void*>(cr.obj, "set_Position", pcontext, cr.obj, &p);
+                }
             }
         }
 

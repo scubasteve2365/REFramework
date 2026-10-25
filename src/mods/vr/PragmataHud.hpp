@@ -7,9 +7,11 @@
 // headset projection (see VR::hijack_camera), which brings the panels into view, but at the game's
 // flat-screen layout scale.
 //
-// The panels are tuned in three groups (hacking circle, health/stamina/weapon wheel, tutorial):
-// size, x/y position and a per-eye gap, applied to each panel's GUI view just before it draws and
-// restored right after (VR::on_pre_gui_draw_element / on_gui_draw_element).
+// Build 11: each HUD element is tuned on its own (hacking circle, health, stamina, weapon wheel, tutorial box):
+// size, x/y position and a per-eye gap, applied to each panel's GUI view just before it draws and restored right
+// after (VR::on_pre_gui_draw_element / on_gui_draw_element). Size grows an element around its own center (found from
+// the panel's GUI tree), so a bigger element stays where it is instead of sliding off toward the edge of the view.
+// The hacking circle keeps the Build 3-6 behaviour it was tuned with, and is locked at Steve's values by default.
 //
 // Values live in reframework/data/pragmatavr_hud.ini. The VR mod menu edits them in the headset.
 //   Gamepad (Build 10): click both thumbsticks = open/close. D-pad or left stick only navigates (Up/Down rows,
@@ -68,9 +70,11 @@ enum class EyeMode : int {
 
 enum Group : int {
     GroupHack = 0,
-    GroupVitals = 1,
-    GroupTutorial = 2,
-    GroupCount = 3,
+    GroupHealth = 1,
+    GroupStamina = 2,
+    GroupWeapons = 3,
+    GroupTutorial = 4,
+    GroupCount = 5,
 };
 
 enum Field : int {
@@ -81,13 +85,24 @@ enum Field : int {
     FieldCount = 4,
 };
 
-inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "vitals", "tutorial"};
-inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health / stamina / weapon wheel", "Tutorial box"};
+inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial"};
+inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box"};
+inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX"};
+
+// The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
+// Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
+inline constexpr int INI_VERSION = 11;
+
+// Steve's hacking circle (Dream Air, per-panel layout, 2026-10-23). D:\Projects\PragmataVR\HACKING_CIRCLE_LOCKED.txt
+inline constexpr float HACK_LOCKED_SIZE = 0.9322f;
+inline constexpr float HACK_LOCKED_X = -275.0f;
+inline constexpr float HACK_LOCKED_Y = -75.0f;
+inline constexpr float HACK_LOCKED_GAP = 12.0f;
 inline constexpr std::array<const char*, FieldCount> FIELD_KEYS{"size", "x", "y", "gap"};
 
 struct GroupTune {
     float size{1.0f}; // multiplies the panel's own scale
-    float x{0.0f};    // layout units (1920 x 1080 basis). For vitals this is "spread": + moves outward
+    float x{0.0f};    // layout units (1920 x 1080 basis)
     float y{0.0f};    // layout units
     float gap{0.0f};  // per-eye horizontal shift: left eye +gap, right eye -gap
     std::array<bool, FieldCount> invert{};
@@ -101,13 +116,15 @@ struct HudTune {
     float y_sign{1.0f};
     bool log_elements{true};
     bool hack_locked{true};
-    bool hud_fixed{true};    // 3D HUD panels and the menu stay fixed in the room instead of following the head
+    bool hud_fixed{false};   // per-panel HUD: rotation-only room lock (Build 6). Off = follows the head, as tuned
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
+    bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
 
-    // HUD layout. 1 = "game screen": the game's own flat 16:9 HUD layout (its GUI camera projection) is shown as
-    // one virtual screen floating in front of the player, like the DS3 VR HUD panel. 0 = per-panel (Builds 2-6).
-    int layout_mode{1};
+    // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
+    // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
+    // always uses 0 (the ini value is ignored; the game-screen code is kept for reference).
+    int layout_mode{0};
     std::array<float, 4> screen{70.0f, 2.0f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
     std::array<bool, 4> screen_invert{};
 
@@ -119,9 +136,13 @@ struct HudTune {
     std::array<GroupTune, GroupCount> groups{};
 
     HudTune() {
-        // Per-panel adjustments start neutral in the game-screen layout. Steve's per-panel hacking circle values
-        // from 2026-10-23 (size 0.9322, x -275, y -75, gap 12) are kept in HACKING_CIRCLE_LOCKED.txt.
-        hack_locked = false;
+        // The hacking circle starts locked at Steve's tuned values. Every other element starts neutral.
+        auto& h = groups[GroupHack];
+        h.size = HACK_LOCKED_SIZE;
+        h.x = HACK_LOCKED_X;
+        h.y = HACK_LOCKED_Y;
+        h.gap = HACK_LOCKED_GAP;
+        hack_locked = true;
     }
 };
 
@@ -129,13 +150,13 @@ inline GroupTune default_group(int g) {
     return HudTune{}.groups[g];
 }
 
-// Which group a GUI GameObject belongs to, and its side for the vitals "spread" (-1 left, +1 right).
-inline int group_for(std::string_view name, float& side) {
-    side = 0.0f;
+// Which element a GUI GameObject belongs to. ui2160Gui is no longer tuned: the fix pack lists it with the hacking
+// target brackets (ui3203), which sit on enemies in the world and must not be moved or scaled with the HUD.
+inline int group_for(std::string_view name) {
     if (name == "ui3400Gui") return GroupHack;
-    if (name == "ui2130Gui") { side = -1.0f; return GroupVitals; } // health, lower left
-    if (name == "ui2150Gui") { side = 1.0f; return GroupVitals; }  // weapon wheel, lower right
-    if (name == "ui2140Gui" || name == "ui2160Gui") return GroupVitals; // stamina, HUD frame
+    if (name == "ui2130Gui") return GroupHealth;
+    if (name == "ui2140Gui") return GroupStamina;
+    if (name == "ui2150Gui") return GroupWeapons;
     if (name == "ui2201Gui" || name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     return -1;
 }
@@ -259,6 +280,7 @@ enum MenuAction : int {
     ActionToggleHackLock,
     ActionResetGroup,
     ActionSnapshot,
+    ActionToggleScaleCenter,
     ActionClose,
 };
 
@@ -569,38 +591,38 @@ private:
         add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
 
         // ==== GAME HUD SETTINGS (lower band) ====
+        // Build 11: every HUD element has its own block. The game-screen "one panel" rows are gone.
         band = 1;
-        column = 0;
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "HUD SCREEN", "THE GAME'S WHOLE HUD AS ONE PANEL");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLayout, "HUD layout", "A = switch between one game-screen panel and the old per-panel layout");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Size", value_hint);
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "Distance", value_hint);
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Left / right", value_hint);
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down", value_hint);
-        add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen", "A = put the HUD screen back to its default size and place");
-
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room, or HUD follows your head");
-        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction", "A = flip, only if the fixed HUD turns with your head");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
-
-        // Per-panel tuning (used by the per-panel layout).
-        column = 1;
-        for (int g = 0; g < GroupCount; ++g) {
-            static constexpr std::array<const char*, GroupCount> titles{"HACKING CIRCLE", "HEALTH / STAMINA / WEAPONS", "TUTORIAL BOX"};
-            add(MenuRow::Kind::Header, g, -1, ActionNone, titles[g], "PER-PANEL LAYOUT");
+        const auto add_element = [&](int g) {
+            add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_TITLES[g], g == GroupHack ? "YOUR TUNED VALUES" : "");
 
             if (g == GroupHack) {
                 add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock the hacking circle values");
             }
 
-            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", value_hint);
-            add(MenuRow::Kind::Value, g, FieldX, ActionNone, g == GroupVitals ? "Toward / away from center" : "Left / right", value_hint);
+            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
+            add(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
             add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
             add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap", "A = edit the double-image gap between eyes");
-            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = reset this panel group to neutral (blocked while locked)");
-        }
+            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults",
+                g == GroupHack ? "A = back to your tuned values (blocked while locked)" : "A = reset this element to the game's own size and place");
+        };
+
+        column = 0;
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD follows your head, or turns less with it (rotation lock)");
+        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction", "A = flip, only if the fixed HUD turns with your head");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
+            "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
+        add_element(GroupHealth);
+        add_element(GroupStamina);
+
+        column = 1;
+        add_element(GroupHack);
+        add_element(GroupWeapons);
+        add_element(GroupTutorial);
 
         // Navigation: each column's selectable rows top to bottom through both bands, with each row's height in its
         // band (in row units; headers are about 1.3 rows tall, the first one in a column about 0.9) for Left / Right.
@@ -647,10 +669,11 @@ private:
         s += "# Menu: both thumbsticks or F1 open/close. D-pad / arrows navigate, A / Enter edits the highlighted value\n";
         s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
-        s += "# <group>.size / .x / .y / .gap: hack, vitals, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
-        s += "# vitals.x is a spread: + moves health and weapon wheel outward, - toward the center.\n";
+        s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
+        s += "# scale_about_center = 1: size grows each element around its own center (hack always uses the panel origin).\n";
         s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
         s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
+        s += fmt::format("ini_version={}\n", INI_VERSION);
         s += fmt::format("enabled={}\n", t.enabled ? 1 : 0);
         s += fmt::format("eye_mode={}\n", (int)t.eye_mode);
         s += fmt::format("zoom={:.4f}\n", t.zoom);
@@ -661,13 +684,7 @@ private:
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
-        s += "# layout_mode: 1 = game screen (whole HUD as one panel), 0 = per-panel.\n";
-        s += "# screen.width in degrees, screen.distance in meters, screen.yaw / screen.pitch in degrees.\n";
-        s += fmt::format("layout_mode={}\n", t.layout_mode);
-        for (int i = 0; i < 4; ++i) {
-            s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
-            s += fmt::format("screen.{}.invert={}\n", SCREEN_KEYS[i], t.screen_invert[i] ? 1 : 0);
-        }
+        s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
         s += "# menu.click_volume = click sound level (0 = off, 0.50 = half, 1.00 = full).\n";
         for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
@@ -750,7 +767,24 @@ private:
         std::ifstream f{p};
         std::string line{};
 
+        // Read the whole file first: hack.* lines only count when the file was written by Build 11 or later.
+        std::vector<std::string> lines{};
+        int file_version = 0;
         while (std::getline(f, line)) {
+            const auto k = trim(line.substr(0, line.find('=')));
+            if (k == "ini_version" && line.find('=') != std::string::npos) {
+                try { file_version = std::stoi(trim(line.substr(line.find('=') + 1))); } catch (...) {}
+            }
+            lines.push_back(line);
+        }
+        f.close();
+        const bool old_file = file_version < INI_VERSION;
+        if (old_file) {
+            spdlog::info("[PragmataVR] pragmatavr_hud.ini is from an older build: hacking circle set to the locked values, other elements neutral");
+        }
+
+        for (auto& l : lines) {
+            line = l;
             const auto hash_pos = line.find('#');
             if (hash_pos != std::string::npos) {
                 line = line.substr(0, hash_pos);
@@ -777,6 +811,7 @@ private:
 
             const auto dot = key.find('.');
             if (dot == std::string::npos) {
+                if (old_file && (key == "hud_fixed" || key == "hack_locked")) continue;
                 if (key == "enabled") t->enabled = val != 0.0f;
                 else if (key == "eye_mode") t->eye_mode = (EyeMode)std::clamp((int)val, 0, 3);
                 else if (key == "zoom") t->zoom = std::clamp(val, 0.05f, 20.0f);
@@ -787,7 +822,9 @@ private:
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
-                else if (key == "layout_mode") t->layout_mode = val != 0.0f ? 1 : 0;
+                else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
+                // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
+                // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
             }
 
@@ -822,6 +859,9 @@ private:
                 if (group_key != GROUP_KEYS[g]) {
                     continue;
                 }
+                if (old_file && g == GroupHack) {
+                    continue;
+                }
 
                 auto& gt = t->groups[g];
 
@@ -846,17 +886,27 @@ private:
             }
         }
 
-        spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini: hack_locked={} hack(size={} x={} y={} gap={}) vitals(size={} x={} y={} gap={}) tutorial(size={} x={} y={} gap={})",
-            t->hack_locked,
-            t->groups[0].size, t->groups[0].x, t->groups[0].y, t->groups[0].gap,
-            t->groups[1].size, t->groups[1].x, t->groups[1].y, t->groups[1].gap,
-            t->groups[2].size, t->groups[2].x, t->groups[2].y, t->groups[2].gap);
+        {
+            std::string desc{};
+            for (int g = 0; g < GroupCount; ++g) {
+                const auto& gt = t->groups[g];
+                desc += fmt::format(" {}(size={:.3f} x={:.0f} y={:.0f} gap={:.0f})", GROUP_KEYS[g], gt.size, gt.x, gt.y, gt.gap);
+            }
+            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: hack_locked={} hud_fixed={} scale_about_center={}{}",
+                file_version, t->hack_locked, t->hud_fixed, t->scale_about_center, desc);
+        }
 
         g_click_volume_pct = (int)std::lround(t->menu[MenuClickVolume] * 100.0f);
 
+        if (old_file) {
+            write_file(*t); // upgrade the file to this build's format (also sets m_mtime)
+        }
+
         std::scoped_lock _{m_mtx};
         m_tune = t;
-        m_mtime = mtime;
+        if (!old_file) {
+            m_mtime = mtime;
+        }
         m_loaded_once = true;
     }
 
@@ -1109,6 +1159,11 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
                     play_click(true);
+                } else if (row.action == ActionToggleScaleCenter) {
+                    t->scale_about_center = !t->scale_about_center;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: size grows from {}", t->scale_about_center ? "element center" : "panel origin");
+                    play_click(true);
                 } else if (row.action == ActionToggleHackLock) {
                     t->hack_locked = !t->hack_locked;
                     commit(t);
@@ -1247,10 +1302,10 @@ private:
     static constexpr float SIZE_STEP = 1.04f;
     static constexpr float SIZE_STEP_BIG = 1.20f;
     static constexpr float MIN_SIZE = 0.2f;
-    static constexpr float MAX_SIZE = 5.0f;
+    static constexpr float MAX_SIZE = 8.0f;
     static constexpr float MOVE_STEP = 10.0f;
     static constexpr float MOVE_STEP_BIG = 50.0f;
-    static constexpr float MAX_MOVE = 2000.0f;
+    static constexpr float MAX_MOVE = 4000.0f;
     static constexpr float GAP_STEP = 1.0f;
     static constexpr float GAP_STEP_BIG = 5.0f;
     static constexpr float MAX_GAP = 300.0f;
