@@ -1532,6 +1532,8 @@ XrResult OpenXR::end_frame() {
 
     std::vector<XrCompositionLayerBaseHeader*> layers{};
     std::vector<XrCompositionLayerProjectionView> projection_layer_views{};
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
 
     // we CANT push the layers every time, it cause some layer error
     // in xrEndFrame, so we must only do it when shouldRender is true
@@ -1549,11 +1551,25 @@ XrResult OpenXR::end_frame() {
             projection_layer_views[i].subImage.imageRect.extent = {swapchain.width, swapchain.height};
         }
 
-        XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         layer.space = this->stage_space;
         layer.viewCount = (uint32_t)projection_layer_views.size();
         layer.views = projection_layer_views.data();
         layers.push_back((XrCompositionLayerBaseHeader*)&layer);
+
+        // Room-fixed menu panel, composited by the runtime on top of the eye images (PragmataVR mod menu).
+        const auto& mq = this->menu_quad;
+        if (mq.visible && mq.swapchain != XR_NULL_HANDLE && mq.owner == this->session && mq.used_width > 0 && mq.used_height > 0) {
+            menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            menu_layer.space = this->stage_space;
+            menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            menu_layer.subImage.swapchain = mq.swapchain;
+            menu_layer.subImage.imageRect.offset = {0, 0};
+            menu_layer.subImage.imageRect.extent = {mq.used_width, mq.used_height};
+            menu_layer.subImage.imageArrayIndex = 0;
+            menu_layer.pose = mq.pose;
+            menu_layer.size = mq.size;
+            layers.push_back((XrCompositionLayerBaseHeader*)&menu_layer);
+        }
     }
 
     XrFrameEndInfo frame_end_info{XR_TYPE_FRAME_END_INFO};

@@ -126,6 +126,19 @@ public:
     XrViewState view_state{XR_TYPE_VIEW_STATE};
     XrViewState stage_view_state{XR_TYPE_VIEW_STATE};
     XrFrameState frame_state{XR_TYPE_FRAME_STATE};
+    // An extra room-fixed quad layer (PragmataVR mod menu). The D3D12 side fills the swapchain and sets the pose and
+    // size in stage space before end_frame; end_frame submits it on top of the eye images while `visible` is true.
+    struct MenuQuad {
+        XrSwapchain swapchain{XR_NULL_HANDLE};
+        XrSession owner{XR_NULL_HANDLE};
+        int32_t width{0};       // swapchain size in pixels
+        int32_t height{0};
+        int32_t used_width{0};  // part of the image that holds the menu
+        int32_t used_height{0};
+        XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        XrExtent2Df size{1.0f, 1.0f}; // meters
+        bool visible{false};
+    } menu_quad{};
 
     bool supportsEyeGazeInteraction{false};
     XrActionSet eyeGazeActionSet{NULL};

@@ -64,6 +64,8 @@
 
 #if defined(PRAGMATA)
 #include "vr/PragmataHud.hpp"
+#include "vr/PragmataMenuFont.hpp"
+#include <limits>
 #endif
 #include <MinHook.h>
 
@@ -3218,8 +3220,98 @@ void pragmata_report_xinput_use() {
 }
 } // namespace
 
-// PragmataVR: in-headset HUD menu. Drawn into REFramework's ImGui frame here; D3D12Component::on_frame
-// copies this window's rectangle into each eye image.
+// PragmataVR: in-headset mod menu (Build 9). Drawn with ImGui's foreground draw list into REFramework's IMGUI render
+// target (always on top of any other ImGui window). D3D12Component::on_frame copies the menu rectangle into the OpenXR
+// menu quad layer, which the headset's compositor shows fixed in the room. On OpenVR it is pasted into each eye image.
+// Look: dark translucent panel, cyan accents and thin lines in the style of Pragmata's own HUD, Barlow Semi Condensed.
+namespace {
+namespace pragmata_menu_style {
+const ImU32 PANEL_TOP = IM_COL32(12, 24, 32, 238);
+const ImU32 PANEL_BOTTOM = IM_COL32(4, 9, 14, 238);
+const ImU32 BORDER = IM_COL32(88, 226, 232, 64);
+const ImU32 ACCENT = IM_COL32(88, 226, 232, 255);
+const ImU32 ACCENT_DIM = IM_COL32(88, 226, 232, 120);
+const ImU32 ACCENT_FAINT = IM_COL32(88, 226, 232, 44);
+const ImU32 SELECT_LEFT = IM_COL32(88, 226, 232, 64);
+const ImU32 SELECT_RIGHT = IM_COL32(88, 226, 232, 6);
+const ImU32 TEXT = IM_COL32(222, 234, 238, 255);
+const ImU32 TEXT_BRIGHT = IM_COL32(255, 255, 255, 255);
+const ImU32 TEXT_DIM = IM_COL32(128, 150, 160, 255);
+const ImU32 TEXT_OFF = IM_COL32(76, 90, 98, 255);
+const ImU32 AMBER = IM_COL32(242, 184, 82, 255);
+} // namespace pragmata_menu_style
+
+// What one menu row shows in its value column.
+struct PragmataRowView {
+    std::string value{};
+    bool show_invert{false};
+    bool invert_on{false};
+    bool dim{false};
+    ImU32 value_color{pragmata_menu_style::TEXT_BRIGHT};
+};
+
+PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr::MenuRow& row) {
+    using namespace pragmata_menu_style;
+    using Kind = pragmatavr::MenuRow::Kind;
+
+    PragmataRowView v{};
+    const bool per_panel_off = t.layout_mode == 1; // per-panel groups only apply in the per-panel layout
+
+    switch (row.kind) {
+    case Kind::Value:
+        v.show_invert = true;
+        if (row.group == pragmatavr::GROUP_SCREEN) {
+            v.value = pragmatavr::HudTuning::format_screen(t, row.field);
+            v.invert_on = t.screen_invert[row.field];
+            v.dim = t.layout_mode != 1;
+        } else if (row.group == pragmatavr::GROUP_MENU) {
+            v.value = pragmatavr::HudTuning::format_menu(t, row.field);
+            v.invert_on = t.menu_invert[row.field];
+        } else if (row.group >= 0 && row.group < pragmatavr::GroupCount) {
+            const auto& gt = t.groups[row.group];
+            v.value = pragmatavr::HudTuning::format_value(gt, row.group, row.field);
+            v.invert_on = gt.invert[row.field];
+            v.dim = per_panel_off || (row.group == pragmatavr::GroupHack && t.hack_locked);
+        }
+        break;
+    case Kind::Toggle:
+        v.value_color = ACCENT;
+        switch (row.action) {
+        case pragmatavr::ActionToggleLayout:
+            v.value = t.layout_mode == 1 ? "GAME SCREEN" : "PER-PANEL";
+            break;
+        case pragmatavr::ActionToggleHudFixed:
+            v.value = t.hud_fixed ? "FIXED IN ROOM" : "FOLLOWS HEAD";
+            break;
+        case pragmatavr::ActionToggleLockInvert:
+            v.value = t.lock_invert ? "FLIPPED" : "NORMAL";
+            v.value_color = t.lock_invert ? AMBER : TEXT_BRIGHT;
+            break;
+        case pragmatavr::ActionToggleGhost:
+            v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
+            break;
+        case pragmatavr::ActionToggleHackLock:
+        default:
+            v.value = t.hack_locked ? "LOCKED" : "UNLOCKED";
+            v.value_color = t.hack_locked ? AMBER : ACCENT;
+            v.dim = per_panel_off;
+            break;
+        }
+        break;
+    case Kind::Action:
+    default:
+        if (row.action == pragmatavr::ActionResetScreen) {
+            v.dim = t.layout_mode != 1;
+        } else if (row.action == pragmatavr::ActionResetGroup) {
+            v.dim = per_panel_off || (row.group == pragmatavr::GroupHack && t.hack_locked);
+        }
+        break;
+    }
+
+    return v;
+}
+} // namespace
+
 void VR::on_frame() {
     auto& hud = pragmatavr::HudTuning::get();
 
@@ -3228,112 +3320,305 @@ void VR::on_frame() {
         return;
     }
 
+    using namespace pragmata_menu_style;
+    using Kind = pragmatavr::MenuRow::Kind;
+
     const auto tune = hud.tune();
+    const auto& t = *tune;
     const auto& rows = hud.menu_rows();
     const int sel = hud.menu_selected.load();
-    auto& io = ImGui::GetIO();
 
-    ImGui::SetNextWindowPos(ImVec2{io.DisplaySize.x * 0.25f, io.DisplaySize.y * 0.15f}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.94f);
+    ImFont* font = pragmatavr::g_menu_font != nullptr ? pragmatavr::g_menu_font : ImGui::GetFont();
+    ImFont* bold = pragmatavr::g_menu_font_bold != nullptr ? pragmatavr::g_menu_font_bold : font;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    constexpr float NO_LIMIT = (std::numeric_limits<float>::max)();
 
-    const auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    // ---- Metrics (all from the body text size, so the whole panel scales together) ----
+    const float fs = pragmatavr::MENU_FONT_PX;
+    const float small_size = std::round(fs * 0.66f);
+    const float title_size = std::round(fs * 1.2f);
+    const float header_size = std::round(fs * 0.78f);
+    const float hint_size = std::round(fs * 0.8f);
+    const float pad = std::round(fs * 1.1f);
+    const float line_h = std::round(fs * 1.5f);
+    const float gutter = std::round(fs * 1.6f);
+    const float gap = std::round(fs * 0.9f);
+    const float indent = std::round(fs * 0.7f);
+    const float box = std::round(fs * 0.5f);
+    const float header_gap_first = std::round(fs * 0.15f);
+    const float header_gap = std::round(fs * 0.75f);
+    const float header_body = std::round(header_size * 1.6f);
 
-    if (ImGui::Begin("PragmataVR HUD menu", nullptr, flags)) {
-        ImGui::SetWindowFontScale(1.6f);
+    const auto text_w = [&](ImFont* f, float size, const char* s) {
+        return f->CalcTextSizeA(size, NO_LIMIT, 0.0f, s).x;
+    };
 
-        const float fs = ImGui::GetFontSize();
-        const float col_value = fs * 17.0f;
-        const float col_invert = fs * 23.0f;
-
-        const ImVec4 title_color{0.45f, 0.85f, 1.0f, 1.0f};
-        const ImVec4 header_color{1.0f, 0.85f, 0.35f, 1.0f};
-        const ImVec4 normal_color{0.92f, 0.92f, 0.92f, 1.0f};
-        const ImVec4 locked_color{0.5f, 0.5f, 0.5f, 1.0f};
-        const ImVec4 selected_color{0.35f, 1.0f, 0.45f, 1.0f};
-
-        ImGui::TextColored(title_color, "PRAGMATA VR  -  HUD MENU");
-        ImGui::TextColored(locked_color, "D-pad Up/Down select   Left/Right change   hold RB = bigger steps");
-        ImGui::TextColored(locked_color, "A = invert box / do action   B or both sticks = close");
-        ImGui::TextColored(locked_color, "Keyboard: arrows, Shift, Enter, Backspace, F1");
-        ImGui::Separator();
-
-        for (int i = 0; i < (int)rows.size(); ++i) {
-            const auto& row = rows[i];
-            const bool selected = i == sel;
-
-            if (row.kind == pragmatavr::MenuRow::Kind::Header) {
-                ImGui::Spacing();
-                ImGui::TextColored(header_color, "%s", row.label.c_str());
-                continue;
+    // Letter-spaced capitals for titles and headers. Returns the width; draws only when `draw` is set.
+    const auto spaced = [&](ImFont* f, float size, float x, float y, ImU32 col, const char* s, float spacing, bool draw) {
+        float cx = x;
+        char buf[2]{0, 0};
+        for (const char* c = s; *c != 0; ++c) {
+            buf[0] = *c;
+            if (draw) {
+                dl->AddText(f, size, ImVec2{std::floor(cx), std::floor(y)}, col, buf);
             }
-
-            const bool locked = row.group == pragmatavr::GroupHack && tune->hack_locked &&
-                row.kind != pragmatavr::MenuRow::Kind::Toggle;
-            const auto color = selected ? selected_color : (locked ? locked_color : normal_color);
-            const char* marker = selected ? ">" : " ";
-
-            switch (row.kind) {
-            case pragmatavr::MenuRow::Kind::Value: {
-                if (row.group == pragmatavr::GROUP_SCREEN) {
-                    const bool off = tune->layout_mode != 1;
-                    const auto scolor = selected ? selected_color : (off ? locked_color : normal_color);
-                    ImGui::TextColored(scolor, "%s  %s", marker, row.label.c_str());
-                    ImGui::SameLine(col_value);
-                    ImGui::TextColored(scolor, "%s", pragmatavr::HudTuning::format_screen(*tune, row.field).c_str());
-                    ImGui::SameLine(col_invert);
-                    ImGui::TextColored(scolor, "[%s] invert", tune->screen_invert[row.field] ? "x" : " ");
-                    break;
-                }
-                const auto& gt = tune->groups[row.group];
-                ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
-                ImGui::SameLine(col_value);
-                ImGui::TextColored(color, "%s", pragmatavr::HudTuning::format_value(gt, row.group, row.field).c_str());
-                ImGui::SameLine(col_invert);
-                ImGui::TextColored(color, "[%s] invert", gt.invert[row.field] ? "x" : " ");
-                break;
-            }
-            case pragmatavr::MenuRow::Kind::Toggle: {
-                const char* text = "";
-                switch (row.action) {
-                case pragmatavr::ActionToggleLayout:
-                    text = tune->layout_mode == 1 ? "HUD layout: GAME SCREEN, one panel (A for per-panel)" : "HUD layout: PER-PANEL, old (A for game screen)";
-                    break;
-                case pragmatavr::ActionToggleHudFixed:
-                    text = tune->hud_fixed ? "HUD position: FIXED in the room (A to change)" : "HUD position: FOLLOWS your head (A to change)";
-                    break;
-                case pragmatavr::ActionToggleLockInvert:
-                    text = tune->lock_invert ? "Fixed HUD direction: FLIPPED (A if the HUD moves with your head)" : "Fixed HUD direction: normal (A if the HUD moves with your head)";
-                    break;
-                case pragmatavr::ActionToggleGhost:
-                    text = tune->hide_ghost ? "Ghost / double layer: HIDDEN (A to show)" : "Ghost / double layer: SHOWN (A to hide)";
-                    break;
-                case pragmatavr::ActionToggleHackLock:
-                default:
-                    text = tune->hack_locked ? "LOCKED - A to unlock" : "UNLOCKED - A to lock";
-                    break;
-                }
-                ImGui::TextColored(color, "%s  %s", marker, text);
-                break;
-            }
-            case pragmatavr::MenuRow::Kind::Action:
-            default:
-                ImGui::TextColored(color, "%s  %s", marker, row.label.c_str());
-                break;
-            }
+            cx += text_w(f, size, buf) + spacing;
         }
+        return *s != 0 ? cx - x - spacing : 0.0f;
+    };
 
-        const auto pos = ImGui::GetWindowPos();
-        const auto size = ImGui::GetWindowSize();
-        hud.menu_rect_x = pos.x;
-        hud.menu_rect_y = pos.y;
-        hud.menu_rect_w = size.x;
-        hud.menu_rect_h = size.y;
-        hud.menu_rect_valid = size.x > 1.0f && size.y > 1.0f;
+    const auto put = [&](ImFont* f, float size, float x, float y, ImU32 col, const char* s) {
+        dl->AddText(f, size, ImVec2{std::floor(x), std::floor(y)}, col, s);
+    };
+
+    // Button chip like a controller prompt: outlined box with the button name, then what it does.
+    const auto chip = [&](float x, float y, const char* button, const char* what, bool draw) {
+        const float bw = text_w(bold, small_size, button) + small_size * 0.9f;
+        const float bh = small_size * 1.35f;
+        if (draw) {
+            dl->AddRect(ImVec2{std::floor(x), std::floor(y)}, ImVec2{std::floor(x + bw), std::floor(y + bh)}, ACCENT_DIM, 3.0f, 0, 1.5f);
+            put(bold, small_size, x + small_size * 0.45f, y + (bh - small_size) * 0.5f, TEXT_BRIGHT, button);
+            put(font, small_size, x + bw + small_size * 0.45f, y + (bh - small_size) * 0.5f, TEXT_DIM, what);
+        }
+        return bw + small_size * 0.45f + text_w(font, small_size, what) + small_size * 1.6f;
+    };
+
+    static constexpr std::array<std::pair<const char*, const char*>, 6> CHIPS{{
+        {"L3 + R3", "Open / close"},
+        {"D-PAD", "Select"},
+        {"LEFT / RIGHT", "Change"},
+        {"RB", "Bigger steps"},
+        {"A", "Invert / action"},
+        {"B", "Close"},
+    }};
+    const char* KEYBOARD_LINE = "KEYBOARD    Arrows = select and change    Shift = bigger steps    Enter = invert / action    Backspace = close    F1 = open / close";
+
+    // ---- Measure: column widths fit every label, value and header ----
+    float value_w = 0.0f;
+    for (const char* s : {"GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
+             "+2000", "-2000", "10.0 m", "+60 deg", "140 deg", "200%", "5.00x"}) {
+        value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
 
-    ImGui::End();
+    const float invert_w = box + std::round(fs * 0.3f) + text_w(bold, small_size, "INV");
+    const float invert_gap = std::round(gap * 0.7f);
+
+    std::array<float, 2> col_w{};
+    std::array<float, 2> col_h{};
+    std::array<bool, 2> col_first{true, true};
+
+    for (const auto& row : rows) {
+        const int c = std::clamp(row.column, 0, 1);
+
+        if (row.kind == Kind::Header) {
+            const float title = header_size * 0.95f + spaced(bold, header_size, 0, 0, 0, row.label.c_str(), header_size * 0.14f, false);
+            const float tag = row.hint.empty() ? 0.0f : gap + text_w(font, small_size, row.hint.c_str());
+            col_w[c] = (std::max)(col_w[c], title + tag);
+            col_h[c] += (col_first[c] ? header_gap_first : header_gap) + header_body;
+            col_first[c] = false;
+            continue;
+        }
+
+        const float label = (std::max)(text_w(font, fs, row.label.c_str()), text_w(bold, fs, row.label.c_str()));
+        col_w[c] = (std::max)(col_w[c], indent + label + gap + value_w + invert_gap + invert_w + indent * 0.5f);
+        col_h[c] += line_h;
+    }
+
+    // Title and footer widths.
+    const float title_spacing = title_size * 0.14f;
+    const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 9");
+
+    float chips_w = 0.0f;
+    for (const auto& [button, what] : CHIPS) {
+        chips_w += chip(0, 0, button, what, false);
+    }
+
+    float hint_w = 0.0f;
+    for (const auto& row : rows) {
+        if (row.kind != Kind::Header) {
+            hint_w = (std::max)(hint_w, text_w(font, hint_size, row.hint.c_str()));
+        }
+    }
+    hint_w = (std::max)(hint_w, text_w(font, hint_size, "Used only in the per-panel HUD layout (switch it under HUD SCREEN)"));
+
+    const float content_w = col_w[0] + gutter + col_w[1];
+    const float panel_w = std::ceil(pad * 2.0f + (std::max)({content_w, title_w, chips_w, hint_w, text_w(font, small_size, KEYBOARD_LINE)}));
+
+    const float title_block = std::round(title_size * 1.25f + fs * 0.9f);
+    const float content_h = (std::max)(col_h[0], col_h[1]);
+    const float footer_h = std::round(fs * 0.8f + hint_size * 1.6f + small_size * 1.35f + small_size * 0.7f + small_size * 1.4f);
+    const float panel_h = std::ceil(pad * 0.8f + title_block + content_h + footer_h + pad * 0.8f);
+
+    // ---- Panel ----
+    const ImVec2 p0{16.0f, 16.0f};
+    const ImVec2 p1{p0.x + panel_w, p0.y + panel_h};
+
+    dl->AddRectFilledMultiColor(p0, p1, PANEL_TOP, PANEL_TOP, PANEL_BOTTOM, PANEL_BOTTOM);
+    dl->AddRect(p0, p1, BORDER, 0.0f, 0, 1.5f);
+
+    // Corner brackets.
+    {
+        const float L = std::round(fs * 1.1f);
+        const float th = 3.0f;
+        const float o = 1.0f;
+        dl->AddLine(ImVec2{p0.x + o, p0.y + o}, ImVec2{p0.x + L, p0.y + o}, ACCENT, th);
+        dl->AddLine(ImVec2{p0.x + o, p0.y + o}, ImVec2{p0.x + o, p0.y + L}, ACCENT, th);
+        dl->AddLine(ImVec2{p1.x - o, p0.y + o}, ImVec2{p1.x - L, p0.y + o}, ACCENT, th);
+        dl->AddLine(ImVec2{p1.x - o, p0.y + o}, ImVec2{p1.x - o, p0.y + L}, ACCENT, th);
+        dl->AddLine(ImVec2{p0.x + o, p1.y - o}, ImVec2{p0.x + L, p1.y - o}, ACCENT, th);
+        dl->AddLine(ImVec2{p0.x + o, p1.y - o}, ImVec2{p0.x + o, p1.y - L}, ACCENT, th);
+        dl->AddLine(ImVec2{p1.x - o, p1.y - o}, ImVec2{p1.x - L, p1.y - o}, ACCENT, th);
+        dl->AddLine(ImVec2{p1.x - o, p1.y - o}, ImVec2{p1.x - o, p1.y - L}, ACCENT, th);
+    }
+
+    // ---- Title ----
+    const float left = p0.x + pad;
+    const float right = p1.x - pad;
+    float y = p0.y + pad * 0.8f;
+    {
+        const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
+        spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
+        put(font, small_size, right - text_w(font, small_size, "BUILD 9"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 9");
+
+        const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
+        dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
+        dl->AddLine(ImVec2{left, ly}, ImVec2{left + fs * 4.0f, ly}, ACCENT, 3.0f);
+        y += title_block;
+    }
+
+    // ---- Columns ----
+    const float content_top = y;
+    const std::array<float, 2> col_x{left, left + col_w[0] + gutter};
+    std::array<float, 2> cy{content_top, content_top};
+    col_first = {true, true};
+
+    {
+        const float dx = std::floor(col_x[1] - gutter * 0.5f);
+        dl->AddLine(ImVec2{dx, content_top + fs * 0.3f}, ImVec2{dx, content_top + content_h}, ACCENT_FAINT, 1.0f);
+    }
+
+    const std::string* selected_hint = nullptr;
+    bool selected_dim_per_panel = false;
+
+    for (int i = 0; i < (int)rows.size(); ++i) {
+        const auto& row = rows[i];
+        const int c = std::clamp(row.column, 0, 1);
+        const float x0 = col_x[c];
+        const float x1 = x0 + col_w[c];
+        float& ry = cy[c];
+
+        if (row.kind == Kind::Header) {
+            ry += col_first[c] ? header_gap_first : header_gap;
+            col_first[c] = false;
+
+            const float sq = std::round(header_size * 0.32f);
+            const float sy = ry + (header_size - sq) * 0.55f;
+            dl->AddRectFilled(ImVec2{x0, std::floor(sy)}, ImVec2{x0 + sq, std::floor(sy + sq)}, ACCENT);
+            spaced(bold, header_size, x0 + header_size * 0.95f, ry, ACCENT, row.label.c_str(), header_size * 0.14f, true);
+
+            if (!row.hint.empty()) {
+                const bool off = row.group >= 0 && row.group < pragmatavr::GroupCount && t.layout_mode == 1;
+                put(font, small_size, x1 - text_w(font, small_size, row.hint.c_str()), ry + (header_size - small_size) * 0.6f, off ? TEXT_OFF : TEXT_DIM, row.hint.c_str());
+            }
+
+            const float ly = std::floor(ry + header_size * 1.3f);
+            dl->AddLine(ImVec2{x0, ly}, ImVec2{x1, ly}, ACCENT_FAINT, 1.0f);
+            ry += header_body;
+            continue;
+        }
+
+        const bool selected = i == sel;
+        const auto v = pragmata_row_view(t, row);
+        const float ty = ry + (line_h - fs) * 0.5f;
+
+        if (selected) {
+            dl->AddRectFilledMultiColor(ImVec2{x0, ry + 2.0f}, ImVec2{x1, ry + line_h - 2.0f}, SELECT_LEFT, SELECT_RIGHT, SELECT_RIGHT, SELECT_LEFT);
+            dl->AddRectFilled(ImVec2{x0, ry + 2.0f}, ImVec2{x0 + 4.0f, ry + line_h - 2.0f}, ACCENT);
+            selected_hint = &row.hint;
+            selected_dim_per_panel = row.group >= 0 && row.group < pragmatavr::GroupCount && t.layout_mode == 1;
+        }
+
+        const ImU32 label_col = selected ? TEXT_BRIGHT : (v.dim ? TEXT_OFF : TEXT);
+        put(selected ? bold : font, fs, x0 + indent, ty, label_col, row.label.c_str());
+
+        const float value_right = x1 - indent * 0.5f - invert_w - invert_gap;
+
+        if (!v.value.empty()) {
+            const float vw = text_w(bold, fs, v.value.c_str());
+            const ImU32 vcol = v.dim ? TEXT_OFF : (selected && v.value_color == TEXT_BRIGHT ? TEXT_BRIGHT : v.value_color);
+            put(bold, fs, value_right - vw, ty, vcol, v.value.c_str());
+
+            // Left / right arrows around the selected value.
+            if (selected && row.kind == Kind::Value && !v.dim) {
+                const float a = std::round(fs * 0.22f);
+                const float my = ry + line_h * 0.5f;
+                const float lx = value_right - vw - fs * 0.45f;
+                const float rx = value_right + fs * 0.45f;
+                dl->AddTriangleFilled(ImVec2{lx, my}, ImVec2{lx + a, my - a}, ImVec2{lx + a, my + a}, ACCENT);
+                dl->AddTriangleFilled(ImVec2{rx, my}, ImVec2{rx - a, my - a}, ImVec2{rx - a, my + a}, ACCENT);
+            }
+        } else if (row.kind == Kind::Action) {
+            // Action rows: a small_size chevron in the value column.
+            const float a = std::round(fs * 0.2f);
+            const float my = ry + line_h * 0.5f;
+            const float ax = value_right;
+            const ImU32 acol = v.dim ? TEXT_OFF : (selected ? ACCENT : ACCENT_DIM);
+            dl->AddTriangleFilled(ImVec2{ax, my}, ImVec2{ax - a * 1.2f, my - a}, ImVec2{ax - a * 1.2f, my + a}, acol);
+        }
+
+        if (v.show_invert) {
+            const float bx = x1 - indent * 0.5f - invert_w;
+            const float by = std::floor(ry + (line_h - box) * 0.5f);
+            if (v.invert_on) {
+                dl->AddRectFilled(ImVec2{bx, by}, ImVec2{bx + box, by + box}, v.dim ? TEXT_OFF : ACCENT, 2.0f);
+            } else {
+                dl->AddRect(ImVec2{bx, by}, ImVec2{bx + box, by + box}, v.dim ? TEXT_OFF : TEXT_DIM, 2.0f, 0, 1.5f);
+            }
+            put(bold, small_size, bx + box + std::round(fs * 0.3f), ry + (line_h - small_size) * 0.5f,
+                v.dim ? TEXT_OFF : (v.invert_on ? ACCENT : TEXT_DIM), "INV");
+        }
+
+        ry += line_h;
+    }
+
+    // ---- Footer: help for the selected row, controller chips, keyboard ----
+    y = content_top + content_h + std::round(fs * 0.8f);
+    dl->AddLine(ImVec2{left, std::floor(y - fs * 0.35f)}, ImVec2{right, std::floor(y - fs * 0.35f)}, ACCENT_FAINT, 1.0f);
+
+    if (selected_hint != nullptr) {
+        if (selected_dim_per_panel) {
+            put(font, hint_size, left, y, AMBER, "Used only in the per-panel HUD layout (switch it under HUD SCREEN)");
+        } else {
+            put(font, hint_size, left, y, TEXT, selected_hint->c_str());
+        }
+    }
+    y += std::round(hint_size * 1.6f);
+
+    float cx = left;
+    for (const auto& [button, what] : CHIPS) {
+        cx += chip(cx, y, button, what, true);
+    }
+    y += std::round(small_size * 1.35f + small_size * 0.7f);
+
+    put(font, small_size, left, y, TEXT_OFF, KEYBOARD_LINE);
+
+    // ---- Hand the rectangle to the compositor ----
+    const auto& io = ImGui::GetIO();
+    if (p1.x > io.DisplaySize.x || p1.y > io.DisplaySize.y) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            spdlog::warn("[PragmataVR] Menu ({:.0f} x {:.0f}) is larger than the ImGui target ({:.0f} x {:.0f}); it will be cut off",
+                panel_w, panel_h, io.DisplaySize.x, io.DisplaySize.y);
+        }
+    }
+
+    hud.menu_rect_x = p0.x;
+    hud.menu_rect_y = p0.y;
+    hud.menu_rect_w = panel_w;
+    hud.menu_rect_h = panel_h;
+    hud.menu_rect_valid = true;
 }
 #endif
 

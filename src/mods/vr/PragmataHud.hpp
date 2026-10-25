@@ -18,9 +18,13 @@
 //   Keyboard: F1 open/close, arrows, Shift = big steps, Enter, Backspace.
 // Pause = snapshot of both eye images. No other hotkeys.
 //
-// Menu drawing: VR::on_frame draws an ImGui window (ImGui frames render into REFramework's IMGUI
-// render target while the headset is active); D3D12Component::on_frame copies that window's rectangle
-// into each eye image, centered on the eye's forward direction, before the eye is sent to the headset.
+// Menu drawing (Build 9): VR::on_frame draws the menu as one ImGui window (ImGui frames render into
+// REFramework's IMGUI render target while the headset is active). Under OpenXR, D3D12Component::on_frame
+// copies that window's rectangle into a dedicated swapchain, and OpenXR::end_frame submits it as a quad
+// composition layer fixed in the room (stage space). The headset's compositor draws the quad with full
+// perspective from each eye's real pose, so the menu cannot bend, tilt or follow the head. Its physical
+// size comes from the window's pixel size, so it always fits every row. OpenVR keeps the Build 8 path
+// (menu pasted into each eye image).
 //
 // Included from VR.cpp (after its includes) and from vr/D3D12Component.cpp.
 
@@ -46,6 +50,7 @@
 #include <spdlog/spdlog.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace pragmatavr {
 
@@ -102,7 +107,8 @@ struct HudTune {
     std::array<bool, 4> screen_invert{};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
-    std::array<float, 3> menu{2.5f, 1.1f, -5.0f}; // distance (m), width (m), up/down (deg)
+    // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg)
+    std::array<float, 3> menu{2.5f, 1.0f, -5.0f};
     std::array<bool, 3> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
 
@@ -141,14 +147,16 @@ inline void play_click(bool ok) {
     }).detach();
 }
 
-// One row of the VR mod menu.
+// One row of the VR mod menu. The menu has two columns; rows are listed left column first, then right.
 struct MenuRow {
     enum class Kind { Header, Value, Toggle, Action };
     Kind kind{Kind::Header};
     int group{-1};
     int field{-1};
     int action{0};
+    int column{0};
     std::string label{};
+    std::string hint{}; // footer help line while this row is selected (headers: small tag after the title)
 };
 
 // Pseudo-group for the HUD screen rows, and its fields.
@@ -168,14 +176,20 @@ inline constexpr std::array<float, 4> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f};
 inline constexpr int GROUP_MENU = 101;
 enum MenuField : int {
     MenuDistance = 0,
-    MenuWidth = 1,
+    MenuScale = 1,
     MenuPitch = 2,
 };
-inline constexpr std::array<const char*, 3> MENU_KEYS{"distance", "width", "pitch"};
-inline constexpr std::array<float, 3> MENU_MIN{0.8f, 0.3f, -40.0f};
-inline constexpr std::array<float, 3> MENU_MAX{8.0f, 4.0f, 40.0f};
+// menu.width (Build 8, meters) is gone: the panel's size now follows its text. Old ini lines for it are ignored.
+inline constexpr std::array<const char*, 3> MENU_KEYS{"distance", "scale", "pitch"};
+inline constexpr std::array<float, 3> MENU_MIN{0.8f, 0.5f, -40.0f};
+inline constexpr std::array<float, 3> MENU_MAX{8.0f, 2.0f, 40.0f};
 inline constexpr std::array<float, 3> MENU_STEP{0.1f, 0.05f, 1.0f};
 inline constexpr std::array<float, 3> MENU_STEP_BIG{0.5f, 0.25f, 5.0f};
+
+// Menu text: body text is drawn MENU_FONT_PX pixels tall into the menu image, and shown MENU_TEXT_DEG degrees tall
+// (times menu.scale) in the headset, whatever the distance. 0.7 degrees is comfortable reading size in VR.
+inline constexpr float MENU_FONT_PX = 30.0f;
+inline constexpr float MENU_TEXT_DEG = 0.7f;
 
 enum MenuAction : int {
     ActionNone = 0,
@@ -424,7 +438,7 @@ public:
     static std::string format_menu(const HudTune& t, int field) {
         switch (field) {
         case MenuDistance: return fmt::format("{:.1f} m", t.menu[0]);
-        case MenuWidth: return fmt::format("{:.2f} m", t.menu[1]);
+        case MenuScale: return fmt::format("{:.0f}%", t.menu[1] * 100.0f);
         case MenuPitch: return fmt::format("{:+.0f} deg", t.menu[2]);
         default: return {};
         }
@@ -463,53 +477,63 @@ private:
     void build_rows() {
         m_rows.clear();
 
-        const auto add = [&](MenuRow::Kind kind, int group, int field, int action, std::string label) {
+        int column = 0;
+        const auto add = [&](MenuRow::Kind kind, int group, int field, int action, std::string label, std::string hint) {
             MenuRow r{};
             r.kind = kind;
             r.group = group;
             r.field = field;
             r.action = action;
+            r.column = column;
             r.label = std::move(label);
+            r.hint = std::move(hint);
             m_rows.push_back(std::move(r));
         };
 
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "HUD screen (the game's whole HUD as one panel)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLayout, "HUD layout");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Size (width)");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "Distance");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Left / right");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down");
-        add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen to defaults");
+        const std::string value_hint = "Left / Right to change     A = flip which way Left / Right moves it";
 
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "Mod menu (fixed where it opens)");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Menu distance");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuWidth, ActionNone, "Menu size (width)");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Menu up / down");
-        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement");
+        // ---- Left column ----
+        column = 0;
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "HUD SCREEN", "THE GAME'S WHOLE HUD AS ONE PANEL");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLayout, "HUD layout", "A = switch between one game-screen panel and the old per-panel layout");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Size", value_hint);
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "Distance", value_hint);
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Left / right", value_hint);
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down", value_hint);
+        add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen", "A = put the HUD screen back to its default size and place");
 
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "View");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position");
-        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD in front of me");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost / double layer");
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "MOD MENU", "FIXED WHERE IT OPENS");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Distance", "Left / Right to change. Text keeps the same size at any distance");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuScale, ActionNone, "Text size", value_hint);
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Up / down", value_hint);
+        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement", "A = default distance, size and height, and move the menu in front of you");
 
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room, or HUD follows your head");
+        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction", "A = flip, only if the fixed HUD turns with your head");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "OTHER", "");
+        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
+        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
+
+        // ---- Right column: per-panel tuning (used by the per-panel layout) ----
+        column = 1;
         for (int g = 0; g < GroupCount; ++g) {
-            add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_LABELS[g]);
+            static constexpr std::array<const char*, GroupCount> titles{"HACKING CIRCLE", "HEALTH / STAMINA / WEAPONS", "TUTORIAL BOX"};
+            add(MenuRow::Kind::Header, g, -1, ActionNone, titles[g], "PER-PANEL LAYOUT");
 
             if (g == GroupHack) {
-                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Locked (Enter to unlock)");
+                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock the hacking circle values");
             }
 
-            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size");
-            add(MenuRow::Kind::Value, g, FieldX, ActionNone, g == GroupVitals ? "Toward / away from center" : "Left / right");
-            add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down");
-            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap (double image)");
-            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, g == GroupHack ? "Restore locked-in values" : "Reset to defaults");
+            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", value_hint);
+            add(MenuRow::Kind::Value, g, FieldX, ActionNone, g == GroupVitals ? "Toward / away from center" : "Left / right", value_hint);
+            add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
+            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap", "Left / Right to change the double-image gap between eyes. A = flip direction");
+            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = reset this panel group to neutral (blocked while locked)");
         }
-
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "Other");
-        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot (both eyes)");
-        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu");
 
         // Start on the first selectable row.
         for (int i = 0; i < (int)m_rows.size(); ++i) {
@@ -560,7 +584,7 @@ private:
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
             s += fmt::format("screen.{}.invert={}\n", SCREEN_KEYS[i], t.screen_invert[i] ? 1 : 0);
         }
-        s += "# menu.distance and menu.width in meters, menu.pitch in degrees.\n";
+        s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees.\n";
         for (int i = 0; i < 3; ++i) {
             s += fmt::format("menu.{}={:.2f}\n", MENU_KEYS[i], t.menu[i]);
             s += fmt::format("menu.{}.invert={}\n", MENU_KEYS[i], t.menu_invert[i] ? 1 : 0);
@@ -1123,6 +1147,31 @@ inline Plane hud_plane(const HudTune& t, const HudTuning::Pose& anchor, const Ma
     const float half_w = dist * std::tan(glm::radians(t.screen[ScreenWidth]) * 0.5f);
     const float flat_aspect = flat[0][0] != 0.0f ? std::fabs(flat[1][1] / flat[0][0]) : (16.0f / 9.0f);
     return make_plane(anchor, t.screen[ScreenYaw], t.screen[ScreenPitch], dist, half_w, half_w / flat_aspect);
+}
+
+// Mod menu panel in tracking (stage) space for the OpenXR quad layer: `dist` meters in front of the anchor, tilted
+// menu.pitch degrees, facing the player. Its size follows the menu image: body text MENU_FONT_PX pixels tall is shown
+// MENU_TEXT_DEG * menu.scale degrees tall, so the panel always fits its text and never stretches it.
+struct MenuQuadPlacement {
+    glm::quat orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::vec3 position{0.0f};
+    float width_m{1.0f};
+    float height_m{1.0f};
+};
+
+inline MenuQuadPlacement menu_quad_placement(const HudTune& t, const HudTuning::Pose& anchor, float image_w_px, float image_h_px) {
+    const float dist = t.menu[MenuDistance];
+    const float text_rad = glm::radians(MENU_TEXT_DEG * t.menu[MenuScale]);
+    const float meters_per_px = (2.0f * dist * std::tan(text_rad * 0.5f)) / MENU_FONT_PX;
+
+    const glm::mat4 r = anchor.rot * glm::rotate(glm::mat4{1.0f}, glm::radians(t.menu[MenuPitch]), glm::vec3{1.0f, 0.0f, 0.0f});
+
+    MenuQuadPlacement out{};
+    out.orientation = glm::normalize(glm::quat_cast(glm::mat3{r}));
+    out.position = anchor.pos + glm::vec3{r * glm::vec4{0.0f, 0.0f, -dist, 0.0f}};
+    out.width_m = image_w_px * meters_per_px;
+    out.height_m = image_h_px * meters_per_px;
+    return out;
 }
 
 inline void adjust_projection(Matrix4x4f& m, float zoom, float x, float y) {

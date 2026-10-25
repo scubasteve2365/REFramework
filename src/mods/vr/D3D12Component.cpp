@@ -122,8 +122,9 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
     }
 
     const float menu_dist = tune->menu[pragmatavr::MenuDistance];
-    const float half_w = tune->menu[pragmatavr::MenuWidth] * 0.5f;
-    const float half_h = half_w * (src_h / src_w);
+    const auto placement = pragmatavr::menu_quad_placement(*tune, st.menu, src_w, src_h);
+    const float half_w = placement.width_m * 0.5f;
+    const float half_h = placement.height_m * 0.5f;
     const auto plane = pragmatavr::make_plane(st.menu, 0.0f, tune->menu[pragmatavr::MenuPitch], menu_dist, half_w, half_h);
     const glm::mat4 view_proj = glm::mat4{proj} * pragmatavr::eye_view(st.head, vr->get_eye_transform(left ? 0 : 1));
 
@@ -203,6 +204,223 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
 
     m.cmds.has_commands = true;
     m.cmds.execute();
+}
+
+// PragmataVR Build 9: the mod menu as an OpenXR quad composition layer. Each submitted frame while the menu is open,
+// the menu rectangle is copied from the ImGui render target into this swapchain, and OpenXR::end_frame submits it at
+// a fixed pose in stage space. The runtime's compositor draws it with full perspective for each eye at display time,
+// so the panel stays exactly where it was placed whatever the head does.
+struct PragmataMenuQuad {
+    std::vector<XrSwapchainImageD3D12KHR> images{};
+    std::vector<std::unique_ptr<d3d12::CommandContext>> cmds{};
+    bool failed{false};
+};
+
+PragmataMenuQuad g_pragmata_quad{};
+
+void pragmata_drop_menu_swapchain(runtimes::OpenXR* openxr) {
+    auto& mq = openxr->menu_quad;
+    auto& q = g_pragmata_quad;
+
+    for (auto& c : q.cmds) {
+        if (c != nullptr) {
+            c->wait(INFINITE);
+        }
+    }
+
+    // A swapchain from an older session was destroyed with that session.
+    if (mq.swapchain != XR_NULL_HANDLE && mq.owner == openxr->session) {
+        xrDestroySwapchain(mq.swapchain);
+    }
+
+    mq.swapchain = XR_NULL_HANDLE;
+    mq.owner = XR_NULL_HANDLE;
+    mq.width = 0;
+    mq.height = 0;
+    q.images.clear();
+    q.cmds.clear();
+}
+
+bool pragmata_create_menu_swapchain(runtimes::OpenXR* openxr, int32_t need_w, int32_t need_h) {
+    auto& mq = openxr->menu_quad;
+    auto& q = g_pragmata_quad;
+
+    // The ImGui target is R8G8B8A8_UNORM holding sRGB-encoded colors. An _SRGB swapchain makes the compositor decode
+    // them, so the menu shows the colors it was drawn with. Both formats are in the R8G8B8A8 family, so a plain copy works.
+    uint32_t format_count = 0;
+    xrEnumerateSwapchainFormats(openxr->session, 0, &format_count, nullptr);
+    std::vector<int64_t> formats(format_count);
+    if (format_count > 0) {
+        xrEnumerateSwapchainFormats(openxr->session, format_count, &format_count, formats.data());
+    }
+
+    int64_t format = 0;
+    for (const auto wanted : {(int64_t)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM}) {
+        if (std::find(formats.begin(), formats.end(), wanted) != formats.end()) {
+            format = wanted;
+            break;
+        }
+    }
+
+    if (format == 0) {
+        spdlog::error("[PragmataVR] OpenXR runtime offers no R8G8B8A8 swapchain format for the menu; using the eye-image fallback");
+        q.failed = true;
+        return false;
+    }
+
+    const auto round_up = [](int32_t v) { return (((std::max)(v, 1024) + 255) / 256) * 256; };
+
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = format;
+    ci.sampleCount = 1;
+    ci.width = (uint32_t)round_up(need_w);
+    ci.height = (uint32_t)round_up(need_h);
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+
+    XrSwapchain handle{XR_NULL_HANDLE};
+    auto result = xrCreateSwapchain(openxr->session, &ci, &handle);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[PragmataVR] Could not create the menu swapchain ({} x {}): {}", ci.width, ci.height, openxr->get_result_string(result));
+        q.failed = true;
+        return false;
+    }
+
+    uint32_t image_count = 0;
+    xrEnumerateSwapchainImages(handle, 0, &image_count, nullptr);
+    q.images.assign(image_count, XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    result = xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)q.images.data());
+    if (result != XR_SUCCESS || image_count == 0) {
+        spdlog::error("[PragmataVR] Could not get the menu swapchain images: {}", openxr->get_result_string(result));
+        xrDestroySwapchain(handle);
+        q.images.clear();
+        q.failed = true;
+        return false;
+    }
+
+    q.cmds.clear();
+    for (uint32_t i = 0; i < image_count; ++i) {
+        auto c = std::make_unique<d3d12::CommandContext>();
+        if (!c->setup((std::wstring{L"PragmataVR menu quad "} + std::to_wstring(i)).c_str())) {
+            spdlog::error("[PragmataVR] Could not set up the menu quad command list");
+            xrDestroySwapchain(handle);
+            q.images.clear();
+            q.cmds.clear();
+            q.failed = true;
+            return false;
+        }
+        q.cmds.push_back(std::move(c));
+    }
+
+    mq.swapchain = handle;
+    mq.owner = openxr->session;
+    mq.width = (int32_t)ci.width;
+    mq.height = (int32_t)ci.height;
+
+    spdlog::info("[PragmataVR] Menu quad layer ready: {} x {}, format {}, {} images", ci.width, ci.height, format, image_count);
+    return true;
+}
+
+// Called right before OpenXR::end_frame. Leaves menu_quad.visible false unless the menu was copied this frame.
+// Returns false when the quad cannot be used (the caller then falls back to pasting the menu into the eye images).
+bool pragmata_update_menu_quad(runtimes::OpenXR* openxr) {
+    auto& mq = openxr->menu_quad;
+    auto& hud = pragmatavr::HudTuning::get();
+    auto& q = g_pragmata_quad;
+
+    mq.visible = false;
+
+    if (q.failed) {
+        return false;
+    }
+
+    if (!openxr->ready() || openxr->frame_state.shouldRender != XR_TRUE || !hud.menu_open.load() || !hud.menu_rect_valid.load()) {
+        return true;
+    }
+
+    auto& imgui_rt = g_framework->get_rendertarget_d3d12();
+    if (imgui_rt == nullptr) {
+        return true;
+    }
+
+    const auto st = hud.head_state();
+    if (!st.valid) {
+        return true;
+    }
+
+    // Source: the menu rectangle in the ImGui render target.
+    const auto rt_desc = imgui_rt->GetDesc();
+    const float rt_w = (float)rt_desc.Width;
+    const float rt_h = (float)rt_desc.Height;
+    const UINT src_left = (UINT)std::clamp(hud.menu_rect_x.load(), 0.0f, rt_w - 1.0f);
+    const UINT src_top = (UINT)std::clamp(hud.menu_rect_y.load(), 0.0f, rt_h - 1.0f);
+    const UINT src_right = (UINT)std::clamp(std::ceil(hud.menu_rect_x.load() + hud.menu_rect_w.load()), (float)src_left + 1.0f, rt_w);
+    const UINT src_bottom = (UINT)std::clamp(std::ceil(hud.menu_rect_y.load() + hud.menu_rect_h.load()), (float)src_top + 1.0f, rt_h);
+    const int32_t w = (int32_t)(src_right - src_left);
+    const int32_t h = (int32_t)(src_bottom - src_top);
+
+    if (mq.swapchain != XR_NULL_HANDLE && (mq.owner != openxr->session || w > mq.width || h > mq.height)) {
+        pragmata_drop_menu_swapchain(openxr);
+    }
+
+    if (mq.swapchain == XR_NULL_HANDLE && !pragmata_create_menu_swapchain(openxr, w, h)) {
+        return false;
+    }
+
+    // Copy the menu into the next swapchain image.
+    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t index = 0;
+    auto result = xrAcquireSwapchainImage(mq.swapchain, &acquire_info, &index);
+    if (result != XR_SUCCESS || index >= q.images.size()) {
+        spdlog::error("[PragmataVR] Menu quad: xrAcquireSwapchainImage failed: {}", openxr->get_result_string(result));
+        return true;
+    }
+
+    XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait_info.timeout = XR_INFINITE_DURATION;
+    result = xrWaitSwapchainImage(mq.swapchain, &wait_info);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[PragmataVR] Menu quad: xrWaitSwapchainImage failed: {}", openxr->get_result_string(result));
+        XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(mq.swapchain, &release_info);
+        return true;
+    }
+
+    auto& cmds = *q.cmds[index];
+    cmds.wait(INFINITE);
+
+    D3D12_BOX box{src_left, src_top, 0, src_right, src_bottom, 1};
+    cmds.copy_region(imgui_rt.Get(), q.images[index].texture, &box, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmds.execute();
+
+    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    result = xrReleaseSwapchainImage(mq.swapchain, &release_info);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[PragmataVR] Menu quad: xrReleaseSwapchainImage failed: {}", openxr->get_result_string(result));
+        return true;
+    }
+
+    // Place it in the room: where the menu was opened, at the menu distance / pitch, sized to the menu's pixels.
+    const auto tune = hud.tune();
+    const auto placement = pragmatavr::menu_quad_placement(*tune, st.menu, (float)w, (float)h);
+
+    mq.pose.orientation = XrQuaternionf{placement.orientation.x, placement.orientation.y, placement.orientation.z, placement.orientation.w};
+    mq.pose.position = XrVector3f{placement.position.x, placement.position.y, placement.position.z};
+    mq.size = XrExtent2Df{placement.width_m, placement.height_m};
+    mq.used_width = w;
+    mq.used_height = h;
+    mq.visible = true;
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        spdlog::info("[PragmataVR] Menu quad shown: {} x {} px, {:.2f} x {:.2f} m at ({:.2f}, {:.2f}, {:.2f})",
+            w, h, placement.width_m, placement.height_m, placement.position.x, placement.position.y, placement.position.z);
+    }
+
+    return true;
 }
 } // namespace
 #endif
@@ -301,7 +519,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }
 
     // PragmataVR mod menu into this eye's image (after the snapshot, so snapshots show the game only).
-    pragmata_composite_menu(vr, backbuffer.Get(), backbuffer_index, (frame_count % 2) == vr->m_left_eye_interval);
+    // Under OpenXR the menu is its own room-fixed quad layer (pragmata_update_menu_quad, before end_frame). The old
+    // paste-into-each-eye path is kept for OpenVR, and as a fallback if the quad layer could not be created.
+    if (!runtime->is_openxr() || g_pragmata_quad.failed) {
+        pragmata_composite_menu(vr, backbuffer.Get(), backbuffer_index, (frame_count % 2) == vr->m_left_eye_interval);
+    }
 #endif
 
     
@@ -695,10 +917,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 vr->m_openxr->begin_frame();
             }
 
+#if defined(PRAGMATA)
+            pragmata_update_menu_quad(vr->m_openxr.get());
+#endif
+
             auto result = vr->m_openxr->end_frame();
 
             if (result == XR_ERROR_LAYER_INVALID) {
                 spdlog::info("[VR] Attempting to correct invalid layer");
+
+#if defined(PRAGMATA)
+                // Never let the menu layer cost the game its frames: drop it and use the eye-image fallback.
+                if (vr->m_openxr->menu_quad.visible) {
+                    spdlog::error("[PragmataVR] Runtime rejected the menu quad layer; switching to the eye-image menu");
+                    vr->m_openxr->menu_quad.visible = false;
+                    g_pragmata_quad.failed = true;
+                }
+#endif
 
                 m_openxr.wait_for_all_copies();
 

@@ -21,6 +21,9 @@ extern "C" {
 #include <imnodes.h>
 #include "re2-imgui/af_faprolight.hpp"
 #include "re2-imgui/font_robotomedium.hpp"
+#if defined(PRAGMATA)
+#include "mods/vr/PragmataMenuFont.hpp"
+#endif
 #include "re2-imgui/imgui_impl_dx11.h"
 #include "re2-imgui/imgui_impl_dx12.h"
 #include "re2-imgui/imgui_impl_win32.h"
@@ -1584,6 +1587,27 @@ void REFramework::init_fonts() {
         
         m_default_font = loaded_fonts["DEFAULT"];
     }
+
+#if defined(PRAGMATA)
+    // PragmataVR mod menu fonts (Barlow Semi Condensed, SIL OFL 1.1), embedded in the DLL.
+    if (!loaded_fonts.contains("PRAGMATAVR_MENU")) {
+        ImFontConfig cfg{};
+        cfg.FontDataOwnedByAtlas = false;
+        loaded_fonts["PRAGMATAVR_MENU"] = fonts->AddFontFromMemoryTTF((void*)pragmatavr::fonts::menu_font_medium,
+            (int)pragmatavr::fonts::menu_font_medium_size, 30.0f, &cfg);
+    }
+
+    if (!loaded_fonts.contains("PRAGMATAVR_MENU_BOLD")) {
+        ImFontConfig cfg{};
+        cfg.FontDataOwnedByAtlas = false;
+        loaded_fonts["PRAGMATAVR_MENU_BOLD"] = fonts->AddFontFromMemoryTTF((void*)pragmatavr::fonts::menu_font_semibold,
+            (int)pragmatavr::fonts::menu_font_semibold_size, 30.0f, &cfg);
+    }
+
+    pragmatavr::g_menu_font = loaded_fonts["PRAGMATAVR_MENU"];
+    pragmatavr::g_menu_font_bold = loaded_fonts["PRAGMATAVR_MENU_BOLD"];
+    spdlog::info("[PragmataVR] Menu fonts {}", pragmatavr::g_menu_font != nullptr && pragmatavr::g_menu_font_bold != nullptr ? "loaded" : "FAILED, using default font");
+#endif
 
     /*if (!loaded_fonts.contains("ICON")) {
         // https://fontawesome.com/
