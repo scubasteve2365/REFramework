@@ -385,8 +385,20 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
             const float x = left ? tune->depth_shift : -tune->depth_shift;
             pragmatavr::adjust_projection(m, tune->zoom, x, 0.0f);
 
-            // Fixed-in-room HUD: rotate the GUI camera's view space against the head.
-            m = m * pragmatavr::HudTuning::get().lock_rotation();
+            // Build 12: HUD fixed in the room. The GUI camera's view space (where the 3D HUD panels sit, as the player
+            // sees them when following the head) is placed in the room at the HUD anchor (head yaw and position at the
+            // last recenter), then seen from this eye's real pose: eye_proj * eye_view * anchor. Same tracking-space
+            // math as the Build 8 HUD screen, which stayed put. Build 6's rotation-only lock (lock_rotation) is gone.
+            if (tune->hud_fixed) {
+                const auto st = pragmatavr::HudTuning::get().head_state();
+                if (st.valid) {
+                    const bool real_left = (vr->m_frame_count % 2) == vr->m_left_eye_interval;
+                    const auto eye_to_head = vr->get_eye_transform(real_left ? 0 : 1);
+                    const auto view = pragmatavr::eye_view(st.head, eye_to_head);
+                    const glm::mat4 anchor = glm::translate(glm::mat4{1.0f}, st.hud.pos) * st.hud.rot;
+                    m = glm::mat4{m} * view * anchor;
+                }
+            }
 
             if (tune->log_elements) {
                 pragmatavr::HudTuning::get().note_element(pragmatavr::g_current_gui_hash, pragmatavr::g_current_gui_name);
@@ -3426,10 +3438,13 @@ void VR::on_frame() {
     std::array<float, 2> col_w{};
     std::array<std::array<float, 2>, 2> col_h{};                 // [band][column]
     std::array<std::array<bool, 2>, 2> col_first{{{true, true}, {true, true}}};
+    std::vector<float> row_col_y(rows.size(), 0.0f); // each row's top within its band column (for scrolling)
 
-    for (const auto& row : rows) {
+    for (int ri = 0; ri < (int)rows.size(); ++ri) {
+        const auto& row = rows[ri];
         const int c = std::clamp(row.column, 0, 1);
         const int bd = std::clamp(row.band, 0, 1);
+        row_col_y[ri] = col_h[bd][c];
 
         if (row.kind == Kind::Header) {
             const float title = header_size * 0.95f + spaced(bold, header_size, 0, 0, 0, row.label.c_str(), header_size * 0.14f, false);
@@ -3451,7 +3466,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 11");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 12");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3480,7 +3495,34 @@ void VR::on_frame() {
     const float title_block = std::round(title_size * 1.25f + fs * 0.9f);
     const float content_h = tier_block + band_h[0] + band_gap + tier_block + band_h[1];
     const float footer_h = std::round(fs * 0.8f + hint_size * 1.6f + small_size * 1.35f + small_size * 0.7f + small_size * 1.4f);
-    const float panel_h = std::ceil(pad * 0.8f + title_block + content_h + footer_h + pad * 0.8f);
+
+    // Build 12: when the rows are taller than the ImGui target, the band area scrolls (title and footer stay put) and
+    // follows the highlighted row. Small cyan arrows on the right show that there is more above or below.
+    const float fixed_h = pad * 0.8f + title_block + footer_h + pad * 0.8f;
+    const float max_panel_h = std::floor(ImGui::GetIO().DisplaySize.y - 32.0f);
+    const float view_h = std::floor((std::min)(content_h, (std::max)(line_h * 6.0f, max_panel_h - fixed_h)));
+    const bool scrolls = view_h < content_h - 0.5f;
+    const float panel_h = std::ceil(fixed_h + view_h);
+
+    static float s_scroll = 0.0f;
+    if (!scrolls) {
+        s_scroll = 0.0f;
+    } else if (sel >= 0 && sel < (int)rows.size()) {
+        const int sbd = std::clamp(rows[sel].band, 0, 1);
+        const float band_off = sbd == 0 ? tier_block : tier_block + band_h[0] + band_gap + tier_block;
+        const float sel_top = band_off + row_col_y[sel];
+        const float margin = line_h * 1.5f;
+        if (sel_top - margin < s_scroll) {
+            s_scroll = sel_top - margin;
+        }
+        if (sel_top + line_h + margin > s_scroll + view_h) {
+            s_scroll = sel_top + line_h + margin - view_h;
+        }
+        if (sbd == 0 && sel_top < view_h * 0.5f) {
+            s_scroll = 0.0f; // top band: show the menu from its top
+        }
+        s_scroll = std::clamp(s_scroll, 0.0f, content_h - view_h);
+    }
 
     // ---- Panel ----
     const ImVec2 p0{16.0f, 16.0f};
@@ -3511,7 +3553,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 11"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 11");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 12"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 12");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3522,6 +3564,10 @@ void VR::on_frame() {
     // ---- Bands: MOD MENU SETTINGS on top, GAME HUD SETTINGS below, each with its own two columns ----
     const std::array<float, 2> col_x{left, left + col_w[0] + gutter};
     std::array<float, 2> band_top{};
+
+    const float content_top = y;
+    y -= std::floor(s_scroll);
+    dl->PushClipRect(ImVec2{p0.x, content_top}, ImVec2{p1.x, content_top + view_h}, true);
 
     for (int bd = 0; bd < 2; ++bd) {
         if (bd == 1) {
@@ -3646,8 +3692,23 @@ void VR::on_frame() {
         ry += line_h;
     }
 
+    dl->PopClipRect();
+
+    if (scrolls) {
+        const float a = std::round(fs * 0.28f);
+        const float ax = p1.x - std::round(pad * 0.45f);
+        if (s_scroll > 0.5f) {
+            const float ay = content_top + a;
+            dl->AddTriangleFilled(ImVec2{ax, ay - a * 0.6f}, ImVec2{ax + a, ay + a * 0.6f}, ImVec2{ax - a, ay + a * 0.6f}, ACCENT);
+        }
+        if (s_scroll < content_h - view_h - 0.5f) {
+            const float ay = content_top + view_h - a;
+            dl->AddTriangleFilled(ImVec2{ax, ay + a * 0.6f}, ImVec2{ax - a, ay - a * 0.6f}, ImVec2{ax + a, ay - a * 0.6f}, ACCENT);
+        }
+    }
+
     // ---- Footer: help for the highlighted item, controller chips, keyboard ----
-    y = band_top[1] + band_h[1] + std::round(fs * 0.8f);
+    y = content_top + view_h + std::round(fs * 0.8f);
     dl->AddLine(ImVec2{left, std::floor(y - fs * 0.35f)}, ImVec2{right, std::floor(y - fs * 0.35f)}, ACCENT_FAINT, 1.0f);
 
     if (selected_row != nullptr) {
@@ -4029,8 +4090,16 @@ bool is_visible(REManagedObject* o, sdk::VMContext* ctx) {
     return m->call<bool>(ctx, o);
 }
 
+// Pieces that are not the element itself: helpers that draw nothing (ParamSetter), and full-screen layers (edge glows,
+// screen effects, blur) that span the whole canvas. Seen in the Build 11 tree dumps of ui2130Gui and ui2150Gui.
+bool skip_type(const std::string& t) {
+    return t == "via.gui.ParamSetter" || t == "via.gui.Material" || t == "via.gui.Effect" || t == "via.gui.EffectTexture" ||
+           t == "via.gui.BlurFilter";
+}
+
 struct Walk {
     sdk::VMContext* ctx{};
+    Vector2f canvas{1920.0f, 1080.0f};
     Vector2f lo{(std::numeric_limits<float>::max)(), (std::numeric_limits<float>::max)()};
     Vector2f hi{-(std::numeric_limits<float>::max)(), -(std::numeric_limits<float>::max)()};
     int leaves{0};
@@ -4038,17 +4107,28 @@ struct Walk {
     std::string dump{};
     bool want_dump{false};
 
-    void add(const Vector2f& p) {
+    // A point counts unless it sits on the canvas edge, at its top-left origin or exactly at its center: those are
+    // layout anchors and full-screen layers, not the element.
+    bool add(const Vector2f& p) {
+        const float e = 5.0f;
+        if (p.x <= e || p.y <= e || p.x >= canvas.x - e || p.y >= canvas.y - e) {
+            return false;
+        }
+        if (std::fabs(p.x - canvas.x * 0.5f) < 2.0f && std::fabs(p.y - canvas.y * 0.5f) < 2.0f) {
+            return false;
+        }
         lo = glm::min(lo, p);
         hi = glm::max(hi, p);
         ++leaves;
+        return true;
     }
 
-    // obj's children, placed with the parent's accumulated offset and scale.
-    void children(REManagedObject* obj, const Vector2f& offset, const Vector2f& scale, int depth) {
+    // obj's children, placed with the parent's accumulated offset and scale. Returns how many points were added.
+    int children(REManagedObject* obj, const Vector2f& offset, const Vector2f& scale, int depth) {
         if (depth > 14) {
-            return;
+            return 0;
         }
+        int added = 0;
         auto c = sdk::call_object_func<REManagedObject*>(obj, "get_Child", ctx, obj);
         for (int n = 0; c != nullptr && n < 256 && nodes < 1024; ++n) {
             ++nodes;
@@ -4058,22 +4138,26 @@ struct Walk {
             const Vector2f p = offset + scale * Vector2f{p4.x, p4.y};
             const Vector2f sc = scale * Vector2f{s4.x, s4.y};
             const auto first_child = sdk::call_object_func<REManagedObject*>(c, "get_Child", ctx, c);
+            auto td = utility::re_managed_object::get_type_definition(c);
+            const std::string type_name = td != nullptr ? td->get_full_name() : std::string{"?"};
 
-            if (want_dump && dump.size() < 6000) {
-                auto td = utility::re_managed_object::get_type_definition(c);
+            if (want_dump && dump.size() < 6000 && type_name != "via.gui.ParamSetter") {
                 dump += fmt::format("\n    {:>{}}{} vis={} pos=({:.0f},{:.0f}) scale=({:.2f},{:.2f}) -> ({:.0f},{:.0f})",
-                    "", depth * 2, td != nullptr ? td->get_full_name() : std::string{"?"}, vis ? 1 : 0, p4.x, p4.y, s4.x, s4.y, p.x, p.y);
+                    "", depth * 2, type_name, vis ? 1 : 0, p4.x, p4.y, s4.x, s4.y, p.x, p.y);
             }
 
-            if (vis) {
-                if (first_child == nullptr) {
-                    add(p); // a drawn piece (texture, text, rect)
-                } else {
-                    children(c, p, sc, depth + 1);
+            if (vis && !skip_type(type_name)) {
+                // A visible piece counts as a point when nothing below it does (a leaf, or a group whose children
+                // are all hidden or skipped).
+                const int below = first_child != nullptr ? children(c, p, sc, depth + 1) : 0;
+                added += below;
+                if (below == 0 && add(p)) {
+                    ++added;
                 }
             }
             c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
         }
+        return added;
     }
 };
 
@@ -4096,6 +4180,13 @@ std::optional<Vector2f> get(size_t hash, const std::string& name, REComponent* v
     Walk w{};
     w.ctx = ctx;
     w.want_dump = want_dump;
+    {
+        regenny::via::Size gui_size{};
+        sdk::call_object_func<void*>((REManagedObject*)view, "get_ScreenSize", &gui_size, ctx, (REManagedObject*)view);
+        if (gui_size.w > 100.0f && gui_size.h > 100.0f) {
+            w.canvas = Vector2f{gui_size.w, gui_size.h};
+        }
+    }
     w.children((REManagedObject*)view, Vector2f{0.0f, 0.0f}, Vector2f{1.0f, 1.0f}, 0);
 
     Entry out{};
@@ -4110,8 +4201,8 @@ std::optional<Vector2f> get(size_t hash, const std::string& name, REComponent* v
     out.logged = e.logged;
     if (want_dump && out.valid) {
         out.logged = true;
-        spdlog::info("[PragmataVR] Element center for {}: ({:.0f}, {:.0f}) from {} visible pieces of {} objects, box ({:.0f},{:.0f})-({:.0f},{:.0f}). Tree:{}",
-            name, out.pivot.x, out.pivot.y, w.leaves, w.nodes, w.lo.x, w.lo.y, w.hi.x, w.hi.y, w.dump);
+        spdlog::info("[PragmataVR] Element center for {}: ({:.0f}, {:.0f}) from {} visible pieces of {} objects, box ({:.0f},{:.0f})-({:.0f},{:.0f}), canvas {:.0f}x{:.0f}. Tree:{}",
+            name, out.pivot.x, out.pivot.y, w.leaves, w.nodes, w.lo.x, w.lo.y, w.hi.x, w.hi.y, w.canvas.x, w.canvas.y, w.dump);
     }
     e = out;
     return out.valid ? std::optional<Vector2f>{out.pivot} : std::nullopt;

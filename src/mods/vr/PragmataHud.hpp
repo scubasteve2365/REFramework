@@ -91,7 +91,11 @@ inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCL
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
-inline constexpr int INI_VERSION = 11;
+inline constexpr int INI_VERSION = 12;
+// hud_fixed and hack_locked lines are ignored in files older than this (Build 11 wrote hud_fixed=0 as its default).
+inline constexpr int INI_VERSION_FIXED_HUD = 12;
+// hack.* lines are ignored in files older than this (Build 10 and before had them reset by Build 8).
+inline constexpr int INI_VERSION_HACK = 11;
 
 // Steve's hacking circle (Dream Air, per-panel layout, 2026-10-23). D:\Projects\PragmataVR\HACKING_CIRCLE_LOCKED.txt
 inline constexpr float HACK_LOCKED_SIZE = 0.9322f;
@@ -116,7 +120,7 @@ struct HudTune {
     float y_sign{1.0f};
     bool log_elements{true};
     bool hack_locked{true};
-    bool hud_fixed{false};   // per-panel HUD: rotation-only room lock (Build 6). Off = follows the head, as tuned
+    bool hud_fixed{true};    // HUD fixed in the room (Build 12, Steve's standing preference). Off = follows the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
@@ -610,9 +614,8 @@ private:
 
         column = 0;
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD follows your head, or turns less with it (rotation lock)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room (default), or HUD follows your head");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction", "A = flip, only if the fixed HUD turns with your head");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
             "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
@@ -779,8 +782,12 @@ private:
         }
         f.close();
         const bool old_file = file_version < INI_VERSION;
+        const bool old_hack = file_version < INI_VERSION_HACK;
+        const bool old_fixed = file_version < INI_VERSION_FIXED_HUD;
         if (old_file) {
-            spdlog::info("[PragmataVR] pragmatavr_hud.ini is from an older build: hacking circle set to the locked values, other elements neutral");
+            spdlog::info("[PragmataVR] pragmatavr_hud.ini v{} is from an older build:{}{} (file will be rewritten as v{})", file_version,
+                old_hack ? " hacking circle set to the locked values, other elements neutral;" : "",
+                old_fixed ? " HUD fixed in the room" : "", INI_VERSION);
         }
 
         for (auto& l : lines) {
@@ -811,7 +818,7 @@ private:
 
             const auto dot = key.find('.');
             if (dot == std::string::npos) {
-                if (old_file && (key == "hud_fixed" || key == "hack_locked")) continue;
+                if (old_fixed && (key == "hud_fixed" || key == "hack_locked")) continue;
                 if (key == "enabled") t->enabled = val != 0.0f;
                 else if (key == "eye_mode") t->eye_mode = (EyeMode)std::clamp((int)val, 0, 3);
                 else if (key == "zoom") t->zoom = std::clamp(val, 0.05f, 20.0f);
@@ -859,7 +866,7 @@ private:
                 if (group_key != GROUP_KEYS[g]) {
                     continue;
                 }
-                if (old_file && g == GroupHack) {
+                if (old_hack && g == GroupHack) {
                     continue;
                 }
 
