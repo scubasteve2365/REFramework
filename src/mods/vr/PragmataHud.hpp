@@ -12,10 +12,12 @@
 // restored right after (VR::on_pre_gui_draw_element / on_gui_draw_element).
 //
 // Values live in reframework/data/pragmatavr_hud.ini. The VR mod menu edits them in the headset.
-//   Gamepad: click both thumbsticks = open/close, D-pad or left stick = move/change, RB held = big steps,
-//            A = invert box / action, B = close. The game does not see the pad while the menu is open
+//   Gamepad (Build 10): click both thumbsticks = open/close. D-pad or left stick only navigates (Up/Down rows,
+//            Left/Right to a value's INV box and between columns). A = edit the highlighted value (then Left/Right
+//            change it, RB held = big steps, A or B = done), flip the highlighted INV box, toggle or run an action.
+//            B = stop editing, or close. The game does not see the pad while the menu is open
 //            (if it reads the pad through XInput, see pragmata_xinput_get_state in VR.cpp).
-//   Keyboard: F1 open/close, arrows, Shift = big steps, Enter, Backspace.
+//   Keyboard: F1 open/close, arrows, Shift = big steps, Enter = A, Backspace = B.
 // Pause = snapshot of both eye images. No other hotkeys.
 //
 // Menu drawing (Build 9): VR::on_frame draws the menu as one ImGui window (ImGui frames render into
@@ -29,7 +31,10 @@
 // Included from VR.cpp (after its includes) and from vr/D3D12Component.cpp.
 
 #include <Windows.h>
+#include <mmsystem.h>
 #include <Xinput.h>
+
+#pragma comment(lib, "winmm.lib")
 
 #include <algorithm>
 #include <cmath>
@@ -107,9 +112,10 @@ struct HudTune {
     std::array<bool, 4> screen_invert{};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
-    // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg)
-    std::array<float, 3> menu{2.5f, 1.0f, -5.0f};
-    std::array<bool, 3> menu_invert{};
+    // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
+    // click volume (0..1 of full scale)
+    std::array<float, 4> menu{2.5f, 1.0f, -5.0f, 0.5f};
+    std::array<bool, 4> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
 
     HudTune() {
@@ -137,14 +143,62 @@ inline int group_for(std::string_view name, float& side) {
 inline thread_local size_t g_current_gui_hash = 0;
 inline thread_local std::string g_current_gui_name{};
 
+// Menu click sounds. Build 9 and earlier used Beep(), which has no volume control and was too loud. The same two tones
+// (1400 Hz 30 ms "ok", 220 Hz 160 ms "limit / blocked") are now made here as small WAV images and played with
+// PlaySound, at the menu's Click volume (menu.click_volume, default 0.5 = half of full scale).
+inline std::atomic<int> g_click_volume_pct{50};
+
+inline const std::vector<uint8_t>& click_wav(bool ok, int volume_pct) {
+    // One cached image per tone and volume step. Never freed, so an asynchronous PlaySound never reads freed memory.
+    static std::mutex mtx{};
+    static std::unordered_map<int, std::unique_ptr<std::vector<uint8_t>>> cache{};
+
+    std::scoped_lock _{mtx};
+    const int key = (ok ? 1000 : 0) + volume_pct;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return *it->second;
+    }
+
+    constexpr uint32_t rate = 44100;
+    const float freq = ok ? 1400.0f : 220.0f;
+    const uint32_t samples = rate * (ok ? 30u : 160u) / 1000u;
+    const uint32_t fade = rate * 3u / 1000u; // 3 ms fade in and out so the tone does not click
+    const float amp = 32767.0f * (float)volume_pct / 100.0f;
+    const uint32_t data_bytes = samples * 2u;
+
+    auto wav = std::make_unique<std::vector<uint8_t>>();
+    auto& w = *wav;
+    w.reserve(44 + data_bytes);
+    const auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) w.push_back((uint8_t)(v >> (8 * i))); };
+    const auto put16 = [&](uint16_t v) { w.push_back((uint8_t)v); w.push_back((uint8_t)(v >> 8)); };
+    const auto tag = [&](const char* s) { w.insert(w.end(), s, s + 4); };
+
+    tag("RIFF"); put32(36 + data_bytes); tag("WAVE");
+    tag("fmt "); put32(16); put16(1); put16(1); put32(rate); put32(rate * 2); put16(2); put16(16);
+    tag("data"); put32(data_bytes);
+
+    for (uint32_t i = 0; i < samples; ++i) {
+        float env = 1.0f;
+        if (i < fade) env = (float)i / (float)fade;
+        else if (samples - i < fade) env = (float)(samples - i) / (float)fade;
+        const float s = std::sin(6.2831853f * freq * (float)i / (float)rate) * amp * env;
+        put16((uint16_t)(int16_t)std::clamp(s, -32767.0f, 32767.0f));
+    }
+
+    const auto& ref = *wav;
+    cache.emplace(key, std::move(wav));
+    return ref;
+}
+
 inline void play_click(bool ok) {
-    std::thread([ok]() {
-        if (ok) {
-            Beep(1400, 30);
-        } else {
-            Beep(220, 160);
-        }
-    }).detach();
+    const int vol = std::clamp(g_click_volume_pct.load(), 0, 100);
+    if (vol == 0) {
+        return;
+    }
+
+    const auto& wav = click_wav(ok, vol);
+    PlaySoundA((LPCSTR)wav.data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
 }
 
 // One row of the VR mod menu. The menu has two columns; rows are listed left column first, then right.
@@ -155,6 +209,7 @@ struct MenuRow {
     int field{-1};
     int action{0};
     int column{0};
+    int band{0}; // 0 = mod menu settings (top), 1 = game HUD settings (below)
     std::string label{};
     std::string hint{}; // footer help line while this row is selected (headers: small tag after the title)
 };
@@ -178,13 +233,14 @@ enum MenuField : int {
     MenuDistance = 0,
     MenuScale = 1,
     MenuPitch = 2,
+    MenuClickVolume = 3,
 };
 // menu.width (Build 8, meters) is gone: the panel's size now follows its text. Old ini lines for it are ignored.
-inline constexpr std::array<const char*, 3> MENU_KEYS{"distance", "scale", "pitch"};
-inline constexpr std::array<float, 3> MENU_MIN{0.8f, 0.5f, -40.0f};
-inline constexpr std::array<float, 3> MENU_MAX{8.0f, 2.0f, 40.0f};
-inline constexpr std::array<float, 3> MENU_STEP{0.1f, 0.05f, 1.0f};
-inline constexpr std::array<float, 3> MENU_STEP_BIG{0.5f, 0.25f, 5.0f};
+inline constexpr std::array<const char*, 4> MENU_KEYS{"distance", "scale", "pitch", "click_volume"};
+inline constexpr std::array<float, 4> MENU_MIN{0.8f, 0.5f, -40.0f, 0.0f};
+inline constexpr std::array<float, 4> MENU_MAX{8.0f, 2.0f, 40.0f, 1.0f};
+inline constexpr std::array<float, 4> MENU_STEP{0.1f, 0.05f, 1.0f, 0.1f};
+inline constexpr std::array<float, 4> MENU_STEP_BIG{0.5f, 0.25f, 5.0f, 0.25f};
 
 // Menu text: body text is drawn MENU_FONT_PX pixels tall into the menu image, and shown MENU_TEXT_DEG degrees tall
 // (times menu.scale) in the headset, whatever the distance. 0.7 degrees is comfortable reading size in VR.
@@ -417,6 +473,8 @@ public:
     // ---- Menu state, read by VR::on_frame (draw) and D3D12Component::on_frame (composite) ----
     std::atomic<bool> menu_open{false};
     std::atomic<int> menu_selected{0};
+    std::atomic<bool> menu_editing{false};   // A on a value row: Left / Right change it until A or B
+    std::atomic<bool> menu_on_invert{false}; // highlight is on the row's INV box (A flips it)
     std::atomic<float> menu_rect_x{0.0f};
     std::atomic<float> menu_rect_y{0.0f};
     std::atomic<float> menu_rect_w{0.0f};
@@ -439,6 +497,7 @@ public:
         switch (field) {
         case MenuDistance: return fmt::format("{:.1f} m", t.menu[0]);
         case MenuScale: return fmt::format("{:.0f}%", t.menu[1] * 100.0f);
+        case MenuClickVolume: return t.menu[3] <= 0.001f ? std::string{"OFF"} : fmt::format("{:.0f}%", t.menu[3] * 100.0f);
         case MenuPitch: return fmt::format("{:+.0f} deg", t.menu[2]);
         default: return {};
         }
@@ -478,6 +537,7 @@ private:
         m_rows.clear();
 
         int column = 0;
+        int band = 0;
         const auto add = [&](MenuRow::Kind kind, int group, int field, int action, std::string label, std::string hint) {
             MenuRow r{};
             r.kind = kind;
@@ -485,14 +545,31 @@ private:
             r.field = field;
             r.action = action;
             r.column = column;
+            r.band = band;
             r.label = std::move(label);
             r.hint = std::move(hint);
             m_rows.push_back(std::move(r));
         };
 
-        const std::string value_hint = "Left / Right to change     A = flip which way Left / Right moves it";
+        const std::string value_hint = "A = edit this value";
 
-        // ---- Left column ----
+        // ==== MOD MENU SETTINGS (top band) ====
+        band = 0;
+        column = 0;
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "PLACEMENT", "FIXED WHERE IT OPENS");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Distance", "A = edit. Text keeps the same size at any distance");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuScale, ActionNone, "Text size", value_hint);
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Up / down", value_hint);
+        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement", "A = default distance, size and height, and move the menu in front of you");
+
+        column = 1;
+        add(MenuRow::Kind::Header, -1, -1, ActionNone, "SOUND AND TOOLS", "");
+        add(MenuRow::Kind::Value, GROUP_MENU, MenuClickVolume, ActionNone, "Click volume", "A = edit. Volume of the menu click sounds (0 = off)");
+        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
+        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
+
+        // ==== GAME HUD SETTINGS (lower band) ====
+        band = 1;
         column = 0;
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "HUD SCREEN", "THE GAME'S WHOLE HUD AS ONE PANEL");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLayout, "HUD layout", "A = switch between one game-screen panel and the old per-panel layout");
@@ -502,23 +579,13 @@ private:
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Up / down", value_hint);
         add(MenuRow::Kind::Action, GROUP_SCREEN, -1, ActionResetScreen, "Reset HUD screen", "A = put the HUD screen back to its default size and place");
 
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "MOD MENU", "FIXED WHERE IT OPENS");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Distance", "Left / Right to change. Text keeps the same size at any distance");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuScale, ActionNone, "Text size", value_hint);
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Up / down", value_hint);
-        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement", "A = default distance, size and height, and move the menu in front of you");
-
         add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room, or HUD follows your head");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleLockInvert, "Fixed HUD direction", "A = flip, only if the fixed HUD turns with your head");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
 
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "OTHER", "");
-        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
-        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
-
-        // ---- Right column: per-panel tuning (used by the per-panel layout) ----
+        // Per-panel tuning (used by the per-panel layout).
         column = 1;
         for (int g = 0; g < GroupCount; ++g) {
             static constexpr std::array<const char*, GroupCount> titles{"HACKING CIRCLE", "HEALTH / STAMINA / WEAPONS", "TUTORIAL BOX"};
@@ -531,17 +598,33 @@ private:
             add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", value_hint);
             add(MenuRow::Kind::Value, g, FieldX, ActionNone, g == GroupVitals ? "Toward / away from center" : "Left / right", value_hint);
             add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
-            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap", "Left / Right to change the double-image gap between eyes. A = flip direction");
+            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap", "A = edit the double-image gap between eyes");
             add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = reset this panel group to neutral (blocked while locked)");
         }
 
-        // Start on the first selectable row.
-        for (int i = 0; i < (int)m_rows.size(); ++i) {
-            if (m_rows[i].kind != MenuRow::Kind::Header) {
-                menu_selected = i;
-                break;
-            }
+        // Navigation: each column's selectable rows top to bottom through both bands, with each row's height in its
+        // band (in row units; headers are about 1.3 rows tall, the first one in a column about 0.9) for Left / Right.
+        for (auto& n : m_nav) {
+            n.clear();
         }
+        std::array<std::array<float, 2>, 2> ys{};
+        std::array<std::array<bool, 2>, 2> first{{{true, true}, {true, true}}};
+        m_row_y.assign(m_rows.size(), 0.0f);
+        for (int i = 0; i < (int)m_rows.size(); ++i) {
+            const auto& r = m_rows[i];
+            const int c = std::clamp(r.column, 0, 1);
+            const int bd = std::clamp(r.band, 0, 1);
+            if (r.kind == MenuRow::Kind::Header) {
+                ys[bd][c] += first[bd][c] ? 0.93f : 1.33f;
+                first[bd][c] = false;
+                continue;
+            }
+            m_row_y[i] = ys[bd][c] + 0.5f;
+            ys[bd][c] += 1.0f;
+            m_nav[c].push_back(i);
+        }
+
+        menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
     }
 
     static std::filesystem::path path() {
@@ -561,8 +644,9 @@ private:
         std::string s{};
         s += "# PragmataVR 3D HUD tuning. Saved changes apply within about a second, no restart needed.\n";
         s += "# The VR mod menu (both thumbsticks or F1) rewrites this file whenever a value changes.\n";
-        s += "# Menu: F1 open/close, Up/Down select, Left/Right change (Shift = big steps), Enter = invert box or action,\n";
-        s += "#   Backspace close. Pause = snapshot of both eyes.\n";
+        s += "# Menu: both thumbsticks or F1 open/close. D-pad / arrows navigate, A / Enter edits the highlighted value\n";
+        s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
+        s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <group>.size / .x / .y / .gap: hack, vitals, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
         s += "# vitals.x is a spread: + moves health and weapon wheel outward, - toward the center.\n";
         s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
@@ -584,8 +668,9 @@ private:
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
             s += fmt::format("screen.{}.invert={}\n", SCREEN_KEYS[i], t.screen_invert[i] ? 1 : 0);
         }
-        s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees.\n";
-        for (int i = 0; i < 3; ++i) {
+        s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
+        s += "# menu.click_volume = click sound level (0 = off, 0.50 = half, 1.00 = full).\n";
+        for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
             s += fmt::format("menu.{}={:.2f}\n", MENU_KEYS[i], t.menu[i]);
             s += fmt::format("menu.{}.invert={}\n", MENU_KEYS[i], t.menu_invert[i] ? 1 : 0);
         }
@@ -714,7 +799,7 @@ private:
             }
 
             if (group_key == "menu") {
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
                     if (rest == MENU_KEYS[i]) {
                         if (is_invert) t->menu_invert[i] = val != 0.0f;
                         else t->menu[i] = std::clamp(val, MENU_MIN[i], MENU_MAX[i]);
@@ -767,6 +852,8 @@ private:
             t->groups[1].size, t->groups[1].x, t->groups[1].y, t->groups[1].gap,
             t->groups[2].size, t->groups[2].x, t->groups[2].y, t->groups[2].gap);
 
+        g_click_volume_pct = (int)std::lround(t->menu[MenuClickVolume] * 100.0f);
+
         std::scoped_lock _{m_mtx};
         m_tune = t;
         m_mtime = mtime;
@@ -774,6 +861,7 @@ private:
     }
 
     void commit(const std::shared_ptr<HudTune>& t) {
+        g_click_volume_pct = (int)std::lround(t->menu[MenuClickVolume] * 100.0f);
         write_file(*t);
         std::scoped_lock _{m_mtx};
         m_tune = t;
@@ -784,17 +872,72 @@ private:
         return std::make_shared<HudTune>(*m_tune);
     }
 
-    void move_selection(int dir) {
-        const int n = (int)m_rows.size();
-        int i = menu_selected.load();
+    // Up / Down: next selectable row in the same column, through both bands, wrapping around.
+    void move_vertical(int dir) {
+        const int sel = menu_selected.load();
+        const int c = sel >= 0 && sel < (int)m_rows.size() ? std::clamp(m_rows[sel].column, 0, 1) : 0;
+        const auto& nav = m_nav[c];
+        if (nav.empty()) {
+            return;
+        }
 
-        for (int step = 0; step < n; ++step) {
-            i = (i + dir + n) % n;
-            if (m_rows[i].kind != MenuRow::Kind::Header) {
-                menu_selected = i;
-                return;
+        auto it = std::find(nav.begin(), nav.end(), sel);
+        int pos = it == nav.end() ? 0 : (int)(it - nav.begin());
+        pos = (pos + dir + (int)nav.size()) % (int)nav.size();
+        menu_selected = nav[pos];
+
+        // Stay on the INV box when moving between value rows.
+        if (m_rows[nav[pos]].kind != MenuRow::Kind::Value) {
+            menu_on_invert = false;
+        }
+    }
+
+    // Left / Right while navigating: row -> its INV box -> the other column (nearest row in the same band).
+    // Returns false when there is nothing further that way.
+    bool move_horizontal(int dir) {
+        const int sel = menu_selected.load();
+        if (sel < 0 || sel >= (int)m_rows.size()) {
+            return false;
+        }
+
+        const auto& row = m_rows[sel];
+        const bool is_value = row.kind == MenuRow::Kind::Value;
+        const bool on_inv = menu_on_invert.load() && is_value;
+
+        if (dir > 0 && is_value && !on_inv) {
+            menu_on_invert = true;
+            return true;
+        }
+        if (dir < 0 && on_inv) {
+            menu_on_invert = false;
+            return true;
+        }
+
+        const int target_col = row.column + dir;
+        if (target_col < 0 || target_col > 1) {
+            return false;
+        }
+
+        int best = -1;
+        float best_d = 1e9f;
+        for (const int i : m_nav[target_col]) {
+            if (m_rows[i].band != row.band) {
+                continue;
+            }
+            const float d = std::fabs(m_row_y[i] - m_row_y[sel]);
+            if (d < best_d - 0.01f) {
+                best_d = d;
+                best = i;
             }
         }
+        if (best < 0) {
+            return false;
+        }
+
+        menu_selected = best;
+        // Coming in from the right, land on the INV box (the nearest thing on that side).
+        menu_on_invert = dir < 0 && m_rows[best].kind == MenuRow::Kind::Value;
+        return true;
     }
 
     void block_pad_briefly() {
@@ -838,6 +981,8 @@ private:
 
         if (vk == VK_F1) {
             menu_open = !menu_open.load();
+            menu_editing = false;
+            menu_on_invert = false;
             if (!menu_open.load()) {
                 block_pad_briefly();
             } else {
@@ -853,21 +998,37 @@ private:
             return;
         }
 
+        const bool editing = menu_editing.load();
+
         switch (vk) {
         case VK_BACK:
+            if (editing) {
+                menu_editing = false; // B: stop editing, back to navigation
+                play_click(true);
+                return;
+            }
             menu_open = false;
+            menu_on_invert = false;
             block_pad_briefly();
             spdlog::info("[PragmataVR] Menu closed");
             play_click(true);
             return;
         case VK_UP:
-            move_selection(-1);
-            play_click(true);
-            return;
         case VK_DOWN:
-            move_selection(1);
+            if (editing) {
+                play_click(false); // finish editing with A or B first
+                return;
+            }
+            move_vertical(vk == VK_UP ? -1 : 1);
             play_click(true);
             return;
+        case VK_LEFT:
+        case VK_RIGHT:
+            if (!editing) {
+                play_click(move_horizontal(vk == VK_RIGHT ? 1 : -1));
+                return;
+            }
+            break; // editing: change the value below
         default:
             break;
         }
@@ -880,9 +1041,26 @@ private:
         const auto& row = m_rows[sel];
         auto t = copy_current();
 
+        if (vk == VK_RETURN && editing) {
+            menu_editing = false; // A: done editing
+            play_click(true);
+            return;
+        }
+
+        if (vk == VK_RETURN && row.kind == MenuRow::Kind::Value && !menu_on_invert.load()) {
+            if (row.group == GroupHack && t->hack_locked) {
+                play_click(false);
+                return;
+            }
+            menu_editing = true; // A on a value: edit it with Left / Right
+            play_click(true);
+            return;
+        }
+
         if (vk == VK_RETURN) {
             switch (row.kind) {
             case MenuRow::Kind::Value: {
+                // The highlight is on this row's INV box: flip which way Left / Right moves the value.
                 if (row.group == GROUP_MENU) {
                     auto& minv = t->menu_invert[row.field];
                     minv = !minv;
@@ -941,7 +1119,9 @@ private:
             case MenuRow::Kind::Action:
                 if (row.action == ActionResetMenu) {
                     const auto inverts = t->menu_invert;
+                    const float volume = t->menu[MenuClickVolume];
                     t->menu = HudTune{}.menu;
+                    t->menu[MenuClickVolume] = volume; // placement only
                     t->menu_invert = inverts;
                     commit(t);
                     menu_place_requested = true;
@@ -983,7 +1163,7 @@ private:
             }
         }
 
-        if ((vk != VK_LEFT && vk != VK_RIGHT) || row.kind != MenuRow::Kind::Value) {
+        if ((vk != VK_LEFT && vk != VK_RIGHT) || row.kind != MenuRow::Kind::Value || !editing) {
             return;
         }
 
@@ -1084,6 +1264,8 @@ private:
     std::array<bool, KEYS.size()> m_key_down{};
     std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
     std::vector<MenuRow> m_rows{};
+    std::array<std::vector<int>, 2> m_nav{}; // selectable rows per column, top to bottom
+    std::vector<float> m_row_y{};             // row center height within its band, in row units
     std::mutex m_head_mtx{};
     HeadState m_state{};
     Matrix4x4f m_lock{1.0f};
