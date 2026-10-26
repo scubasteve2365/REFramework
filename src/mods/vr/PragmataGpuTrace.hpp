@@ -52,6 +52,7 @@ inline std::unique_ptr<FunctionHook> g_draw_hook{};
 inline std::unique_ptr<FunctionHook> g_draw_indexed_hook{};
 inline std::unique_ptr<FunctionHook> g_copy_region_hook{};
 inline std::unique_ptr<FunctionHook> g_copy_resource_hook{};
+inline std::unique_ptr<FunctionHook> g_barrier_hook{};
 
 inline std::shared_mutex g_rtv_mtx{};
 inline std::unordered_map<uint64_t, RtvInfo> g_rtvs{};
@@ -154,12 +155,13 @@ inline void report_redirects() {
     const auto a = g_ui_alone_sets.exchange(0);
     const auto u = g_ui_unknown_sets.exchange(0);
     const auto m = g_ui_mrt_sets.exchange(0);
+    const auto ho = g_handoffs_window.exchange(0);
     static int reports = 0;
     if (reports < 60) {
         ++reports;
-        spdlog::info("[PragmataVR] Glued HUD {}: last 10 s, UI-buffer target sets: {} with other targets, {} redirected, {} alone, "
-            "{} with unknown targets; RTVs created since hooks {}", g_redirect.load() ? "removal on" : "removal off", m, r, a, u,
-            g_creates_total.load());
+        spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}), erase {}; UI-buffer target sets: {} with other "
+            "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
+            g_erase.load() ? "on" : "off", m, a, u);
     }
 }
 
@@ -338,6 +340,128 @@ inline void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* self, ID3
     g_copy_resource_hook->get_original<decltype(copy_resource)>()(self, dst, src);
 }
 
+// Build 20: the UI buffer hand-off. The engine draws its UI into the UI buffer on its own, then turns the buffer from a
+// render target into a shader input and blends it onto the eye image (the "glued" HUD). At that state change, while
+// the buffer still holds the whole UI, it is copied to g_capture (the HUD panel's source) and the HUD elements' areas
+// are cleared from it (g_erase), so they reach the HUD panel but not the eye images. Recorded on the engine's own
+// command list, so it runs at exactly that point in the frame.
+inline std::atomic<ID3D12Resource*> g_capture{nullptr};   // HUD panel source, kept in D3D12_RESOURCE_STATE_COMMON
+inline std::atomic<bool> g_intercept{false};               // HUD panel mode on: capture at the hand-off
+inline std::atomic<bool> g_erase{false};                   // Glued HUD REMOVED: clear the element areas after the copy
+inline std::atomic<uint64_t> g_ui_rtv{0};                  // our own RTV of the UI buffer (for the clear)
+inline std::atomic<uint64_t> g_handoffs{0};                // hand-offs seen (all time)
+inline std::atomic<uint64_t> g_handoffs_window{0};         // hand-offs in the current 10 s report window
+inline std::mutex g_rects_mtx{};
+inline std::vector<D3D12_RECT> g_rects{};                  // element areas in UI buffer pixels
+
+inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    auto original = g_barrier_hook->get_original<decltype(barrier)>();
+    auto ui = g_ui_buffer.load();
+
+    if (g_intercept.load() && ui != nullptr && b != nullptr) {
+        bool handoff = false;
+        for (UINT i = 0; i < n; ++i) {
+            const auto& t = b[i];
+            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && t.Transition.pResource == ui &&
+                t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && t.Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                handoff = true;
+            }
+        }
+
+        if (handoff) {
+            g_handoffs++;
+            g_handoffs_window++;
+            auto cap = g_capture.load();
+            if (cap != nullptr) {
+                D3D12_RESOURCE_BARRIER pre[2]{};
+                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[0].Transition.pResource = ui;
+                pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                pre[1].Transition.pResource = cap;
+                pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                original(self, 2, pre);
+
+                g_copy_resource_hook != nullptr ? g_copy_resource_hook->get_original<void(STDMETHODCALLTYPE)(ID3D12GraphicsCommandList*,
+                    ID3D12Resource*, ID3D12Resource*)>()(self, cap, ui) : self->CopyResource(cap, ui);
+
+                D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
+                std::swap(post[0].Transition.StateBefore, post[0].Transition.StateAfter);
+                std::swap(post[1].Transition.StateBefore, post[1].Transition.StateAfter);
+                original(self, 2, post);
+            }
+
+            const auto rtv = g_ui_rtv.load();
+            if (g_erase.load() && rtv != 0) {
+                std::vector<D3D12_RECT> rects{};
+                {
+                    std::scoped_lock _{g_rects_mtx};
+                    rects = g_rects;
+                }
+                if (!rects.empty()) {
+                    const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+                    D3D12_CPU_DESCRIPTOR_HANDLE h{};
+                    h.ptr = (SIZE_T)rtv;
+                    self->ClearRenderTargetView(h, clear, (UINT)rects.size(), rects.data());
+                }
+            }
+        }
+    }
+
+    original(self, n, b);
+}
+
+// Our own RTV of the UI buffer for the clear; recreated when the buffer changes. Called from the present thread.
+inline void update_ui_rtv(ID3D12Resource* ui) {
+    static ID3D12Resource* last = nullptr;
+    static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap{};
+    if (ui == last || g_device == nullptr) {
+        return;
+    }
+    last = ui;
+    g_ui_rtv = 0;
+    if (ui == nullptr) {
+        return;
+    }
+    if (heap == nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1;
+        if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap)))) {
+            return;
+        }
+    }
+    auto h = heap->GetCPUDescriptorHandleForHeapStart();
+    if (g_create_rtv_hook != nullptr) {
+        g_create_rtv_hook->get_original<decltype(create_rtv)>()(g_device, ui, nullptr, h);
+    } else {
+        g_device->CreateRenderTargetView(ui, nullptr, h);
+    }
+    g_ui_rtv = (uint64_t)h.ptr;
+
+    // Element areas in the flat (Screen mode) layout, measured from Build 17-18 snapshots of the UI buffer, as
+    // fractions of its width and height: tutorial box, health, stamina, weapon wheel.
+    const auto d = ui->GetDesc();
+    const float w = (float)d.Width;
+    const float hh = (float)d.Height;
+    static constexpr float areas[4][4] = {
+        {0.00f, 0.27f, 0.30f, 0.46f}, // tutorial box
+        {0.00f, 0.68f, 0.17f, 0.79f}, // health
+        {0.36f, 0.71f, 0.64f, 0.81f}, // stamina
+        {0.74f, 0.60f, 1.00f, 0.86f}, // weapon wheel
+    };
+    std::scoped_lock _{g_rects_mtx};
+    g_rects.clear();
+    for (const auto& a : areas) {
+        g_rects.push_back(D3D12_RECT{(LONG)(a[0] * w), (LONG)(a[1] * hh), (LONG)(a[2] * w), (LONG)(a[3] * hh)});
+    }
+    spdlog::info("[PragmataVR] UI buffer hand-off: own RTV ready for {} x {}, {} element areas", d.Width, d.Height, g_rects.size());
+}
+
 // Hooks the D3D12 functions through the vtables of the game's device and a throwaway command list. All devices and
 // command lists of the runtime share these functions, so the game's own calls go through the hooks.
 inline bool install(ID3D12Device* device) {
@@ -383,6 +507,7 @@ inline bool install(ID3D12Device* device) {
     ok = make(g_draw_indexed_hook, list_vt[13], (uintptr_t)&draw_indexed, "DrawIndexedInstanced") && ok;
     ok = make(g_copy_region_hook, list_vt[16], (uintptr_t)&copy_region, "CopyTextureRegion") && ok;
     ok = make(g_copy_resource_hook, list_vt[17], (uintptr_t)&copy_resource, "CopyResource") && ok;
+    ok = make(g_barrier_hook, list_vt[26], (uintptr_t)&barrier, "ResourceBarrier") && ok;
 
     spdlog::info("[PragmataVR] GPU trace hooks {} (RTV descriptor size {})", ok ? "installed" : "partly failed", g_rtv_increment);
     return ok;

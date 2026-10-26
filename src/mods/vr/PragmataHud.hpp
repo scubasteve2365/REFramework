@@ -132,7 +132,7 @@ struct HudTune {
     int engine_overlay{0};
     // Build 19 test: draws that write the eye image and the UI buffer together get a throwaway image instead of the eye
     // image, so the UI reaches only the UI buffer (and the HUD panel). Off = the engine's normal drawing.
-    bool glued_hud_removed{false};
+    bool glued_hud_removed{true}; // Build 20: the element areas are cleared from the UI buffer after the HUD panel copy
     bool flat_test{false}; // Build 16 test: the 3D HUD drawn with the game's own flat projection, companions left flat
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
@@ -670,7 +670,7 @@ private:
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGluedHud, "Glued HUD",
-            "A = test: SHOWN, or REMOVED (the game's HUD kept out of your eyes, shown only on the HUD panel)");
+            "A = REMOVED (health, stamina, weapons, tutorial only on the HUD panel) or SHOWN (also stuck to your view)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
             "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");

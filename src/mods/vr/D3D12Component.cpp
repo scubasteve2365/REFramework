@@ -471,6 +471,7 @@ void pragmata_capture_ui_buffer(VR* vr) {
     }
 
     if (p.src == nullptr || p.src_w != (int32_t)d0.Width || p.src_h != (int32_t)d0.Height || p.src_format != d0.Format) {
+        pragmata_trace::g_capture = nullptr;
         p.src_cmds.wait(INFINITE);
         p.src.Reset();
         D3D12_RESOURCE_DESC d = d0;
@@ -486,6 +487,23 @@ void pragmata_capture_ui_buffer(VR* vr) {
         p.src_h = (int32_t)d0.Height;
         p.src_format = d0.Format;
         spdlog::info("[PragmataVR] HUD panel: capturing the UI buffer, {} x {}, format {}", p.src_w, p.src_h, (int)p.src_format);
+    }
+
+    // Build 20: the copy is normally taken at the UI buffer hand-off, on the engine's command list (see
+    // pragmata_trace::barrier), before the element areas are cleared. Copying here, after the frame, would miss the
+    // elements once they are cleared, so this only runs when no hand-off has been seen.
+    pragmata_trace::g_capture = p.src.Get();
+    static uint64_t last_handoffs = 0;
+    const auto handoffs = pragmata_trace::g_handoffs.load();
+    if (handoffs != last_handoffs) {
+        last_handoffs = handoffs;
+        p.src_time = std::chrono::steady_clock::now();
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            spdlog::info("[PragmataVR] HUD panel: taking the UI buffer at the engine's hand-off");
+        }
+        return;
     }
 
     p.src_cmds.wait(INFINITE);
@@ -724,7 +742,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         static int trace_frames_left = 0;
         pragmata_trace::install(g_framework->get_d3d12_hook()->get_device());
         pragmata_trace::g_ui_buffer = vr->uiBufferTex[0];
-        pragmata_trace::g_redirect = pragmatavr::HudTuning::get().tune()->glued_hud_removed;
+        {
+            const auto t = pragmatavr::HudTuning::get().tune();
+            pragmata_trace::g_redirect = false; // Build 19's render target redirect is retired (the UI buffer is drawn on its own)
+            pragmata_trace::g_intercept = t->enabled && t->hud_panel;
+            pragmata_trace::g_erase = t->enabled && t->hud_panel && t->glued_hud_removed;
+            pragmata_trace::update_ui_rtv(vr->uiBufferTex[0]);
+        }
         pragmata_trace::report_redirects();
 
         if (hud.trace_requested.exchange(false) && !pragmata_trace::g_active.load()) {
