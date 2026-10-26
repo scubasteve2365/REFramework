@@ -3375,6 +3375,11 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleMasks:
+            v.value = t.masks_off ? "OFF" : "NORMAL";
+            v.value_color = t.masks_off ? AMBER : ACCENT;
+            v.dim = !t.flat_test; // FLAT mode only
+            break;
         case pragmatavr::ActionToggleBlur:
             v.value = t.hide_blur ? "HIDDEN" : "SHOWN";
             v.dim = !t.flat_test; // FLAT mode only
@@ -3563,7 +3568,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 22");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 23");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3650,7 +3655,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 22"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 22");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 23"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 23");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4149,6 +4154,8 @@ struct PragmataChildRestore {
     Vector4f scale{};
     bool restore_position{false};
     bool restore_visible{false}; // Build 22: only make obj visible again (frosted glass hidden for one draw)
+    bool restore_mask{false};    // Build 23: only put obj's MaskMode back
+    uint32_t mask_mode{0};
 };
 
 struct PragmataPanelRestore {
@@ -4404,6 +4411,78 @@ void get(size_t hash, const std::string& name, REComponent* view, sdk::VMContext
     out = e.objs;
 }
 } // namespace pragmata_blur
+
+// PragmataVR Build 23: every piece of a HUD view that has a MaskMode, for the Element masks test, and a one-time log
+// of the mask setup of each view (pieces whose MaskType or MaskMode is not the default), to find what cuts off the
+// shrunk tutorial box and weapon wheel. Objects are held with add_ref, refreshed every 120 frames like pragmata_blur.
+namespace pragmata_mask {
+struct Entry {
+    REComponent* view{nullptr};
+    std::vector<REManagedObject*> objs{};
+    int frame{-100000};
+    bool logged{false};
+};
+
+std::mutex g_mtx{};
+std::unordered_map<size_t, Entry> g_cache{};
+
+void collect(REManagedObject* obj, sdk::VMContext* ctx, std::vector<REManagedObject*>& out, const Vector2f& offset,
+    const Vector2f& scale, int depth, int& nodes, std::string* dump) {
+    if (depth > 14) {
+        return;
+    }
+    auto c = sdk::call_object_func<REManagedObject*>(obj, "get_Child", ctx, obj);
+    for (int n = 0; c != nullptr && n < 256 && nodes < 1024; ++n) {
+        ++nodes;
+        auto td = utility::re_managed_object::get_type_definition(c);
+        const auto p4 = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+        const auto s4 = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+        const Vector2f p = offset + scale * Vector2f{p4.x, p4.y};
+        const Vector2f sc = scale * Vector2f{s4.x, s4.y};
+        if (td != nullptr && td->get_method("set_MaskMode") != nullptr) {
+            out.push_back(c);
+            if (dump != nullptr && dump->size() < 8000) {
+                const auto mtype = td->get_method("get_MaskType") != nullptr ? sdk::call_object_func<uint32_t>(c, "get_MaskType", ctx, c) : 99u;
+                const auto mmode = td->get_method("get_MaskMode") != nullptr ? sdk::call_object_func<uint32_t>(c, "get_MaskMode", ctx, c) : 99u;
+                if (mtype != 0 || mmode != 0) {
+                    const bool vis = td->get_method("get_Visible") != nullptr ? sdk::call_object_func<bool>(c, "get_Visible", ctx, c) : true;
+                    *dump += fmt::format("\n    depth {} {} vis={} MaskType={} MaskMode={} pos=({:.0f},{:.0f}) local=({:.0f},{:.0f}) scale=({:.2f},{:.2f})",
+                        depth, td->get_full_name(), vis ? 1 : 0, mtype, mmode, p.x, p.y, p4.x, p4.y, s4.x, s4.y);
+                }
+            }
+        }
+        collect(c, ctx, out, p, sc, depth + 1, nodes, dump);
+        c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+    }
+}
+
+void get(size_t hash, const std::string& name, REComponent* view, sdk::VMContext* ctx, int frame, std::vector<REManagedObject*>& out) {
+    std::scoped_lock _{g_mtx};
+    auto& e = g_cache[hash];
+    if (e.view != view || frame - e.frame >= 120 || frame - e.frame < 0) {
+        for (auto o : e.objs) {
+            ((sdk::ManagedObject*)o)->release();
+        }
+        e.objs.clear();
+        int nodes = 0;
+        std::string dump{};
+        const bool want_log = !e.logged;
+        collect((REManagedObject*)view, ctx, e.objs, Vector2f{0.0f, 0.0f}, Vector2f{1.0f, 1.0f}, 0, nodes, want_log ? &dump : nullptr);
+        for (auto o : e.objs) {
+            ((sdk::ManagedObject*)o)->add_ref();
+        }
+        e.view = view;
+        e.frame = frame;
+        if (want_log) {
+            e.logged = true;
+            spdlog::info("[PragmataVR] Masks in {}: {} pieces of {} have a MaskMode. Pieces with a mask setting (MaskType 0 Target, "
+                "1 NonTarget, 2 Mask, 3 MaskTop, 4 MaskTopMost; MaskMode 0 Keep, 1 Default, 2 Reverse, 3 Disable, 4 ApplyToParent):{}",
+                name, e.objs.size(), nodes, dump.empty() ? std::string{" none"} : dump);
+        }
+    }
+    out = e.objs;
+}
+} // namespace pragmata_mask
 #endif
 
 bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) {
@@ -4489,8 +4568,15 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     const float dy = gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
                     const float k = gt.size;
                     const bool hide_blur = ftune->hide_blur;
+                    const bool masks_off = ftune->masks_off;
 
-                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f || hide_blur)) {
+                    // Build 23: always walk once per view so the mask log is written even with masks NORMAL.
+                    std::vector<REManagedObject*> mask_objs{};
+                    if (fview != nullptr) {
+                        pragmata_mask::get(name_hash, name, fview, context, m_frame_count, mask_objs);
+                    }
+
+                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f || hide_blur || masks_off)) {
                         // Build 22: fixed center per element (see pragmatavr::FLAT_PIVOTS), shared by both halves.
                         const float kk = k;
                         const Vector2f pv{ pragmatavr::FLAT_PIVOTS[fgroup][0], pragmatavr::FLAT_PIVOTS[fgroup][1] };
@@ -4498,6 +4584,20 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         PragmataPanelRestore restore{};
                         restore.view = fview;
                         restore.position = sdk::call_object_func_easy<Vector4f>(fview, "get_Position");
+
+                        if (masks_off) {
+                            for (auto m : mask_objs) {
+                                const auto mode = sdk::call_object_func<uint32_t>(m, "get_MaskMode", context, m);
+                                if (mode != 3u) { // 3 = Disable
+                                    sdk::call_object_func<void*>(m, "set_MaskMode", context, m, 3u);
+                                    PragmataChildRestore mr{};
+                                    mr.obj = m;
+                                    mr.restore_mask = true;
+                                    mr.mask_mode = mode;
+                                    restore.children.push_back(mr);
+                                }
+                            }
+                        }
 
                         if (hide_blur) {
                             std::vector<REManagedObject*> blur{};
@@ -5287,6 +5387,10 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
             for (auto& cr : r.children) {
                 if (cr.restore_visible) {
                     sdk::call_object_func<void*>(cr.obj, "set_Visible", pcontext, cr.obj, true);
+                    continue;
+                }
+                if (cr.restore_mask) {
+                    sdk::call_object_func<void*>(cr.obj, "set_MaskMode", pcontext, cr.obj, cr.mask_mode);
                     continue;
                 }
                 sdk::call_object_func<void*>(cr.obj, "set_Scale", pcontext, cr.obj, &cr.scale);

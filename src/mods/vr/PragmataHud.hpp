@@ -150,6 +150,9 @@ struct HudTune {
     // Build 22: FLAT mode hides the frosted glass (via.gui.BlurFilter) behind the HUD elements. The blur keeps the
     // element's original size and place when the element is resized and moved, which showed as a stray panel.
     bool hide_blur{true};
+    // Build 23 test: FLAT mode sets MaskMode Disable on every piece of the five HUD elements for each draw, to see
+    // whether GUI masks that do not follow the resize are what cuts off the tutorial box and weapon wheel.
+    bool masks_off{false};
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
     // Build 17: HUD panel. 1 = health, stamina, weapon wheel and tutorial are drawn flat (Screen mode, as on a monitor)
     // into the engine's UI buffer, which is copied each frame onto a room-fixed OpenXR quad (screen.* place and size it).
@@ -389,6 +392,7 @@ enum MenuAction : int {
     ActionToggleLockInvert,
     ActionToggleGhost,
     ActionToggleBlur,
+    ActionToggleMasks,
     ActionToggleHackLock,
     ActionResetGroup,
     ActionSnapshot,
@@ -753,6 +757,8 @@ private:
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
             "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleMasks, "Element masks",
+            "A = test, FLAT mode: NORMAL or OFF (mask clipping off for the HUD elements). Does the cutoff go away?");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBlur, "Frosted glass",
             "A = FLAT mode: hide or show the blurred glass behind HUD elements (it does not follow size and position)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
@@ -828,6 +834,8 @@ private:
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
         s += "# hide_blur = 1: FLAT mode hides the frosted glass behind HUD elements.\n";
         s += fmt::format("hide_blur={}\n", t.hide_blur ? 1 : 0);
+        s += "# masks_off = 1: test, FLAT mode turns off GUI mask clipping for the HUD elements.\n";
+        s += fmt::format("masks_off={}\n", t.masks_off ? 1 : 0);
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
@@ -992,6 +1000,7 @@ private:
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 else if (key == "hide_blur") t->hide_blur = val != 0.0f;
+                else if (key == "masks_off") t->masks_off = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
                 else if (key == "companion_mode") t->companion_mode = std::clamp((int)val, 0, 2);
                 else if (key == "hud_mode") t->hud_mode = std::clamp((int)val, 0, 2);
@@ -1362,6 +1371,11 @@ private:
                     t->lock_invert = !t->lock_invert;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: fixed HUD direction {}", t->lock_invert ? "flipped" : "normal");
+                    play_click(true);
+                } else if (row.action == ActionToggleMasks) {
+                    t->masks_off = !t->masks_off;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: element masks {}", t->masks_off ? "OFF" : "normal");
                     play_click(true);
                 } else if (row.action == ActionToggleBlur) {
                     t->hide_blur = !t->hide_blur;
