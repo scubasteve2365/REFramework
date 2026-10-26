@@ -3345,15 +3345,16 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         if (row.group == pragmatavr::GROUP_SCREEN) {
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
-            v.dim = !t.hud_panel && !t.hud_fixed; // the HUD panel rows apply to the panel and the room-fixed 3D HUD
+            v.dim = t.flat_test || (!t.hud_panel && !t.hud_fixed); // the HUD panel rows apply to the panel and the room-fixed 3D HUD
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
         } else if (row.group >= 0 && row.group < pragmatavr::GroupCount) {
-            const auto& gt = t.groups[row.group];
+            const auto& gt = pragmatavr::active_group(t, row.group);
             v.value = pragmatavr::HudTuning::format_value(gt, row.group, row.field);
-            v.invert_on = gt.invert[row.field];
-            v.dim = per_panel_off || (row.group == pragmatavr::GroupHack && t.hack_locked);
+            v.invert_on = t.groups[row.group].invert[row.field];
+            // PANEL mode draws health, stamina, weapons and tutorial untuned (the panel shows the game's own layout).
+            v.dim = per_panel_off || pragmatavr::group_locked(t, row.group) || (t.hud_panel && row.group != pragmatavr::GroupHack);
         }
         break;
     case Kind::Toggle:
@@ -3364,6 +3365,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             break;
         case pragmatavr::ActionToggleHudFixed:
             v.value = t.hud_fixed ? "FIXED IN ROOM" : "FOLLOWS HEAD";
+            v.dim = t.flat_test; // FLAT mode always follows the head
             break;
         case pragmatavr::ActionToggleLockInvert:
             v.value = t.lock_invert ? "FLIPPED" : "NORMAL";
@@ -3375,33 +3377,32 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGluedHud:
             v.value = t.glued_hud_removed ? "REMOVED" : "SHOWN";
             v.value_color = t.glued_hud_removed ? AMBER : ACCENT;
+            v.dim = !t.hud_panel; // PANEL mode only
             break;
         case pragmatavr::ActionToggleHudPanel:
-            v.value = t.hud_panel ? "PANEL" : "3D";
-            v.value_color = t.hud_panel ? ACCENT : AMBER;
+            v.value = pragmatavr::hud_mode_name(t.hud_mode);
+            v.value_color = t.hud_mode == pragmatavr::HudModeFlat ? ACCENT : AMBER;
             break;
         case pragmatavr::ActionToggleEngineOverlay:
             v.value = t.engine_overlay == 0 ? "DEFAULT" : (t.engine_overlay == 1 ? "OFF" : "ON");
             v.value_color = t.engine_overlay == 0 ? ACCENT : AMBER;
             break;
-        case pragmatavr::ActionToggleFlatTest:
-            v.value = t.flat_test ? "ON" : "OFF";
-            v.value_color = t.flat_test ? AMBER : ACCENT;
-            break;
         case pragmatavr::ActionToggleCompanion:
             v.value = t.companion_mode == pragmatavr::CompanionWithElement ? "WITH ELEMENT" :
                       (t.companion_mode == pragmatavr::CompanionReframework ? "REFRAMEWORK" : "HIDDEN");
             v.value_color = t.companion_mode == pragmatavr::CompanionWithElement ? ACCENT : AMBER;
+            v.dim = t.hud_mode != pragmatavr::HudMode3D; // FLAT and PANEL place the companions themselves
             break;
         case pragmatavr::ActionToggleScaleCenter:
             v.value = t.scale_about_center ? "ELEMENT CENTER" : "PANEL ORIGIN";
             v.value_color = t.scale_about_center ? ACCENT : AMBER;
+            v.dim = t.hud_mode != pragmatavr::HudMode3D; // FLAT always grows from the element center
             break;
         case pragmatavr::ActionToggleHackLock:
         default:
             v.value = t.hack_locked ? "LOCKED" : "UNLOCKED";
             v.value_color = t.hack_locked ? AMBER : ACCENT;
-            v.dim = per_panel_off;
+            v.dim = per_panel_off || t.flat_test; // the lock covers the 3D values only
             break;
         }
         break;
@@ -3410,7 +3411,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         if (row.action == pragmatavr::ActionResetScreen) {
             v.dim = t.layout_mode != 1;
         } else if (row.action == pragmatavr::ActionResetGroup) {
-            v.dim = per_panel_off || (row.group == pragmatavr::GroupHack && t.hack_locked);
+            v.dim = per_panel_off || pragmatavr::group_locked(t, row.group);
         }
         break;
     }
@@ -3557,7 +3558,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 20");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 21");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3644,7 +3645,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 20"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 20");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 21"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 21");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4403,6 +4404,99 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             }
         }
 
+        // PragmataVR Build 21: FLAT HUD mode. The GUI camera keeps the game's own flat projection (see the projection
+        // hook), so every HUD element is drawn exactly as on a monitor, in both eyes. Here each element (its 3D panel and
+        // its Screen-mode companion, which stays flat) is grown around the element's center and moved, in canvas pixels:
+        // child position -> center + size * (position - center) + (x + eye shift, -y), child scale -> size * scale.
+        // The 3D panel's center is shared with its companion so both halves stay together. Restored after the draw.
+        {
+            const auto ftune = pragmatavr::HudTuning::get().tune();
+
+            if (ftune->enabled && ftune->flat_test) {
+                std::string_view fpartner{};
+                int fgroup = pragmatavr::group_for(name);
+                const bool fnative = fgroup >= 0;
+                if (!fnative) {
+                    fgroup = pragmatavr::companion_group(name, fpartner);
+                }
+
+                if (fgroup >= 0) {
+                    auto fview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
+                    const auto& gt = ftune->flat_groups[fgroup];
+                    const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
+                    const float dx = gt.x + eye_shift;
+                    const float dy = -gt.y; // canvas y points down; Up / down positive moves the element up
+                    const float k = gt.size;
+                    const auto now = std::chrono::steady_clock::now();
+
+                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f)) {
+                        std::optional<Vector2f> pivot{};
+
+                        if (k != 1.0f) {
+                            if (fnative) {
+                                pivot = pragmata_pivot::get(name_hash, name, fview, context, m_frame_count);
+                                std::scoped_lock _{pragmata_companion::g_mtx};
+                                auto& pt = pragmata_companion::g_partners[name];
+                                pt.pivot = pivot;
+                                pt.seen = now;
+                            } else {
+                                {
+                                    std::scoped_lock _{pragmata_companion::g_mtx};
+                                    auto it = pragmata_companion::g_partners.find(std::string{fpartner});
+                                    if (it != pragmata_companion::g_partners.end() && it->second.pivot &&
+                                        now - it->second.seen < std::chrono::milliseconds(500)) {
+                                        pivot = it->second.pivot;
+                                    }
+                                }
+                                if (!pivot) {
+                                    pivot = pragmata_pivot::get(name_hash, name, fview, context, m_frame_count);
+                                }
+                            }
+                        }
+
+                        const float kk = pivot ? k : 1.0f; // no center found: move only
+                        const Vector2f pv = pivot ? *pivot : Vector2f{0.0f, 0.0f};
+
+                        PragmataPanelRestore restore{};
+                        restore.view = fview;
+                        restore.position = sdk::call_object_func_easy<Vector4f>(fview, "get_Position");
+
+                        auto c = sdk::call_object_func<REManagedObject*>(fview, "get_Child", context, fview);
+                        for (int n = 0; c != nullptr && n < 64; ++n) {
+                            PragmataChildRestore cr{};
+                            cr.obj = c;
+                            cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+                            cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+                            cr.restore_position = true;
+                            Vector3f p{ pv.x + kk * (cr.position.x - pv.x) + dx, pv.y + kk * (cr.position.y - pv.y) + dy, cr.position.z };
+                            Vector4f sc{ cr.scale.x * kk, cr.scale.y * kk, cr.scale.z, 1.0f };
+                            sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
+                            sdk::call_object_func<void*>(c, "set_Scale", context, c, &sc);
+                            restore.children.push_back(cr);
+                            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
+                        }
+
+                        g_pragmata_panel_restore.push_back(std::move(restore));
+                    }
+
+                    static thread_local std::unordered_map<size_t, int> logged_flat{};
+                    const int fgen = pragmatavr::HudTuning::get().companion_generation.load();
+                    auto lit = logged_flat.find(name_hash);
+                    if (lit == logged_flat.end() || lit->second != fgen) {
+                        logged_flat[name_hash] = fgen;
+                        const auto vt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 99u;
+                        spdlog::info("[PragmataVR] FLAT HUD: {} as {} ({}), view type {}, size {:.2f} x {:.0f} y {:.0f} gap {:.0f}",
+                            name, pragmatavr::GROUP_KEYS[fgroup], fnative ? "3D panel" : "companion", vt, k, gt.x, gt.y, gt.gap);
+                    }
+
+                    if (!fnative) {
+                        return true; // the companion stays flat (Screen mode): skip REFramework's floating sheet
+                    }
+                    // 3D panels go on as before (World mode, drawn with the flat projection; the 3D tuning is skipped)
+                }
+            }
+        }
+
         // PragmataVR Build 15: Screen-mode companion layers of the HUD elements (see pragmatavr::companion_group).
         {
             std::string_view partner_name{};
@@ -4410,9 +4504,6 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             const auto tune = pragmatavr::HudTuning::get().tune();
 
             if (cgroup >= 0 && tune->enabled) {
-                if (tune->flat_test) {
-                    return true; // Build 16 test: leave the companion flat (Screen mode), skip REFramework's sheet
-                }
                 if (tune->companion_mode == pragmatavr::CompanionHidden) {
                     return false; // test: do not draw the companion at all
                 }

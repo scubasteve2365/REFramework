@@ -91,7 +91,8 @@ inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCL
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
-inline constexpr int INI_VERSION = 12;
+inline constexpr int INI_VERSION = 13;
+// hud_mode (Build 21) replaces the flat_test and hud_panel lines; those are ignored from any file.
 // hud_fixed and hack_locked lines are ignored in files older than this (Build 11 wrote hud_fixed=0 as its default).
 inline constexpr int INI_VERSION_FIXED_HUD = 12;
 // hack.* lines are ignored in files older than this (Build 10 and before had them reset by Build 8).
@@ -103,6 +104,14 @@ inline constexpr float HACK_LOCKED_X = -275.0f;
 inline constexpr float HACK_LOCKED_Y = -75.0f;
 inline constexpr float HACK_LOCKED_GAP = 12.0f;
 inline constexpr std::array<const char*, FieldCount> FIELD_KEYS{"size", "x", "y", "gap"};
+
+// Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
+// in both eyes (follows the head), with per-element size, position and eye gap. PANEL = the Build 17-20 room-fixed panel.
+enum HudMode : int {
+    HudMode3D = 0,
+    HudModeFlat = 1,
+    HudModePanel = 2,
+};
 
 struct GroupTune {
     float size{1.0f}; // multiplies the panel's own scale
@@ -127,13 +136,15 @@ struct HudTune {
     // Build 17: HUD panel. 1 = health, stamina, weapon wheel and tutorial are drawn flat (Screen mode, as on a monitor)
     // into the engine's UI buffer, which is copied each frame onto a room-fixed OpenXR quad (screen.* place and size it).
     // 0 = the Builds 11-15 3D placement.
-    int hud_panel{1};
+    int hud_panel{0};
     // Build 17 test: the engine's overlay layer draw. 0 = REFramework's default, 1 = always skipped, 2 = always drawn.
     int engine_overlay{0};
     // Build 19 test: draws that write the eye image and the UI buffer together get a throwaway image instead of the eye
     // image, so the UI reaches only the UI buffer (and the HUD panel). Off = the engine's normal drawing.
     bool glued_hud_removed{true}; // Build 20: the element areas are cleared from the UI buffer after the HUD panel copy
-    bool flat_test{false}; // Build 16 test: the 3D HUD drawn with the game's own flat projection, companions left flat
+    // Build 21: HUD mode (HudMode). flat_test and hud_panel are derived from it (apply_hud_mode), never stored.
+    int hud_mode{HudModeFlat};
+    bool flat_test{true}; // FLAT mode: the game's own flat projection, companions left flat, flat_groups tuning
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
     // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
@@ -149,6 +160,15 @@ struct HudTune {
     std::array<float, 4> menu{2.5f, 1.0f, -5.0f, 0.5f};
     std::array<bool, 4> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
+    // Build 21: FLAT mode values, kept apart from the 3D values (the hacking circle lock applies to 3D only).
+    // x / y / gap in canvas pixels (1920 x 1080); y positive = up.
+    std::array<GroupTune, GroupCount> flat_groups{};
+
+    void apply_hud_mode() {
+        hud_mode = std::clamp(hud_mode, 0, 2);
+        flat_test = hud_mode == HudModeFlat;
+        hud_panel = hud_mode == HudModePanel ? 1 : 0;
+    }
 
     HudTune() {
         // The hacking circle starts locked at Steve's tuned values. Every other element starts neutral.
@@ -158,11 +178,47 @@ struct HudTune {
         h.y = HACK_LOCKED_Y;
         h.gap = HACK_LOCKED_GAP;
         hack_locked = true;
+
+        // FLAT mode starting layout: every element smaller and pulled in toward the middle of the view, so all of it
+        // starts inside the headset's field of view (the game's own layout puts them at the screen edges).
+        const auto set_flat = [&](int g, float size, float x, float y) {
+            flat_groups[g].size = size;
+            flat_groups[g].x = x;
+            flat_groups[g].y = y;
+            flat_groups[g].gap = 0.0f;
+        };
+        set_flat(GroupHack, 0.75f, -200.0f, 0.0f);
+        set_flat(GroupHealth, 0.60f, 320.0f, 100.0f);
+        set_flat(GroupStamina, 0.60f, 0.0f, 140.0f);
+        set_flat(GroupWeapons, 0.60f, -280.0f, 100.0f);
+        set_flat(GroupTutorial, 0.60f, 270.0f, -60.0f);
+        apply_hud_mode();
     }
 };
 
 inline GroupTune default_group(int g) {
     return HudTune{}.groups[g];
+}
+
+inline GroupTune default_flat_group(int g) {
+    return HudTune{}.flat_groups[g];
+}
+
+// The values the menu shows and edits for an element in the current HUD mode.
+inline GroupTune& active_group(HudTune& t, int g) {
+    return t.flat_test ? t.flat_groups[g] : t.groups[g];
+}
+inline const GroupTune& active_group(const HudTune& t, int g) {
+    return t.flat_test ? t.flat_groups[g] : t.groups[g];
+}
+
+// The hacking circle lock protects its 3D values only.
+inline bool group_locked(const HudTune& t, int g) {
+    return g == GroupHack && t.hack_locked && !t.flat_test;
+}
+
+inline const char* hud_mode_name(int m) {
+    return m == HudModeFlat ? "FLAT" : (m == HudModePanel ? "PANEL" : "3D");
 }
 
 // Which element a GUI GameObject belongs to. ui2160Gui is no longer tuned: the fix pack lists it with the hacking
@@ -645,15 +701,16 @@ private:
             add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_TITLES[g], g == GroupHack ? "YOUR TUNED VALUES" : "");
 
             if (g == GroupHack) {
-                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock the hacking circle values");
+                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock the hacking circle's 3D values (FLAT values are never locked)");
             }
 
             add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
             add(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
             add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
-            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap", "A = edit the double-image gap between eyes");
+            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap",
+                "A = edit the gap between eyes. In FLAT mode, higher = the element sits closer to you");
             add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults",
-                g == GroupHack ? "A = back to your tuned values (blocked while locked)" : "A = reset this element to the game's own size and place");
+                g == GroupHack ? "A = back to the starting values for this HUD mode (3D: blocked while locked)" : "A = back to the starting values for this HUD mode");
         };
 
         column = 0;
@@ -663,7 +720,7 @@ private:
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
             "A = WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
-            "A = PANEL (health, stamina, weapons, tutorial on a room-fixed panel) or 3D (the older placement)");
+            "A = FLAT (game HUD as on a monitor, follows your head), PANEL (room-fixed panel test) or 3D (older placement)");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Width of the HUD panel (degrees)");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
             "A = edit. How far away the HUD panel sits (meters). Its size in view stays the same");
@@ -730,6 +787,7 @@ private:
         s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
+        s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the same for FLAT mode (canvas pixels, flat_y positive = up).\n";
         s += "# scale_about_center = 1: size grows each element around its own center (hack always uses the panel origin).\n";
         s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
         s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
@@ -747,8 +805,9 @@ private:
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
-        s += "# hud_panel = 1: health / stamina / weapons / tutorial shown on a room-fixed panel (screen.* = size, distance, place).\n";
-        s += fmt::format("hud_panel={}\n", t.hud_panel);
+        s += "# hud_mode: 0 = 3D, 1 = FLAT (game HUD as on a monitor, follows the head; <element>.flat_* values),\n";
+        s += "#   2 = PANEL (health / stamina / weapons / tutorial on a room-fixed panel; screen.* = size, distance, place).\n";
+        s += fmt::format("hud_mode={}\n", t.hud_mode);
         s += "# engine_overlay: test of the engine's overlay layer draw (0 = default, 1 = skipped, 2 = drawn).\n";
         s += fmt::format("engine_overlay={}\n", t.engine_overlay);
         s += "# glued_hud_removed = 1: test, the UI is kept out of the eye images (only the HUD panel shows it).\n";
@@ -757,8 +816,6 @@ private:
             if (i == ScreenDistance) continue; // written below
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
         }
-        s += "# flat_test = 1: test only, the HUD is drawn flat as on a monitor (for the HUD capture test).\n";
-        s += fmt::format("flat_test={}\n", t.flat_test ? 1 : 0);
         s += "# screen.distance = HUD distance in meters (the room-fixed HUD is shown as a panel this far in front of you).\n";
         s += fmt::format("screen.distance={:.2f}\n", t.screen[ScreenDistance]);
         s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
@@ -774,6 +831,11 @@ private:
             s += fmt::format("{}.x={:.2f}\n", GROUP_KEYS[g], gt.x);
             s += fmt::format("{}.y={:.2f}\n", GROUP_KEYS[g], gt.y);
             s += fmt::format("{}.gap={:.2f}\n", GROUP_KEYS[g], gt.gap);
+            const auto& ft = t.flat_groups[g];
+            s += fmt::format("{}.flat_size={:.4f}\n", GROUP_KEYS[g], ft.size);
+            s += fmt::format("{}.flat_x={:.2f}\n", GROUP_KEYS[g], ft.x);
+            s += fmt::format("{}.flat_y={:.2f}\n", GROUP_KEYS[g], ft.y);
+            s += fmt::format("{}.flat_gap={:.2f}\n", GROUP_KEYS[g], ft.gap);
 
             for (int f = 0; f < FieldCount; ++f) {
                 s += fmt::format("{}.{}.invert={}\n", GROUP_KEYS[g], FIELD_KEYS[f], gt.invert[f] ? 1 : 0);
@@ -904,8 +966,8 @@ private:
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
                 else if (key == "companion_mode") t->companion_mode = std::clamp((int)val, 0, 2);
-                else if (key == "flat_test") t->flat_test = val != 0.0f;
-                else if (key == "hud_panel") t->hud_panel = val != 0.0f ? 1 : 0;
+                else if (key == "hud_mode") t->hud_mode = std::clamp((int)val, 0, 2);
+                // flat_test and hud_panel lines (Builds 16-20) are ignored: flat_test stayed on unseen after its row went.
                 else if (key == "engine_overlay") t->engine_overlay = std::clamp((int)val, 0, 2);
                 else if (key == "glued_hud_removed") t->glued_hud_removed = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
@@ -948,7 +1010,14 @@ private:
                     continue;
                 }
 
-                auto& gt = t->groups[g];
+                const bool flat_key = rest.size() > 5 && rest.substr(0, 5) == "flat_";
+                if (flat_key) {
+                    rest = rest.substr(5);
+                    if (is_invert) {
+                        continue; // invert flags are shared by both modes
+                    }
+                }
+                auto& gt = flat_key ? t->flat_groups[g] : t->groups[g];
 
                 for (int fi = 0; fi < FieldCount; ++fi) {
                     if (rest != FIELD_KEYS[fi]) {
@@ -971,14 +1040,17 @@ private:
             }
         }
 
+        t->apply_hud_mode();
         {
             std::string desc{};
             for (int g = 0; g < GroupCount; ++g) {
-                const auto& gt = t->groups[g];
+                const auto& gt = active_group(*t, g);
                 desc += fmt::format(" {}(size={:.3f} x={:.0f} y={:.0f} gap={:.0f})", GROUP_KEYS[g], gt.size, gt.x, gt.y, gt.gap);
             }
-            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: hack_locked={} hud_fixed={} scale_about_center={}{}",
-                file_version, t->hack_locked, t->hud_fixed, t->scale_about_center, desc);
+            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} hack_locked={} hud_fixed={} companion_mode={} "
+                "engine_overlay={} glued_hud_removed={} hide_ghost={} | {} values:{}",
+                file_version, hud_mode_name(t->hud_mode), t->hack_locked, t->hud_fixed, t->companion_mode, t->engine_overlay,
+                t->glued_hud_removed, t->hide_ghost, hud_mode_name(t->hud_mode), desc);
         }
 
         g_click_volume_pct = (int)std::lround(t->menu[MenuClickVolume] * 100.0f);
@@ -1206,7 +1278,7 @@ private:
         }
 
         if (vk == VK_RETURN && row.kind == MenuRow::Kind::Value && !menu_on_invert.load()) {
-            if (row.group == GroupHack && t->hack_locked) {
+            if (row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) {
                 play_click(false);
                 return;
             }
@@ -1234,10 +1306,11 @@ private:
                     play_click(true);
                     return;
                 }
-                if (row.group == GroupHack && t->hack_locked) {
+                if (group_locked(*t, row.group)) {
                     play_click(false);
                     return;
                 }
+                // Invert flags are shared by both modes; the 3D set holds them.
                 auto& inv = t->groups[row.group].invert[row.field];
                 inv = !inv;
                 commit(t);
@@ -1268,9 +1341,12 @@ private:
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
                     play_click(true);
                 } else if (row.action == ActionToggleHudPanel) {
-                    t->hud_panel = t->hud_panel ? 0 : 1;
+                    // 3D -> FLAT -> PANEL -> 3D
+                    t->hud_mode = (t->hud_mode + 1) % 3;
+                    t->apply_hud_mode();
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: HUD mode {}", t->hud_panel ? "panel" : "3D");
+                    companion_generation++;
+                    spdlog::info("[PragmataVR] Menu: HUD mode {}", hud_mode_name(t->hud_mode));
                     play_click(true);
                 } else if (row.action == ActionToggleGluedHud) {
                     t->glued_hud_removed = !t->glued_hud_removed;
@@ -1281,11 +1357,6 @@ private:
                     t->engine_overlay = (t->engine_overlay + 1) % 3;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: engine UI blend {}", t->engine_overlay == 0 ? "default" : (t->engine_overlay == 1 ? "off" : "on"));
-                    play_click(true);
-                } else if (row.action == ActionToggleFlatTest) {
-                    t->flat_test = !t->flat_test;
-                    commit(t);
-                    spdlog::info("[PragmataVR] Menu: flat HUD test {}", t->flat_test ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleCompanion) {
                     t->companion_mode = (t->companion_mode + 1) % 3;
@@ -1324,15 +1395,19 @@ private:
                     spdlog::info("[PragmataVR] Menu: reset HUD screen");
                     play_click(true);
                 } else if (row.action == ActionResetGroup) {
-                    if (row.group == GroupHack && t->hack_locked) {
+                    if (group_locked(*t, row.group)) {
                         play_click(false);
                         return;
                     }
-                    const auto inverts = t->groups[row.group].invert;
-                    t->groups[row.group] = default_group(row.group);
-                    t->groups[row.group].invert = inverts;
+                    if (t->flat_test) {
+                        t->flat_groups[row.group] = default_flat_group(row.group);
+                    } else {
+                        const auto inverts = t->groups[row.group].invert;
+                        t->groups[row.group] = default_group(row.group);
+                        t->groups[row.group].invert = inverts;
+                    }
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: reset {}", GROUP_KEYS[row.group]);
+                    spdlog::info("[PragmataVR] Menu: reset {} ({} values)", GROUP_KEYS[row.group], hud_mode_name(t->hud_mode));
                     play_click(true);
                 } else if (row.action == ActionRecenter) {
                     recenter_requested = true;
@@ -1401,14 +1476,14 @@ private:
             return;
         }
 
-        if (row.group == GroupHack && t->hack_locked) {
+        if (group_locked(*t, row.group)) {
             play_click(false);
             return;
         }
 
-        auto& gt = t->groups[row.group];
+        auto& gt = active_group(*t, row.group);
         int dir = vk == VK_RIGHT ? 1 : -1;
-        if (gt.invert[row.field]) {
+        if (t->groups[row.group].invert[row.field]) {
             dir = -dir;
         }
 
@@ -1437,8 +1512,8 @@ private:
             commit(t);
         }
 
-        spdlog::info("[PragmataVR] Menu: {} {} -> size={:.3f} x={:.1f} y={:.1f} gap={:.1f}{}",
-            GROUP_KEYS[row.group], FIELD_KEYS[row.field], gt.size, gt.x, gt.y, gt.gap, ok ? "" : " (limit)");
+        spdlog::info("[PragmataVR] Menu: {} {} ({}) -> size={:.3f} x={:.1f} y={:.1f} gap={:.1f}{}",
+            GROUP_KEYS[row.group], FIELD_KEYS[row.field], hud_mode_name(t->hud_mode), gt.size, gt.x, gt.y, gt.gap, ok ? "" : " (limit)");
         play_click(ok);
     }
 
