@@ -482,36 +482,72 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto frame_count = vr->m_render_frame_count;
 
 #if defined(PRAGMATA)
-    // PragmataVR snapshot (Pause key): save this frame's eye image, then the other eye's next frame.
+    // PragmataVR snapshot (Build 15): copy this eye's image and the other eye's next one (about 11 ms apart, so the two
+    // match even while the head moves), then save both. Builds 3-14 saved each eye as it was captured, 0.7 s apart.
     {
         auto& hud = pragmatavr::HudTuning::get();
+        static std::array<ComPtr<ID3D12Resource>, 2> snap_tex{};
+        static d3d12::CommandContext snap_cmds{};
+        static bool snap_cmds_ready = false;
 
         if (hud.snapshot_frames_left.load() > 0) {
             const bool left = (frame_count % 2) == vr->m_left_eye_interval;
             auto& done = left ? hud.snapshot_left_done : hud.snapshot_right_done;
+            const int ei = left ? 0 : 1;
 
             if (!done.load()) {
                 done = true;
-                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                auto device = g_framework->get_d3d12_hook()->get_device();
+                const auto bb_desc = backbuffer->GetDesc();
 
-                const auto dir = pragmatavr::HudTuning::data_dir() / "snapshots";
-                const auto png = dir / (hud.snapshot_stem + (left ? "_left.png" : "_right.png"));
+                if (!snap_cmds_ready) {
+                    snap_cmds_ready = snap_cmds.setup(L"PragmataVR snapshot");
+                }
 
-                auto hr = DirectX::SaveWICTextureToFile(command_queue, backbuffer.Get(), GUID_ContainerFormatPng, png.wstring().c_str(),
-                    D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT, &GUID_WICPixelFormat24bppBGR);
+                auto& tex = snap_tex[ei];
+                if (tex == nullptr || tex->GetDesc().Width != bb_desc.Width || tex->GetDesc().Height != bb_desc.Height ||
+                    tex->GetDesc().Format != bb_desc.Format) {
+                    tex.Reset();
+                    D3D12_RESOURCE_DESC d = bb_desc;
+                    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+                    D3D12_HEAP_PROPERTIES hp{};
+                    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex)))) {
+                        spdlog::error("[PragmataVR] Snapshot: could not create the copy texture");
+                        tex.Reset();
+                    }
+                }
 
-                if (SUCCEEDED(hr)) {
-                    spdlog::info("[PragmataVR] Snapshot saved: {}", png.string());
-                } else {
-                    const auto dds = dir / (hud.snapshot_stem + (left ? "_left.dds" : "_right.dds"));
-                    hr = DirectX::SaveDDSTextureToFile(command_queue, backbuffer.Get(), dds.wstring().c_str(),
-                        D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_PRESENT);
-                    spdlog::info("[PragmataVR] Snapshot PNG failed, DDS {}: {}", SUCCEEDED(hr) ? "saved" : "failed too", dds.string());
+                if (tex != nullptr && snap_cmds_ready) {
+                    snap_cmds.wait(INFINITE);
+                    snap_cmds.copy(backbuffer.Get(), tex.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COMMON);
+                    snap_cmds.execute();
+                    snap_cmds.wait(INFINITE);
                 }
             }
 
             if (hud.snapshot_left_done.load() && hud.snapshot_right_done.load()) {
                 hud.snapshot_frames_left = 0;
+                CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                const auto dir = pragmatavr::HudTuning::data_dir() / "snapshots";
+
+                for (int i = 0; i < 2; ++i) {
+                    if (snap_tex[i] == nullptr) {
+                        continue;
+                    }
+                    const auto png = dir / (hud.snapshot_stem + (i == 0 ? "_left.png" : "_right.png"));
+                    auto hr = DirectX::SaveWICTextureToFile(command_queue, snap_tex[i].Get(), GUID_ContainerFormatPng, png.wstring().c_str(),
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, &GUID_WICPixelFormat24bppBGR);
+
+                    if (SUCCEEDED(hr)) {
+                        spdlog::info("[PragmataVR] Snapshot saved: {}", png.string());
+                    } else {
+                        const auto dds = dir / (hud.snapshot_stem + (i == 0 ? "_left.dds" : "_right.dds"));
+                        hr = DirectX::SaveDDSTextureToFile(command_queue, snap_tex[i].Get(), dds.wstring().c_str(),
+                            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON);
+                        spdlog::info("[PragmataVR] Snapshot PNG failed, DDS {}: {}", SUCCEEDED(hr) ? "saved" : "failed too", dds.string());
+                    }
+                }
             } else {
                 hud.snapshot_frames_left--;
             }

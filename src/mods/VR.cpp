@@ -3348,6 +3348,11 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleCompanion:
+            v.value = t.companion_mode == pragmatavr::CompanionWithElement ? "WITH ELEMENT" :
+                      (t.companion_mode == pragmatavr::CompanionReframework ? "REFRAMEWORK" : "HIDDEN");
+            v.value_color = t.companion_mode == pragmatavr::CompanionWithElement ? ACCENT : AMBER;
+            break;
         case pragmatavr::ActionToggleScaleCenter:
             v.value = t.scale_about_center ? "ELEMENT CENTER" : "PANEL ORIGIN";
             v.value_color = t.scale_about_center ? ACCENT : AMBER;
@@ -3474,7 +3479,7 @@ void VR::on_frame() {
     // ---- Measure: column widths fit every label, value and header in both bands ----
     float value_w = 0.0f;
     for (const char* s : {"GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
-             "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN"}) {
+             "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN", "WITH ELEMENT", "REFRAMEWORK"}) {
         value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
 
@@ -3512,7 +3517,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 14");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 15");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3599,7 +3604,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 14"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 14");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 15"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 15");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4103,7 +4108,49 @@ struct PragmataPanelRestore {
     REComponent* view{nullptr};
     Vector4f position{};
     std::vector<PragmataChildRestore> children{};
+    // Build 15 companions: the view's own settings and the GUI object's world matrix, put back after the draw.
+    bool companion{false};
+    uint32_t view_type{0};
+    bool overlay{false};
+    bool detonemap{false};
+    Vector4f view_scale{};
+    RETransform* transform{nullptr};
+    Matrix4x4f world{};
 };
+
+// Build 15: the 3D partner panels' own settings (before any tuning), captured as they draw, so their Screen-mode
+// companions can be drawn the same way. Also the partner's element center, so both halves grow around one point.
+namespace pragmata_companion {
+struct Partner {
+    Vector4f position{};
+    Vector4f scale{};
+    Vector4f rotation{};
+    bool overlay{true};
+    bool detonemap{false};
+    Matrix4x4f world{1.0f};
+    std::optional<Vector2f> pivot{};
+    std::chrono::steady_clock::time_point seen{};
+};
+
+std::mutex g_mtx{};
+std::unordered_map<std::string, Partner> g_partners{};
+std::unordered_map<size_t, int> g_logged{}; // name hash -> companion generation logged
+
+void log_view(const std::string& what, const std::string& name, REComponent* view, RETransform* transform, sdk::VMContext* ctx) {
+    const auto pos = sdk::call_object_func_easy<Vector4f>(view, "get_Position");
+    const auto scale = sdk::call_object_func_easy<Vector4f>(view, "get_Scale");
+    const auto rot = sdk::call_object_func_easy<Vector4f>(view, "get_Rotation");
+    regenny::via::Size size{};
+    sdk::call_object_func<void*>((REManagedObject*)view, "get_ScreenSize", &size, ctx, (REManagedObject*)view);
+    const Matrix4x4f w = transform != nullptr ? transform->worldTransform : Matrix4x4f{1.0f};
+    spdlog::info("[PragmataVR] {} {}: viewType={} overlay={} detonemap={} pos ({:.3f}, {:.3f}, {:.3f}) scale ({:.4f}, {:.4f}, {:.4f}) "
+        "rot ({:.3f}, {:.3f}, {:.3f}, {:.3f}) screen {:.0f}x{:.0f} | world pos ({:.3f}, {:.3f}, {:.3f}) axes {:.4f} {:.4f} {:.4f}",
+        what, name, sdk::call_object_func<uint32_t>(view, "get_ViewType", ctx, view),
+        sdk::call_object_func<bool>(view, "get_Overlay", ctx, view), sdk::call_object_func<bool>(view, "get_Detonemap", ctx, view),
+        pos.x, pos.y, pos.z, scale.x, scale.y, scale.z, rot.x, rot.y, rot.z, rot.w, size.w, size.h,
+        w[3].x, w[3].y, w[3].z, glm::length(glm::vec3{w[0]}), glm::length(glm::vec3{w[1]}), glm::length(glm::vec3{w[2]}));
+}
+} // namespace pragmata_companion
 
 
 thread_local std::vector<PragmataPanelRestore> g_pragmata_panel_restore{};
@@ -4278,6 +4325,97 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
 
+        // PragmataVR Build 15: Screen-mode companion layers of the HUD elements (see pragmatavr::companion_group).
+        {
+            std::string_view partner_name{};
+            const int cgroup = pragmatavr::companion_group(name, partner_name);
+            const auto tune = pragmatavr::HudTuning::get().tune();
+
+            if (cgroup >= 0 && tune->enabled) {
+                if (tune->companion_mode == pragmatavr::CompanionHidden) {
+                    return false; // test: do not draw the companion at all
+                }
+
+                auto cview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
+                std::optional<pragmata_companion::Partner> partner{};
+                {
+                    std::scoped_lock _{pragmata_companion::g_mtx};
+                    auto it = pragmata_companion::g_partners.find(std::string{partner_name});
+                    if (it != pragmata_companion::g_partners.end() &&
+                        std::chrono::steady_clock::now() - it->second.seen < std::chrono::milliseconds(500)) {
+                        partner = it->second;
+                    }
+                }
+
+                const int gen = pragmatavr::HudTuning::get().companion_generation.load();
+                bool log_now = false;
+                {
+                    std::scoped_lock _{pragmata_companion::g_mtx};
+                    auto it = pragmata_companion::g_logged.find(name_hash);
+                    if (it == pragmata_companion::g_logged.end() || it->second != gen) {
+                        pragmata_companion::g_logged[name_hash] = gen;
+                        log_now = true;
+                    }
+                }
+                if (log_now && cview != nullptr) {
+                    pragmata_companion::log_view(partner ? "Companion (as found)" : "Companion (partner not drawn yet)", name, cview, game_object->transform, context);
+                }
+
+                if (tune->companion_mode == pragmatavr::CompanionWithElement && cview != nullptr && partner && game_object->transform != nullptr) {
+                    const auto& gt = tune->groups[cgroup];
+                    const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
+
+                    PragmataPanelRestore restore{};
+                    restore.view = cview;
+                    restore.companion = true;
+                    restore.position = sdk::call_object_func_easy<Vector4f>(cview, "get_Position");
+                    restore.view_scale = sdk::call_object_func_easy<Vector4f>(cview, "get_Scale");
+                    restore.view_type = sdk::call_object_func<uint32_t>(cview, "get_ViewType", context, cview);
+                    restore.overlay = sdk::call_object_func<bool>(cview, "get_Overlay", context, cview);
+                    restore.detonemap = sdk::call_object_func<bool>(cview, "get_Detonemap", context, cview);
+                    restore.transform = game_object->transform;
+                    restore.world = game_object->transform->worldTransform;
+
+                    // Same view settings and placement as the partner, plus the element's position values.
+                    sdk::call_object_func<void*>(cview, "set_ViewType", context, cview, (uint32_t)via::gui::ViewType::World);
+                    sdk::call_object_func<void*>(cview, "set_Overlay", context, cview, partner->overlay);
+                    sdk::call_object_func<void*>(cview, "set_Detonemap", context, cview, partner->detonemap);
+                    Vector3f np{ partner->position.x + gt.x + eye_shift, partner->position.y + gt.y * tune->y_sign, partner->position.z };
+                    sdk::call_object_func<void*>(cview, "set_Position", context, cview, &np);
+                    Vector4f ns = partner->scale;
+                    sdk::call_object_func<void*>(cview, "set_Scale", context, cview, &ns);
+                    game_object->transform->worldTransform = partner->world;
+
+                    // Grow around the partner's element center, so both halves stay together.
+                    if (gt.size != 1.0f && tune->scale_about_center && partner->pivot) {
+                        const float k = gt.size;
+                        const auto pv = *partner->pivot;
+                        auto c = sdk::call_object_func<REManagedObject*>(cview, "get_Child", context, cview);
+                        for (int n = 0; c != nullptr && n < 64; ++n) {
+                            PragmataChildRestore cr{};
+                            cr.obj = c;
+                            cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+                            cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+                            cr.restore_position = true;
+                            Vector3f p{ pv.x + k * (cr.position.x - pv.x), pv.y + k * (cr.position.y - pv.y), cr.position.z };
+                            Vector4f sc{ cr.scale.x * k, cr.scale.y * k, cr.scale.z, 1.0f };
+                            sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
+                            sdk::call_object_func<void*>(c, "set_Scale", context, c, &sc);
+                            restore.children.push_back(cr);
+                            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
+                        }
+                    }
+
+                    g_pragmata_panel_restore.push_back(std::move(restore));
+
+                    if (log_now) {
+                        pragmata_companion::log_view("Companion (drawn with element)", name, cview, game_object->transform, context);
+                    }
+                    return true; // skip REFramework's generic Screen-to-World sheet for this object
+                }
+            }
+        }
+
         // PragmataVR: per-element size, position and per-eye gap for Pragmata's World-mode 3D HUD panels.
         // Applied to the panel's GUI view just before it draws, restored in on_gui_draw_element.
         {
@@ -4299,11 +4437,38 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     restore.view = pview;
                     restore.position = sdk::call_object_func_easy<Vector4f>(pview, "get_Position");
 
+                    // Build 15: remember this panel's own settings for its companion, and log them once per mode.
+                    {
+                        const int gen = pragmatavr::HudTuning::get().companion_generation.load();
+                        bool log_now = false;
+                        {
+                            std::scoped_lock _{pragmata_companion::g_mtx};
+                            auto& pt = pragmata_companion::g_partners[name];
+                            pt.position = restore.position;
+                            pt.scale = sdk::call_object_func_easy<Vector4f>(pview, "get_Scale");
+                            pt.rotation = sdk::call_object_func_easy<Vector4f>(pview, "get_Rotation");
+                            pt.overlay = sdk::call_object_func<bool>(pview, "get_Overlay", context, pview);
+                            pt.detonemap = sdk::call_object_func<bool>(pview, "get_Detonemap", context, pview);
+                            pt.world = game_object->transform != nullptr ? game_object->transform->worldTransform : Matrix4x4f{1.0f};
+                            pt.seen = std::chrono::steady_clock::now();
+                            auto it = pragmata_companion::g_logged.find(name_hash);
+                            if (it == pragmata_companion::g_logged.end() || it->second != gen) {
+                                pragmata_companion::g_logged[name_hash] = gen;
+                                log_now = true;
+                            }
+                        }
+                        if (log_now) {
+                            pragmata_companion::log_view("3D panel", name, pview, game_object->transform, context);
+                        }
+                    }
+
                     // Element center, found before anything is changed this draw (values are restored after each draw).
                     const bool centered = group != pragmatavr::GroupHack && tune->scale_about_center;
                     std::optional<Vector2f> pivot{};
                     if (centered && gt.size != 1.0f) {
                         pivot = pragmata_pivot::get(name_hash, name, pview, context, m_frame_count);
+                        std::scoped_lock _{pragmata_companion::g_mtx};
+                        pragmata_companion::g_partners[name].pivot = pivot;
                     }
 
                     Vector3f new_position{ restore.position.x + dx, restore.position.y + dy, restore.position.z };
@@ -4882,6 +5047,16 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
         auto pcontext = sdk::get_thread_context();
 
         for (auto& r : g_pragmata_panel_restore) {
+            if (r.companion) {
+                sdk::call_object_func<void*>(r.view, "set_ViewType", pcontext, r.view, r.view_type);
+                sdk::call_object_func<void*>(r.view, "set_Overlay", pcontext, r.view, r.overlay);
+                sdk::call_object_func<void*>(r.view, "set_Detonemap", pcontext, r.view, r.detonemap);
+                sdk::call_object_func<void*>(r.view, "set_Scale", pcontext, r.view, &r.view_scale);
+                if (r.transform != nullptr) {
+                    r.transform->worldTransform = r.world;
+                }
+            }
+
             Vector3f original_position{ r.position.x, r.position.y, r.position.z };
             sdk::call_object_func<void*>(r.view, "set_Position", pcontext, r.view, &original_position);
 
