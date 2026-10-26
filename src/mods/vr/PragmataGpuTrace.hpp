@@ -88,6 +88,9 @@ inline uint32_t g_scratch_used{0};
 inline std::unordered_map<uint64_t, Scratch> g_scratch{}; // key: width, height, format
 inline constexpr uint32_t SCRATCH_MAX = 32;
 
+inline void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+    D3D12_CPU_DESCRIPTOR_HANDLE handle);
+
 inline std::optional<D3D12_CPU_DESCRIPTOR_HANDLE> scratch_rtv(const RtvInfo& info) {
     if (g_device == nullptr || info.w == 0 || info.h == 0 || info.format == 0) {
         return std::nullopt;
@@ -131,8 +134,7 @@ inline std::optional<D3D12_CPU_DESCRIPTOR_HANDLE> scratch_rtv(const RtvInfo& inf
     ++g_scratch_used;
     // Created through the original function so the trace map does not record it.
     if (g_create_rtv_hook != nullptr) {
-        g_create_rtv_hook->get_original<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
-            D3D12_CPU_DESCRIPTOR_HANDLE)>()(g_device, sc.tex.Get(), nullptr, sc.rtv);
+        g_create_rtv_hook->get_original<decltype(create_rtv)>()(g_device, sc.tex.Get(), nullptr, sc.rtv);
     } else {
         g_device->CreateRenderTargetView(sc.tex.Get(), nullptr, sc.rtv);
     }
