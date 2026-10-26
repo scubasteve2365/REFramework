@@ -386,8 +386,11 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                 pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
                 original(self, 2, pre);
 
-                g_copy_resource_hook != nullptr ? g_copy_resource_hook->get_original<void(STDMETHODCALLTYPE)(ID3D12GraphicsCommandList*,
-                    ID3D12Resource*, ID3D12Resource*)>()(self, cap, ui) : self->CopyResource(cap, ui);
+                if (g_copy_resource_hook != nullptr) {
+                    g_copy_resource_hook->get_original<decltype(copy_resource)>()(self, cap, ui);
+                } else {
+                    self->CopyResource(cap, ui);
+                }
 
                 D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
                 std::swap(post[0].Transition.StateBefore, post[0].Transition.StateAfter);
