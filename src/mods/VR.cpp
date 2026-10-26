@@ -3375,9 +3375,9 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
-        case pragmatavr::ActionToggleMasks:
-            v.value = t.masks_off ? "OFF" : "NORMAL";
-            v.value_color = t.masks_off ? AMBER : ACCENT;
+        case pragmatavr::ActionToggleFlatScreen:
+            v.value = t.flat_screen ? "SCREEN" : "WORLD";
+            v.value_color = t.flat_screen ? ACCENT : AMBER;
             v.dim = !t.flat_test; // FLAT mode only
             break;
         case pragmatavr::ActionToggleBlur:
@@ -3568,7 +3568,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 23");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 24");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3655,7 +3655,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 23"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 23");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 24"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 24");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4568,15 +4568,13 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     const float dy = gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
                     const float k = gt.size;
                     const bool hide_blur = ftune->hide_blur;
-                    const bool masks_off = ftune->masks_off;
+                    // Build 24: the 3D panel (not the hacking circle) drawn as a Screen view, like its companion.
+                    const auto fvt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 0u;
+                    const bool to_screen = fnative && fgroup != pragmatavr::GroupHack && ftune->flat_screen &&
+                                           fview != nullptr && fvt != (uint32_t)via::gui::ViewType::Screen;
+                    const bool screen_drawn = to_screen || (fview != nullptr && fvt == (uint32_t)via::gui::ViewType::Screen);
 
-                    // Build 23: always walk once per view so the mask log is written even with masks NORMAL.
-                    std::vector<REManagedObject*> mask_objs{};
-                    if (fview != nullptr) {
-                        pragmata_mask::get(name_hash, name, fview, context, m_frame_count, mask_objs);
-                    }
-
-                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f || hide_blur || masks_off)) {
+                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f || hide_blur || to_screen)) {
                         // Build 22: fixed center per element (see pragmatavr::FLAT_PIVOTS), shared by both halves.
                         const float kk = k;
                         const Vector2f pv{ pragmatavr::FLAT_PIVOTS[fgroup][0], pragmatavr::FLAT_PIVOTS[fgroup][1] };
@@ -4585,18 +4583,16 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         restore.view = fview;
                         restore.position = sdk::call_object_func_easy<Vector4f>(fview, "get_Position");
 
-                        if (masks_off) {
-                            for (auto m : mask_objs) {
-                                const auto mode = sdk::call_object_func<uint32_t>(m, "get_MaskMode", context, m);
-                                if (mode != 3u) { // 3 = Disable
-                                    sdk::call_object_func<void*>(m, "set_MaskMode", context, m, 3u);
-                                    PragmataChildRestore mr{};
-                                    mr.obj = m;
-                                    mr.restore_mask = true;
-                                    mr.mask_mode = mode;
-                                    restore.children.push_back(mr);
-                                }
-                            }
+                        if (to_screen) {
+                            // Same restore as the PANEL mode switch: view type, overlay, detonemap, scale, world matrix.
+                            restore.companion = true;
+                            restore.view_scale = sdk::call_object_func_easy<Vector4f>(fview, "get_Scale");
+                            restore.view_type = fvt;
+                            restore.overlay = sdk::call_object_func<bool>(fview, "get_Overlay", context, fview);
+                            restore.detonemap = sdk::call_object_func<bool>(fview, "get_Detonemap", context, fview);
+                            restore.transform = game_object->transform;
+                            restore.world = game_object->transform->worldTransform;
+                            sdk::call_object_func<void*>(fview, "set_ViewType", context, fview, (uint32_t)via::gui::ViewType::Screen);
                         }
 
                         if (hide_blur) {
@@ -4637,12 +4633,22 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     if (lit == logged_flat.end() || lit->second != fgen) {
                         logged_flat[name_hash] = fgen;
                         const auto vt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 99u;
-                        spdlog::info("[PragmataVR] FLAT HUD: {} as {} ({}), view type {}, size {:.2f} x {:.0f} y {:.0f} gap {:.0f}",
-                            name, pragmatavr::GROUP_KEYS[fgroup], fnative ? "3D panel" : "companion", vt, k, gt.x, gt.y, gt.gap);
+                        // Build 24: does this GUI draw into its own render target (an image shown elsewhere)?
+                        void* rt = nullptr;
+                        bool has_rt_method = false;
+                        if (auto gtd = utility::re_managed_object::get_type_definition((REManagedObject*)gui_element); gtd != nullptr &&
+                            gtd->get_method("get_RenderTarget") != nullptr) {
+                            has_rt_method = true;
+                            rt = sdk::call_object_func<void*>(gui_element, "get_RenderTarget", context, gui_element);
+                        }
+                        spdlog::info("[PragmataVR] FLAT HUD: {} as {} ({}), view type {} (was {}), drawn {}, render target {}, size {:.2f} x {:.0f} y {:.0f} gap {:.0f}",
+                            name, pragmatavr::GROUP_KEYS[fgroup], fnative ? "3D panel" : "companion", vt, fvt,
+                            screen_drawn ? "as Screen view" : "as World view", has_rt_method ? (rt != nullptr ? fmt::format("{:x}", (uintptr_t)rt) : std::string{"none"}) : std::string{"(no method)"},
+                            k, gt.x, gt.y, gt.gap);
                     }
 
-                    if (!fnative) {
-                        return true; // the companion stays flat (Screen mode): skip REFramework's floating sheet
+                    if (!fnative || to_screen) {
+                        return true; // drawn as a Screen view: skip REFramework's floating sheet for it
                     }
                     // 3D panels go on as before (World mode, drawn with the flat projection; the 3D tuning is skipped)
                 }
