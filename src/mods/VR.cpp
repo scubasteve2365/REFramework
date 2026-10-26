@@ -49,6 +49,7 @@
 #include "sdk/Renderer.hpp"
 #include "sdk/REMath.hpp"
 #include "sdk/REGameObject.hpp"
+#include "sdk/ManagedObject.hpp"
 
 #include "utility/Scan.hpp"
 #include "utility/FunctionHook.hpp"
@@ -3374,6 +3375,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleBlur:
+            v.value = t.hide_blur ? "HIDDEN" : "SHOWN";
+            v.dim = !t.flat_test; // FLAT mode only
+            break;
         case pragmatavr::ActionToggleGluedHud:
             v.value = t.glued_hud_removed ? "REMOVED" : "SHOWN";
             v.value_color = t.glued_hud_removed ? AMBER : ACCENT;
@@ -3558,7 +3563,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 21");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 22");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3645,7 +3650,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 21"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 21");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 22"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 22");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4143,6 +4148,7 @@ struct PragmataChildRestore {
     Vector4f position{};
     Vector4f scale{};
     bool restore_position{false};
+    bool restore_visible{false}; // Build 22: only make obj visible again (frosted glass hidden for one draw)
 };
 
 struct PragmataPanelRestore {
@@ -4343,6 +4349,61 @@ std::optional<Vector2f> get(size_t hash, const std::string& name, REComponent* v
     return out.valid ? std::optional<Vector2f>{out.pivot} : std::nullopt;
 }
 } // namespace pragmata_pivot
+
+// PragmataVR Build 22: the frosted glass pieces (via.gui.BlurFilter) of a HUD view, hidden for each FLAT draw. The tree
+// is walked once every 120 frames (or when the view changes); the found objects are held with add_ref so a cached
+// pointer can never point at freed memory if the game rebuilds the view in between.
+namespace pragmata_blur {
+struct Entry {
+    REComponent* view{nullptr};
+    std::vector<REManagedObject*> objs{};
+    int frame{-100000};
+};
+
+std::mutex g_mtx{};
+std::unordered_map<size_t, Entry> g_cache{};
+
+void collect(REManagedObject* obj, sdk::VMContext* ctx, std::vector<REManagedObject*>& out, int depth, int& nodes) {
+    if (depth > 14) {
+        return;
+    }
+    auto c = sdk::call_object_func<REManagedObject*>(obj, "get_Child", ctx, obj);
+    for (int n = 0; c != nullptr && n < 256 && nodes < 1024; ++n) {
+        ++nodes;
+        auto td = utility::re_managed_object::get_type_definition(c);
+        if (td != nullptr && td->get_full_name() == "via.gui.BlurFilter") {
+            out.push_back(c);
+        } else {
+            collect(c, ctx, out, depth + 1, nodes);
+        }
+        c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+    }
+}
+
+// Copies the cached list into out (the objects stay referenced by the cache).
+void get(size_t hash, const std::string& name, REComponent* view, sdk::VMContext* ctx, int frame, std::vector<REManagedObject*>& out) {
+    std::scoped_lock _{g_mtx};
+    auto& e = g_cache[hash];
+    if (e.view != view || frame - e.frame >= 120 || frame - e.frame < 0) {
+        for (auto o : e.objs) {
+            ((sdk::ManagedObject*)o)->release();
+        }
+        const bool first = e.view == nullptr;
+        e.objs.clear();
+        int nodes = 0;
+        collect((REManagedObject*)view, ctx, e.objs, 0, nodes);
+        for (auto o : e.objs) {
+            ((sdk::ManagedObject*)o)->add_ref();
+        }
+        e.view = view;
+        e.frame = frame;
+        if (first) {
+            spdlog::info("[PragmataVR] Frosted glass in {}: {} BlurFilter pieces", name, e.objs.size());
+        }
+    }
+    out = e.objs;
+}
+} // namespace pragmata_blur
 #endif
 
 bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) {
@@ -4425,41 +4486,32 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     const auto& gt = ftune->flat_groups[fgroup];
                     const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
                     const float dx = gt.x + eye_shift;
-                    const float dy = -gt.y; // canvas y points down; Up / down positive moves the element up
+                    const float dy = gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
                     const float k = gt.size;
-                    const auto now = std::chrono::steady_clock::now();
+                    const bool hide_blur = ftune->hide_blur;
 
-                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f)) {
-                        std::optional<Vector2f> pivot{};
-
-                        if (k != 1.0f) {
-                            if (fnative) {
-                                pivot = pragmata_pivot::get(name_hash, name, fview, context, m_frame_count);
-                                std::scoped_lock _{pragmata_companion::g_mtx};
-                                auto& pt = pragmata_companion::g_partners[name];
-                                pt.pivot = pivot;
-                                pt.seen = now;
-                            } else {
-                                {
-                                    std::scoped_lock _{pragmata_companion::g_mtx};
-                                    auto it = pragmata_companion::g_partners.find(std::string{fpartner});
-                                    if (it != pragmata_companion::g_partners.end() && it->second.pivot &&
-                                        now - it->second.seen < std::chrono::milliseconds(500)) {
-                                        pivot = it->second.pivot;
-                                    }
-                                }
-                                if (!pivot) {
-                                    pivot = pragmata_pivot::get(name_hash, name, fview, context, m_frame_count);
-                                }
-                            }
-                        }
-
-                        const float kk = pivot ? k : 1.0f; // no center found: move only
-                        const Vector2f pv = pivot ? *pivot : Vector2f{0.0f, 0.0f};
+                    if (fview != nullptr && (k != 1.0f || dx != 0.0f || dy != 0.0f || hide_blur)) {
+                        // Build 22: fixed center per element (see pragmatavr::FLAT_PIVOTS), shared by both halves.
+                        const float kk = k;
+                        const Vector2f pv{ pragmatavr::FLAT_PIVOTS[fgroup][0], pragmatavr::FLAT_PIVOTS[fgroup][1] };
 
                         PragmataPanelRestore restore{};
                         restore.view = fview;
                         restore.position = sdk::call_object_func_easy<Vector4f>(fview, "get_Position");
+
+                        if (hide_blur) {
+                            std::vector<REManagedObject*> blur{};
+                            pragmata_blur::get(name_hash, name, fview, context, m_frame_count, blur);
+                            for (auto b : blur) {
+                                if (sdk::call_object_func<bool>(b, "get_Visible", context, b)) {
+                                    sdk::call_object_func<void*>(b, "set_Visible", context, b, false);
+                                    PragmataChildRestore br{};
+                                    br.obj = b;
+                                    br.restore_visible = true;
+                                    restore.children.push_back(br);
+                                }
+                            }
+                        }
 
                         auto c = sdk::call_object_func<REManagedObject*>(fview, "get_Child", context, fview);
                         for (int n = 0; c != nullptr && n < 64; ++n) {
@@ -5233,6 +5285,10 @@ void VR::on_gui_draw_element(REComponent* gui_element, void* primitive_context) 
             sdk::call_object_func<void*>(r.view, "set_Position", pcontext, r.view, &original_position);
 
             for (auto& cr : r.children) {
+                if (cr.restore_visible) {
+                    sdk::call_object_func<void*>(cr.obj, "set_Visible", pcontext, cr.obj, true);
+                    continue;
+                }
                 sdk::call_object_func<void*>(cr.obj, "set_Scale", pcontext, cr.obj, &cr.scale);
                 if (cr.restore_position) {
                     Vector3f p{ cr.position.x, cr.position.y, cr.position.z };

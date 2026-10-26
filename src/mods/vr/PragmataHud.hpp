@@ -91,7 +91,9 @@ inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCL
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
-inline constexpr int INI_VERSION = 13;
+inline constexpr int INI_VERSION = 14;
+// Build 22: FLAT Up / down became positive = down. Files written as v13 have their flat_y values negated on load.
+inline constexpr int INI_VERSION_FLAT_Y_DOWN = 14;
 // hud_mode (Build 21) replaces the flat_test and hud_panel lines; those are ignored from any file.
 // hud_fixed and hack_locked lines are ignored in files older than this (Build 11 wrote hud_fixed=0 as its default).
 inline constexpr int INI_VERSION_FIXED_HUD = 12;
@@ -104,6 +106,19 @@ inline constexpr float HACK_LOCKED_X = -275.0f;
 inline constexpr float HACK_LOCKED_Y = -75.0f;
 inline constexpr float HACK_LOCKED_GAP = 12.0f;
 inline constexpr std::array<const char*, FieldCount> FIELD_KEYS{"size", "x", "y", "gap"};
+
+// Build 22: FLAT mode grows each element around a fixed point (canvas pixels, 1920 x 1080, y down): the middle of the
+// element in the game's own layout, taken from the Build 21 GUI tree logs and snapshots. Build 21 recomputed the
+// center from the visible pieces every 16 frames; health and the tutorial box have only a few such pieces, so the
+// center jumped as pieces showed and hid (health bounced between a few spots), and sat near the screen edge (shrinking
+// pulled the element off the edge of the view). Both halves of an element (3D panel and companion) use the same point.
+inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
+    {1560.0f, 445.0f}, // hacking circle
+    {178.0f, 964.0f},  // health
+    {960.0f, 1001.0f}, // stamina
+    {1612.0f, 877.0f}, // weapon wheel
+    {305.0f, 300.0f},  // tutorial box
+}};
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
 // in both eyes (follows the head), with per-element size, position and eye gap. PANEL = the Build 17-20 room-fixed panel.
@@ -132,6 +147,9 @@ struct HudTune {
     bool hud_fixed{true};    // HUD fixed in the room (Build 12, Steve's standing preference). Off = follows the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
+    // Build 22: FLAT mode hides the frosted glass (via.gui.BlurFilter) behind the HUD elements. The blur keeps the
+    // element's original size and place when the element is resized and moved, which showed as a stray panel.
+    bool hide_blur{true};
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
     // Build 17: HUD panel. 1 = health, stamina, weapon wheel and tutorial are drawn flat (Screen mode, as on a monitor)
     // into the engine's UI buffer, which is copied each frame onto a room-fixed OpenXR quad (screen.* place and size it).
@@ -185,13 +203,16 @@ struct HudTune {
             flat_groups[g].size = size;
             flat_groups[g].x = x;
             flat_groups[g].y = y;
-            flat_groups[g].gap = 0.0f;
         };
-        set_flat(GroupHack, 0.75f, -200.0f, 0.0f);
-        set_flat(GroupHealth, 0.60f, 320.0f, 100.0f);
-        set_flat(GroupStamina, 0.60f, 0.0f, 140.0f);
-        set_flat(GroupWeapons, 0.60f, -280.0f, 100.0f);
-        set_flat(GroupTutorial, 0.60f, 270.0f, -60.0f);
+        // Build 22: Steve's Build 21 tuning (moved to the fixed centers, y positive = down).
+        set_flat(GroupHack, 0.385f, -420.0f, 80.0f);
+        set_flat(GroupHealth, 0.60f, 570.0f, -200.0f);
+        set_flat(GroupStamina, 1.0f, 0.0f, -100.0f);
+        set_flat(GroupWeapons, 0.82f, -250.0f, 60.0f);
+        set_flat(GroupTutorial, 0.73f, 390.0f, 160.0f);
+        for (auto& f : flat_groups) {
+            f.gap = 50.0f;
+        }
         apply_hud_mode();
     }
 };
@@ -367,6 +388,7 @@ enum MenuAction : int {
     ActionRecenter,
     ActionToggleLockInvert,
     ActionToggleGhost,
+    ActionToggleBlur,
     ActionToggleHackLock,
     ActionResetGroup,
     ActionSnapshot,
@@ -731,6 +753,8 @@ private:
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
             "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBlur, "Frosted glass",
+            "A = FLAT mode: hide or show the blurred glass behind HUD elements (it does not follow size and position)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
             "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
         add_element(GroupHealth);
@@ -787,7 +811,7 @@ private:
         s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
-        s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the same for FLAT mode (canvas pixels, flat_y positive = up).\n";
+        s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the same for FLAT mode (canvas pixels, flat_y positive = down).\n";
         s += "# scale_about_center = 1: size grows each element around its own center (hack always uses the panel origin).\n";
         s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
         s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
@@ -802,6 +826,8 @@ private:
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
+        s += "# hide_blur = 1: FLAT mode hides the frosted glass behind HUD elements.\n";
+        s += fmt::format("hide_blur={}\n", t.hide_blur ? 1 : 0);
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
@@ -919,6 +945,7 @@ private:
         const bool old_file = file_version < INI_VERSION;
         const bool old_hack = file_version < INI_VERSION_HACK;
         const bool old_fixed = file_version < INI_VERSION_FIXED_HUD;
+        const bool flat_y_up = file_version < INI_VERSION_FLAT_Y_DOWN;
         if (old_file) {
             spdlog::info("[PragmataVR] pragmatavr_hud.ini v{} is from an older build:{}{} (file will be rewritten as v{})", file_version,
                 old_hack ? " hacking circle set to the locked values, other elements neutral;" : "",
@@ -964,6 +991,7 @@ private:
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
+                else if (key == "hide_blur") t->hide_blur = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
                 else if (key == "companion_mode") t->companion_mode = std::clamp((int)val, 0, 2);
                 else if (key == "hud_mode") t->hud_mode = std::clamp((int)val, 0, 2);
@@ -1032,7 +1060,7 @@ private:
                     switch (fi) {
                     case FieldSize: gt.size = std::clamp(val, MIN_SIZE, MAX_SIZE); break;
                     case FieldX: gt.x = std::clamp(val, -MAX_MOVE, MAX_MOVE); break;
-                    case FieldY: gt.y = std::clamp(val, -MAX_MOVE, MAX_MOVE); break;
+                    case FieldY: gt.y = std::clamp(flat_key && flat_y_up ? -val : val, -MAX_MOVE, MAX_MOVE); break;
                     case FieldGap: gt.gap = std::clamp(val, -MAX_GAP, MAX_GAP); break;
                     default: break;
                     }
@@ -1335,6 +1363,11 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: fixed HUD direction {}", t->lock_invert ? "flipped" : "normal");
                     play_click(true);
+                } else if (row.action == ActionToggleBlur) {
+                    t->hide_blur = !t->hide_blur;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: frosted glass {}", t->hide_blur ? "hidden" : "shown");
+                    play_click(true);
                 } else if (row.action == ActionToggleGhost) {
                     t->hide_ghost = !t->hide_ghost;
                     commit(t);
@@ -1442,6 +1475,9 @@ private:
 
         if (row.group == GROUP_MENU) {
             int mdir = vk == VK_RIGHT ? 1 : -1;
+            if (row.field == MenuDistance) {
+                mdir = -mdir; // Build 22: Right brings the menu closer (Steve had it marked INV)
+            }
             if (t->menu_invert[row.field]) {
                 mdir = -mdir;
             }
