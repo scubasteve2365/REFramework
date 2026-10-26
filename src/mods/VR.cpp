@@ -3346,7 +3346,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         if (row.group == pragmatavr::GROUP_SCREEN) {
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
-            v.dim = t.flat_test || (!t.hud_panel && !t.hud_fixed); // the HUD panel rows apply to the panel and the room-fixed 3D HUD
+            v.dim = !t.hud_panel && (t.flat_test || !t.hud_fixed); // ANCHORED panel, or the room-fixed 3D HUD
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
@@ -3354,8 +3354,8 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             const auto& gt = pragmatavr::active_group(t, row.group);
             v.value = pragmatavr::HudTuning::format_value(gt, row.group, row.field);
             v.invert_on = t.groups[row.group].invert[row.field];
-            // PANEL mode draws health, stamina, weapons and tutorial untuned (the panel shows the game's own layout).
-            v.dim = per_panel_off || pragmatavr::group_locked(t, row.group) || (t.hud_panel && row.group != pragmatavr::GroupHack);
+            v.dim = per_panel_off || pragmatavr::group_locked(t, row.group) ||
+                    (row.field == pragmatavr::FieldGap && t.hud_panel && row.group != pragmatavr::GroupHack); // ANCHORED: no eye gap
         }
         break;
     case Kind::Toggle:
@@ -3366,7 +3366,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             break;
         case pragmatavr::ActionToggleHudFixed:
             v.value = t.hud_fixed ? "FIXED IN ROOM" : "FOLLOWS HEAD";
-            v.dim = t.flat_test; // FLAT mode always follows the head
+            v.dim = t.hud_mode != pragmatavr::HudMode3D; // 3D mode only
             break;
         case pragmatavr::ActionToggleLockInvert:
             v.value = t.lock_invert ? "FLIPPED" : "NORMAL";
@@ -3375,10 +3375,15 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleBoxes:
+            v.value = t.show_boxes ? "SHOWN" : "HIDDEN";
+            v.value_color = t.show_boxes ? AMBER : ACCENT;
+            v.dim = !t.hud_panel; // ANCHORED only
+            break;
         case pragmatavr::ActionToggleFlatScreen:
-            v.value = t.flat_screen ? "SCREEN" : "WORLD";
-            v.value_color = t.flat_screen ? ACCENT : AMBER;
-            v.dim = !t.flat_test; // FLAT mode only
+            v.value = t.flat_screen || t.hud_panel ? "SCREEN" : "WORLD";
+            v.value_color = t.flat_screen || t.hud_panel ? ACCENT : AMBER;
+            v.dim = !t.flat_test || t.hud_panel; // FLAT mode only (ANCHORED always uses SCREEN)
             break;
         case pragmatavr::ActionToggleBlur:
             v.value = t.hide_blur ? "HIDDEN" : "SHOWN";
@@ -3391,7 +3396,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             break;
         case pragmatavr::ActionToggleHudPanel:
             v.value = pragmatavr::hud_mode_name(t.hud_mode);
-            v.value_color = t.hud_mode == pragmatavr::HudModeFlat ? ACCENT : AMBER;
+            v.value_color = t.hud_mode == pragmatavr::HudMode3D ? AMBER : ACCENT;
             break;
         case pragmatavr::ActionToggleEngineOverlay:
             v.value = t.engine_overlay == 0 ? "DEFAULT" : (t.engine_overlay == 1 ? "OFF" : "ON");
@@ -3410,9 +3415,12 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             break;
         case pragmatavr::ActionToggleHackLock:
         default:
-            v.value = t.hack_locked ? "LOCKED" : "UNLOCKED";
-            v.value_color = t.hack_locked ? AMBER : ACCENT;
-            v.dim = per_panel_off || t.flat_test; // the lock covers the 3D values only
+            {
+                const bool lk = row.group >= 0 && row.group < pragmatavr::GroupCount && t.locked[row.group];
+                v.value = lk ? "LOCKED" : "UNLOCKED";
+                v.value_color = lk ? AMBER : ACCENT;
+                v.dim = per_panel_off;
+            }
             break;
         }
         break;
@@ -3542,15 +3550,29 @@ void VR::on_frame() {
     std::array<std::array<bool, 2>, 2> col_first{{{true, true}, {true, true}}};
     std::vector<float> row_col_y(rows.size(), 0.0f); // each row's top within its band column (for scrolling)
 
+    // Build 25: collapsible sections. A collapsed section shows only its header; its rows are skipped here and below.
+    const auto header_tag = [&](const pragmatavr::MenuRow& r) -> std::string {
+        if (r.section < 0) {
+            return r.hint;
+        }
+        return pragmatavr::section_collapsed(t.collapsed, r.section) ? "SHOW  +" : "HIDE  -";
+    };
+    const char* HEADER_HINT = "A = show or hide this section";
+
     for (int ri = 0; ri < (int)rows.size(); ++ri) {
         const auto& row = rows[ri];
         const int c = std::clamp(row.column, 0, 1);
         const int bd = std::clamp(row.band, 0, 1);
         row_col_y[ri] = col_h[bd][c];
 
+        if (pragmatavr::row_hidden(t.collapsed, row)) {
+            continue;
+        }
+
         if (row.kind == Kind::Header) {
+            const auto htag = header_tag(row);
             const float title = header_size * 0.95f + spaced(bold, header_size, 0, 0, 0, row.label.c_str(), header_size * 0.14f, false);
-            const float tag = row.hint.empty() ? 0.0f : gap + text_w(font, small_size, row.hint.c_str());
+            const float tag = htag.empty() ? 0.0f : gap + text_w(font, small_size, htag.c_str());
             col_w[c] = (std::max)(col_w[c], title + tag);
             col_h[bd][c] += (col_first[bd][c] ? header_gap_first : header_gap) + header_body;
             col_first[bd][c] = false;
@@ -3568,7 +3590,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 24");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 25");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3584,7 +3606,8 @@ void VR::on_frame() {
         chips_w = (std::max)(chips_w, w);
     }
 
-    float hint_w = (std::max)({text_w(font, hint_size, EDIT_HINT), text_w(font, hint_size, INV_HINT), text_w(font, hint_size, PER_PANEL_HINT)});
+    float hint_w = (std::max)({text_w(font, hint_size, EDIT_HINT), text_w(font, hint_size, INV_HINT), text_w(font, hint_size, PER_PANEL_HINT),
+        text_w(font, hint_size, HEADER_HINT)});
     for (const auto& row : rows) {
         if (row.kind != Kind::Header) {
             hint_w = (std::max)(hint_w, text_w(font, hint_size, row.hint.c_str()));
@@ -3655,7 +3678,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 24"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 24");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 25"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 25");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3703,18 +3726,33 @@ void VR::on_frame() {
         const float x1 = x0 + col_w[c];
         float& ry = cy[bd][c];
 
+        if (pragmatavr::row_hidden(t.collapsed, row)) {
+            continue;
+        }
+
         if (row.kind == Kind::Header) {
             ry += col_first[bd][c] ? header_gap_first : header_gap;
             col_first[bd][c] = false;
+
+            // Build 25: a selectable (collapsible) header gets the same highlight as a selected row.
+            if (i == sel && row.section >= 0) {
+                selected_row = &row;
+                const float hy0 = ry - std::round(header_size * 0.2f);
+                const float hy1 = ry + header_size * 1.3f - 1.0f;
+                dl->AddRectFilledMultiColor(ImVec2{x0, hy0}, ImVec2{x1, hy1}, SELECT_LEFT, SELECT_RIGHT, SELECT_RIGHT, SELECT_LEFT);
+                dl->AddRectFilled(ImVec2{x0, hy0}, ImVec2{x0 + 4.0f, hy1}, ACCENT);
+            }
 
             const float sq = std::round(header_size * 0.32f);
             const float sy = ry + (header_size - sq) * 0.55f;
             dl->AddRectFilled(ImVec2{x0, std::floor(sy)}, ImVec2{x0 + sq, std::floor(sy + sq)}, ACCENT);
             spaced(bold, header_size, x0 + header_size * 0.95f, ry, ACCENT, row.label.c_str(), header_size * 0.14f, true);
 
-            if (!row.hint.empty()) {
+            if (const auto htag = header_tag(row); !htag.empty()) {
                 const bool off = row.group >= 0 && row.group < pragmatavr::GroupCount && t.layout_mode == 1;
-                put(font, small_size, x1 - text_w(font, small_size, row.hint.c_str()), ry + (header_size - small_size) * 0.6f, off ? TEXT_OFF : TEXT_DIM, row.hint.c_str());
+                const bool hsel = i == sel && row.section >= 0;
+                put(font, small_size, x1 - text_w(font, small_size, htag.c_str()), ry + (header_size - small_size) * 0.6f,
+                    hsel ? TEXT_BRIGHT : (off ? TEXT_OFF : TEXT_DIM), htag.c_str());
             }
 
             const float hl = std::floor(ry + header_size * 1.3f);
@@ -3815,7 +3853,9 @@ void VR::on_frame() {
 
     if (selected_row != nullptr) {
         const bool per_panel = selected_row->group >= 0 && selected_row->group < pragmatavr::GroupCount && t.layout_mode == 1;
-        if (editing) {
+        if (selected_row->kind == Kind::Header) {
+            put(font, hint_size, left, y, TEXT, HEADER_HINT);
+        } else if (editing) {
             put(font, hint_size, left, y, ACCENT, EDIT_HINT);
         } else if (on_invert && selected_row->kind == Kind::Value) {
             put(font, hint_size, left, y, TEXT, INV_HINT);
@@ -4516,7 +4556,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             const int pgroup = pragmatavr::group_for(name);
             const bool element = (pgroup >= 0 && pgroup != pragmatavr::GroupHack) || pragmatavr::companion_group(name, pn) >= 0;
 
-            if (element && ptune->enabled && ptune->hud_panel) {
+            if (element && ptune->enabled && ptune->hud_panel && !ptune->flat_test) { // Build 25: ANCHORED uses the FLAT path
                 auto v = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
                 if (v != nullptr) {
                     const auto vt = sdk::call_object_func<uint32_t>(v, "get_ViewType", context, v);
@@ -4563,14 +4603,17 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 if (fgroup >= 0) {
                     auto fview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
                     const auto& gt = ftune->flat_groups[fgroup];
-                    const float eye_shift = is_left_eye() ? gt.gap : -gt.gap;
+                    // Build 25: ANCHORED takes depth from the panel distance, so the anchored elements get no eye gap
+                    // (the UI buffer is shared by both eyes, so it must match in both).
+                    const bool anchored = ftune->hud_panel && fgroup != pragmatavr::GroupHack;
+                    const float eye_shift = anchored ? 0.0f : (is_left_eye() ? gt.gap : -gt.gap);
                     const float dx = gt.x + eye_shift;
                     const float dy = gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
                     const float k = gt.size;
                     const bool hide_blur = ftune->hide_blur;
                     // Build 24: the 3D panel (not the hacking circle) drawn as a Screen view, like its companion.
                     const auto fvt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 0u;
-                    const bool to_screen = fnative && fgroup != pragmatavr::GroupHack && ftune->flat_screen &&
+                    const bool to_screen = fnative && fgroup != pragmatavr::GroupHack && (ftune->flat_screen || ftune->hud_panel) &&
                                            fview != nullptr && fvt != (uint32_t)via::gui::ViewType::Screen;
                     const bool screen_drawn = to_screen || (fview != nullptr && fvt == (uint32_t)via::gui::ViewType::Screen);
 

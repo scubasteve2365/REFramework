@@ -120,12 +120,23 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
     {305.0f, 300.0f},  // tutorial box
 }};
 
+// Build 25: each element's area in the game's own layout (canvas pixels, 1920 x 1080, x0 y0 x1 y1), with a margin. From
+// the Build 21 GUI tree logs and the Build 17-18 UI buffer measurements. ANCHORED moves these areas (after the FLAT size
+// and position) from the eye images to the room-fixed panel. The hacking circle is not anchored.
+inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
+    {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
+    {70.0f, 900.0f, 400.0f, 1030.0f},  // health
+    {720.0f, 950.0f, 1200.0f, 1050.0f}, // stamina
+    {1300.0f, 690.0f, 1920.0f, 1070.0f}, // weapon wheel
+    {60.0f, 200.0f, 620.0f, 480.0f},   // tutorial box
+}};
+
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
 // in both eyes (follows the head), with per-element size, position and eye gap. PANEL = the Build 17-20 room-fixed panel.
 enum HudMode : int {
     HudMode3D = 0,
     HudModeFlat = 1,
-    HudModePanel = 2,
+    HudModeAnchored = 2, // Build 25 (was PANEL): FLAT tuning, health / stamina / weapons / tutorial on a room-fixed panel
 };
 
 struct GroupTune {
@@ -143,7 +154,13 @@ struct HudTune {
     float depth_shift{0.0f};
     float y_sign{1.0f};
     bool log_elements{true};
-    bool hack_locked{true};
+    bool hack_locked{true}; // Build 25: kept for old ini files; the locks are now per element (locked[])
+    // Build 25: per-element lock. While locked, the menu cannot change that element's values in any HUD mode.
+    std::array<bool, GroupCount> locked{true, true, true, true, true};
+    // Build 25: mod menu sections that are collapsed (bit per MenuSection). DEVELOPER starts collapsed.
+    uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
+    // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
+    bool show_boxes{false};
     bool hud_fixed{true};    // HUD fixed in the room (Build 12, Steve's standing preference). Off = follows the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
@@ -190,8 +207,8 @@ struct HudTune {
 
     void apply_hud_mode() {
         hud_mode = std::clamp(hud_mode, 0, 2);
-        flat_test = hud_mode == HudModeFlat;
-        hud_panel = hud_mode == HudModePanel ? 1 : 0;
+        flat_test = hud_mode == HudModeFlat || hud_mode == HudModeAnchored; // ANCHORED draws the HUD exactly like FLAT
+        hud_panel = hud_mode == HudModeAnchored ? 1 : 0;                     // ... and moves the four elements to the panel
     }
 
     HudTune() {
@@ -241,11 +258,11 @@ inline const GroupTune& active_group(const HudTune& t, int g) {
 
 // The hacking circle lock protects its 3D values only.
 inline bool group_locked(const HudTune& t, int g) {
-    return g == GroupHack && t.hack_locked && !t.flat_test;
+    return g >= 0 && g < GroupCount && t.locked[g];
 }
 
 inline const char* hud_mode_name(int m) {
-    return m == HudModeFlat ? "FLAT" : (m == HudModePanel ? "PANEL" : "3D");
+    return m == HudModeFlat ? "FLAT" : (m == HudModeAnchored ? "ANCHORED" : "3D");
 }
 
 // Which element a GUI GameObject belongs to. ui2160Gui is no longer tuned: the fix pack lists it with the hacking
@@ -350,7 +367,24 @@ struct MenuRow {
     int band{0}; // 0 = mod menu settings (top), 1 = game HUD settings (below)
     std::string label{};
     std::string hint{}; // footer help line while this row is selected (headers: small tag after the title)
+    int section{-1};    // Build 25: collapsible section (MenuSection) this row belongs to; headers with one can be selected
 };
+
+// Build 25: collapsible sections of the GAME HUD band (bit numbers in HudTune::collapsed).
+enum MenuSection : int {
+    SectionView = 0,
+    SectionDeveloper = 1,
+    SectionElement0 = 2, // + Group
+};
+
+inline bool section_collapsed(uint32_t collapsed, int section) {
+    return section >= 0 && section < 32 && (collapsed & (1u << section)) != 0;
+}
+
+// A row that is not drawn because its section is collapsed (the section's own header always is).
+inline bool row_hidden(uint32_t collapsed, const MenuRow& r) {
+    return r.kind != MenuRow::Kind::Header && section_collapsed(collapsed, r.section);
+}
 
 // Pseudo-group for the HUD screen rows, and its fields.
 inline constexpr int GROUP_SCREEN = 100;
@@ -397,6 +431,7 @@ enum MenuAction : int {
     ActionToggleBlur,
     ActionToggleMasks,
     ActionToggleFlatScreen,
+    ActionToggleBoxes,
     ActionToggleHackLock,
     ActionResetGroup,
     ActionSnapshot,
@@ -687,11 +722,45 @@ private:
         build_rows();
     }
 
+    // Build 25: navigation over the rows that are showing (collapsed sections hide their rows). Collapsible headers are
+    // selectable (A = show or hide). Each row's height in its band (in row units; headers are about 1.3 rows tall, the
+    // first one in a column about 0.9) is kept for Left / Right. Called at startup, when the menu opens and on collapse.
+    void rebuild_nav(uint32_t collapsed) {
+        for (auto& n : m_nav) {
+            n.clear();
+        }
+        std::array<std::array<float, 2>, 2> ys{};
+        std::array<std::array<bool, 2>, 2> first{{{true, true}, {true, true}}};
+        m_row_y.assign(m_rows.size(), 0.0f);
+        for (int i = 0; i < (int)m_rows.size(); ++i) {
+            const auto& r = m_rows[i];
+            const int c = std::clamp(r.column, 0, 1);
+            const int bd = std::clamp(r.band, 0, 1);
+            if (row_hidden(collapsed, r)) {
+                continue;
+            }
+            if (r.kind == MenuRow::Kind::Header) {
+                const float hh = first[bd][c] ? 0.93f : 1.33f;
+                if (r.section >= 0) {
+                    m_row_y[i] = ys[bd][c] + hh * 0.5f;
+                    m_nav[c].push_back(i);
+                }
+                ys[bd][c] += hh;
+                first[bd][c] = false;
+                continue;
+            }
+            m_row_y[i] = ys[bd][c] + 0.5f;
+            ys[bd][c] += 1.0f;
+            m_nav[c].push_back(i);
+        }
+    }
+
     void build_rows() {
         m_rows.clear();
 
         int column = 0;
         int band = 0;
+        int section = -1;
         const auto add = [&](MenuRow::Kind kind, int group, int field, int action, std::string label, std::string hint) {
             MenuRow r{};
             r.kind = kind;
@@ -702,6 +771,7 @@ private:
             r.band = band;
             r.label = std::move(label);
             r.hint = std::move(hint);
+            r.section = section;
             m_rows.push_back(std::move(r));
         };
 
@@ -727,76 +797,59 @@ private:
         // ==== GAME HUD SETTINGS (lower band) ====
         // Build 11: every HUD element has its own block. The game-screen "one panel" rows are gone.
         band = 1;
+        const auto add_section = [&](int sec, std::string title) {
+            section = sec;
+            add(MenuRow::Kind::Header, -1, -1, ActionNone, std::move(title), "");
+            m_rows.back().section = sec;
+        };
         const auto add_element = [&](int g) {
-            add(MenuRow::Kind::Header, g, -1, ActionNone, GROUP_TITLES[g], g == GroupHack ? "YOUR TUNED VALUES" : "");
-
-            if (g == GroupHack) {
-                add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock the hacking circle's 3D values (FLAT values are never locked)");
-            }
-
+            add_section(SectionElement0 + g, GROUP_TITLES[g]);
+            m_rows.back().group = g;
+            add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
             add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
             add(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
             add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
             add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap",
-                "A = edit the gap between eyes. In FLAT mode, higher = the element sits closer to you");
-            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults",
-                g == GroupHack ? "A = back to the starting values for this HUD mode (3D: blocked while locked)" : "A = back to the starting values for this HUD mode");
+                "A = edit the gap between eyes. In FLAT mode, higher = closer to you (ANCHORED uses HUD distance)");
+            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = back to the starting values for this HUD mode (blocked while locked)");
         };
 
         column = 0;
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "VIEW", "");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = HUD fixed in the room (default), or HUD follows your head");
-        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
-            "A = WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
+        add_section(SectionView, "VIEW");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
-            "A = FLAT (game HUD as on a monitor, follows your head), PANEL (room-fixed panel test) or 3D (older placement)");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Width of the HUD panel (degrees)");
+            "A = FLAT (follows your head), ANCHORED (health, stamina, weapons, tutorial fixed in the room) or 3D (older)");
+        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
-            "A = edit. How far away the HUD panel sits (meters). Its size in view stays the same");
+            "A = edit. How far away the anchored HUD sits (meters). Its size in view stays the same");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Size of the anchored HUD (degrees wide)");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
+        add_element(GroupHealth);
+        add_element(GroupStamina);
+        add_section(SectionDeveloper, "DEVELOPER");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
+            "A = ANCHORED: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGluedHud, "Glued HUD",
-            "A = REMOVED (health, stamina, weapons, tutorial only on the HUD panel) or SHOWN (also stuck to your view)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
-            "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+            "A = ANCHORED: REMOVED (elements only on the room-fixed panel) or SHOWN (also stuck to your view)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleFlatScreen, "FLAT 3D panels",
             "A = FLAT mode: SCREEN (3D panels drawn as flat screen pieces, like their bars and text) or WORLD (Builds 21-23)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBlur, "Frosted glass",
             "A = FLAT mode: hide or show the blurred glass behind HUD elements (it does not follow size and position)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = 3D mode: HUD fixed in the room, or follows your head");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
+            "A = 3D mode: WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
-            "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
-        add_element(GroupHealth);
-        add_element(GroupStamina);
+            "A = 3D mode: element center (keeps it in place) or panel origin (old behaviour)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
+            "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
 
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
         add_element(GroupTutorial);
 
-        // Navigation: each column's selectable rows top to bottom through both bands, with each row's height in its
-        // band (in row units; headers are about 1.3 rows tall, the first one in a column about 0.9) for Left / Right.
-        for (auto& n : m_nav) {
-            n.clear();
-        }
-        std::array<std::array<float, 2>, 2> ys{};
-        std::array<std::array<bool, 2>, 2> first{{{true, true}, {true, true}}};
-        m_row_y.assign(m_rows.size(), 0.0f);
-        for (int i = 0; i < (int)m_rows.size(); ++i) {
-            const auto& r = m_rows[i];
-            const int c = std::clamp(r.column, 0, 1);
-            const int bd = std::clamp(r.band, 0, 1);
-            if (r.kind == MenuRow::Kind::Header) {
-                ys[bd][c] += first[bd][c] ? 0.93f : 1.33f;
-                first[bd][c] = false;
-                continue;
-            }
-            m_row_y[i] = ys[bd][c] + 0.5f;
-            ys[bd][c] += 1.0f;
-            m_nav[c].push_back(i);
-        }
-
+        rebuild_nav(HudTune{}.collapsed);
         menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
     }
 
@@ -832,7 +885,9 @@ private:
         s += fmt::format("depth_shift={:.4f}\n", t.depth_shift);
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
-        s += fmt::format("hack_locked={}\n", t.hack_locked ? 1 : 0);
+        s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial).\n";
+        s += fmt::format("collapsed={}\n", t.collapsed);
+        s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
@@ -869,6 +924,7 @@ private:
             s += fmt::format("{}.x={:.2f}\n", GROUP_KEYS[g], gt.x);
             s += fmt::format("{}.y={:.2f}\n", GROUP_KEYS[g], gt.y);
             s += fmt::format("{}.gap={:.2f}\n", GROUP_KEYS[g], gt.gap);
+            s += fmt::format("{}.locked={}\n", GROUP_KEYS[g], t.locked[g] ? 1 : 0);
             const auto& ft = t.flat_groups[g];
             s += fmt::format("{}.flat_size={:.4f}\n", GROUP_KEYS[g], ft.size);
             s += fmt::format("{}.flat_x={:.2f}\n", GROUP_KEYS[g], ft.x);
@@ -999,7 +1055,9 @@ private:
                 else if (key == "depth_shift") t->depth_shift = std::clamp(val, -1.0f, 1.0f);
                 else if (key == "y_sign") t->y_sign = val < 0.0f ? -1.0f : 1.0f;
                 else if (key == "log_elements") t->log_elements = val != 0.0f;
-                else if (key == "hack_locked") t->hack_locked = val != 0.0f;
+                else if (key == "hack_locked") { t->hack_locked = val != 0.0f; t->locked[GroupHack] = t->hack_locked; } // old files
+                else if (key == "collapsed") t->collapsed = (uint32_t)std::max(0.0f, val);
+                else if (key == "show_boxes") t->show_boxes = val != 0.0f;
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
@@ -1051,6 +1109,10 @@ private:
                     continue;
                 }
 
+                if (rest == "locked" && !is_invert) {
+                    t->locked[g] = val != 0.0f;
+                    continue;
+                }
                 const bool flat_key = rest.size() > 5 && rest.substr(0, 5) == "flat_";
                 if (flat_key) {
                     rest = rest.substr(5);
@@ -1088,9 +1150,9 @@ private:
                 const auto& gt = active_group(*t, g);
                 desc += fmt::format(" {}(size={:.3f} x={:.0f} y={:.0f} gap={:.0f})", GROUP_KEYS[g], gt.size, gt.x, gt.y, gt.gap);
             }
-            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} hack_locked={} hud_fixed={} companion_mode={} "
+            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} locks={}{}{}{}{} hud_fixed={} companion_mode={} "
                 "engine_overlay={} glued_hud_removed={} hide_ghost={} | {} values:{}",
-                file_version, hud_mode_name(t->hud_mode), t->hack_locked, t->hud_fixed, t->companion_mode, t->engine_overlay,
+                file_version, hud_mode_name(t->hud_mode), (int)t->locked[0], (int)t->locked[1], (int)t->locked[2], (int)t->locked[3], (int)t->locked[4], t->hud_fixed, t->companion_mode, t->engine_overlay,
                 t->glued_hud_removed, t->hide_ghost, hud_mode_name(t->hud_mode), desc);
         }
 
@@ -1259,6 +1321,11 @@ private:
             } else {
                 recenter_if_far = true;
                 menu_place_requested = true;
+                rebuild_nav(copy_current()->collapsed);
+                const int s0 = menu_selected.load();
+                if (s0 < 0 || s0 >= (int)m_rows.size() || row_hidden(copy_current()->collapsed, m_rows[s0])) {
+                    menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
+                }
             }
             spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
             play_click(true);
@@ -1328,6 +1395,18 @@ private:
             return;
         }
 
+        if (vk == VK_RETURN && row.kind == MenuRow::Kind::Header) {
+            if (row.section < 0) {
+                return;
+            }
+            t->collapsed ^= (1u << row.section);
+            commit(t);
+            rebuild_nav(t->collapsed);
+            spdlog::info("[PragmataVR] Menu: section {} {}", row.label, section_collapsed(t->collapsed, row.section) ? "hidden" : "shown");
+            play_click(true);
+            return;
+        }
+
         if (vk == VK_RETURN) {
             switch (row.kind) {
             case MenuRow::Kind::Value: {
@@ -1376,6 +1455,11 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: fixed HUD direction {}", t->lock_invert ? "flipped" : "normal");
                     play_click(true);
+                } else if (row.action == ActionToggleBoxes) {
+                    t->show_boxes = !t->show_boxes;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: element boxes {}", t->show_boxes ? "shown" : "hidden");
+                    play_click(true);
                 } else if (row.action == ActionToggleFlatScreen) {
                     t->flat_screen = !t->flat_screen;
                     commit(t);
@@ -1422,9 +1506,13 @@ private:
                     spdlog::info("[PragmataVR] Menu: size grows from {}", t->scale_about_center ? "element center" : "panel origin");
                     play_click(true);
                 } else if (row.action == ActionToggleHackLock) {
-                    t->hack_locked = !t->hack_locked;
+                    const int lg = std::clamp(row.group, 0, (int)GroupCount - 1);
+                    t->locked[lg] = !t->locked[lg];
+                    if (lg == GroupHack) {
+                        t->hack_locked = t->locked[lg];
+                    }
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: hacking circle {}", t->hack_locked ? "locked" : "unlocked");
+                    spdlog::info("[PragmataVR] Menu: {} {}", GROUP_KEYS[lg], t->locked[lg] ? "locked" : "unlocked");
                     play_click(true);
                 }
                 return;
@@ -1698,6 +1786,41 @@ inline MenuQuadPlacement hud_panel_placement(const HudTune& t, const HudTuning::
     out.position = anchor.pos + glm::vec3{r * glm::vec4{0.0f, 0.0f, -dist, 0.0f}};
     out.width_m = width_m;
     out.height_m = image_w_px > 0.0f ? width_m * image_h_px / image_w_px : width_m;
+    return out;
+}
+
+// Build 25: the ANCHORED element areas in UI buffer pixels (w x h). Screen views fit the 16:9 canvas into the buffer
+// width, centered vertically (checked against the Build 17-18 measurements). Each area gets the element's FLAT size
+// (around FLAT_PIVOTS) and position; the eye gap is not used in ANCHORED.
+struct AnchoredBox {
+    int group{0};
+    long x0{0}, y0{0}, x1{0}, y1{0};
+};
+
+inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h) {
+    std::vector<AnchoredBox> out{};
+    const float s = (std::min)(w / 1920.0f, h / 1080.0f);
+    const float ox = (w - 1920.0f * s) * 0.5f;
+    const float oy = (h - 1080.0f * s) * 0.5f;
+    for (int g = GroupHealth; g <= GroupTutorial; ++g) {
+        const auto& b = FLAT_BOXES[g];
+        const auto& gt = t.flat_groups[g];
+        const float px = FLAT_PIVOTS[g][0];
+        const float py = FLAT_PIVOTS[g][1];
+        const float cx0 = px + gt.size * (b[0] - px) + gt.x;
+        const float cy0 = py + gt.size * (b[1] - py) + gt.y;
+        const float cx1 = px + gt.size * (b[2] - px) + gt.x;
+        const float cy1 = py + gt.size * (b[3] - py) + gt.y;
+        AnchoredBox a{};
+        a.group = g;
+        a.x0 = (long)std::clamp(ox + s * (std::min)(cx0, cx1), 0.0f, w);
+        a.y0 = (long)std::clamp(oy + s * (std::min)(cy0, cy1), 0.0f, h);
+        a.x1 = (long)std::clamp(ox + s * (std::max)(cx0, cx1), 0.0f, w);
+        a.y1 = (long)std::clamp(oy + s * (std::max)(cy0, cy1), 0.0f, h);
+        if (a.x1 > a.x0 + 1 && a.y1 > a.y0 + 1) {
+            out.push_back(a);
+        }
+    }
     return out;
 }
 

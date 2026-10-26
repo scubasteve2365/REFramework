@@ -437,9 +437,43 @@ struct PragmataHudPanel {
     std::vector<XrSwapchainImageD3D12KHR> images{};
     std::vector<std::unique_ptr<d3d12::CommandContext>> cmds{};
     bool failed{false};
+    // Build 25: the panel image, built from the element areas only (everything else transparent), plus box outlines.
+    Microsoft::WRL::ComPtr<ID3D12Resource> comp{};
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> comp_heap{};
 };
 
 PragmataHudPanel g_pragmata_hud{};
+
+bool pragmata_ensure_comp(PragmataHudPanel& p) {
+    if (p.comp != nullptr) {
+        const auto d = p.comp->GetDesc();
+        if ((int32_t)d.Width == p.src_w && (int32_t)d.Height == p.src_h && d.Format == p.src_format) {
+            return true;
+        }
+        p.comp.Reset();
+    }
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    D3D12_RESOURCE_DESC d = p.src->GetDesc();
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.comp)))) {
+        spdlog::error("[PragmataVR] ANCHORED: could not create the panel image");
+        return false;
+    }
+    if (p.comp_heap == nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1;
+        if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p.comp_heap)))) {
+            p.comp.Reset();
+            return false;
+        }
+    }
+    device->CreateRenderTargetView(p.comp.Get(), nullptr, p.comp_heap->GetCPUDescriptorHandleForHeapStart());
+    spdlog::info("[PragmataVR] ANCHORED: panel image ready, {} x {}", p.src_w, p.src_h);
+    return true;
+}
 
 // Called on left-eye frames from on_frame, while the UI buffer still holds this frame's UI.
 void pragmata_capture_ui_buffer(VR* vr) {
@@ -653,7 +687,71 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     auto& cmds = *p.cmds[index];
     cmds.wait(INFINITE);
     p.src_cmds.wait(INFINITE); // the capture copy must be finished
-    cmds.copy(p.src.Get(), p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    // Build 25: the panel shows only the element areas (the same areas cleared from the eye images), so the hacking
+    // circle and enemy markers stay in the eyes only. Show element boxes adds a cyan outline around each area.
+    if (pragmata_ensure_comp(p)) {
+        std::vector<D3D12_RECT> rects{};
+        {
+            std::scoped_lock _{pragmata_trace::g_rects_mtx};
+            rects = pragmata_trace::g_rects;
+        }
+        std::scoped_lock _{cmds.mtx};
+        auto cl = cmds.cmd_list.Get();
+        const auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER br{};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = r;
+            br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            br.Transition.StateBefore = a;
+            br.Transition.StateAfter = b;
+            cl->ResourceBarrier(1, &br);
+        };
+        const auto rtv = p.comp_heap->GetCPUDescriptorHandleForHeapStart();
+        const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+
+        tr(p.comp.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cl->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        tr(p.comp.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        tr(p.src.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = p.src.Get();
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = p.comp.Get();
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        for (const auto& r : rects) {
+            D3D12_BOX box{(UINT)r.left, (UINT)r.top, 0u, (UINT)r.right, (UINT)r.bottom, 1u};
+            cl->CopyTextureRegion(&dst_loc, (UINT)r.left, (UINT)r.top, 0, &src_loc, &box);
+        }
+        tr(p.src.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+
+        if (tune->show_boxes && !rects.empty()) {
+            tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            const float cyan[4]{0.0f, 0.85f, 0.9f, 1.0f};
+            std::vector<D3D12_RECT> lines{};
+            const LONG th = 6;
+            for (const auto& r : rects) {
+                lines.push_back(D3D12_RECT{r.left, r.top, r.right, (std::min)(r.top + th, r.bottom)});
+                lines.push_back(D3D12_RECT{r.left, (std::max)(r.bottom - th, r.top), r.right, r.bottom});
+                lines.push_back(D3D12_RECT{r.left, r.top, (std::min)(r.left + th, r.right), r.bottom});
+                lines.push_back(D3D12_RECT{(std::max)(r.right - th, r.left), r.top, r.right, r.bottom});
+            }
+            cl->ClearRenderTargetView(rtv, cyan, (UINT)lines.size(), lines.data());
+            tr(p.comp.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        } else {
+            tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        }
+
+        tr(p.images[index].texture, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(p.images[index].texture, p.comp.Get());
+        tr(p.images[index].texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        cmds.has_commands = true;
+    } else {
+        cmds.copy(p.src.Get(), p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    }
     cmds.execute();
 
     XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -748,6 +846,27 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             pragmata_trace::g_intercept = t->enabled && t->hud_panel;
             pragmata_trace::g_erase = t->enabled && t->hud_panel && t->glued_hud_removed;
             pragmata_trace::update_ui_rtv(vr->uiBufferTex[0]);
+
+            // Build 25: ANCHORED element areas, from the FLAT tuning, every frame (they follow the menu edits).
+            if (t->enabled && t->hud_panel && vr->uiBufferTex[0] != nullptr) {
+                const auto d = vr->uiBufferTex[0]->GetDesc();
+                const auto boxes = pragmatavr::anchored_boxes_px(*t, (float)d.Width, (float)d.Height);
+                std::vector<D3D12_RECT> rects{};
+                for (const auto& b : boxes) {
+                    rects.push_back(D3D12_RECT{(LONG)b.x0, (LONG)b.y0, (LONG)b.x1, (LONG)b.y1});
+                }
+                static std::string last_desc{};
+                std::string desc{};
+                for (const auto& b : boxes) {
+                    desc += fmt::format(" {}({},{})-({},{})", pragmatavr::GROUP_KEYS[b.group], b.x0, b.y0, b.x1, b.y1);
+                }
+                if (desc != last_desc) {
+                    last_desc = desc;
+                    spdlog::info("[PragmataVR] ANCHORED areas in the {} x {} UI buffer:{}", d.Width, d.Height, desc);
+                }
+                std::scoped_lock _{pragmata_trace::g_rects_mtx};
+                pragmata_trace::g_rects = std::move(rects);
+            }
         }
         pragmata_trace::report_redirects();
 
