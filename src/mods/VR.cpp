@@ -632,6 +632,52 @@ bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* r
     }
 
 #if defined(PRAGMATA)
+    // PragmataVR Build 18: log the overlay layer's render target setup (with a snapshot), to compare with the GPU trace.
+    if (pragmatavr::HudTuning::get().dump_engine_targets.exchange(false)) {
+        const auto ui = uiBufferTex[0];
+        const auto res_name = [&](sdk::renderer::TargetState* ts) {
+            std::string out{};
+            if (ts == nullptr) {
+                return std::string{"null"};
+            }
+            const auto n = ts->get_rtv_count();
+            out += fmt::format("{} rtv", n);
+            for (uint32_t i = 0; i < n && i < 8; ++i) {
+                auto rtv = ts->get_rtv((int32_t)i);
+                ID3D12Resource* r = nullptr;
+                if (rtv != nullptr) {
+                    auto& tex = rtv->get_texture_d3d12();
+                    if (tex != nullptr) {
+                        auto c = tex->get_d3d12_resource_container();
+                        r = c != nullptr ? c->get_native_resource() : nullptr;
+                    }
+                }
+                out += fmt::format(" [{}:{}{}]", i, r == ui && r != nullptr ? "UIBUF " : "", fmt::ptr(r));
+            }
+            return out;
+        };
+
+        std::string fields{};
+        auto td = utility::re_managed_object::get_type_definition(layer);
+        if (td != nullptr) {
+            for (auto f : td->get_fields()) {
+                if (f == nullptr) continue;
+                auto ft = f->get_type();
+                const std::string fname = f->get_name() != nullptr ? f->get_name() : "?";
+                const std::string tname = ft != nullptr ? ft->get_full_name() : "?";
+                if (tname.find("TargetState") == std::string::npos && fname.find("Target") == std::string::npos) continue;
+                fields += fmt::format("\n  field {} ({})", fname, tname);
+                if (tname.find("TargetState") != std::string::npos) {
+                    auto ts = layer->get_target_state(fname);
+                    fields += ": " + res_name(ts);
+                }
+            }
+        }
+        spdlog::info("[PragmataVR] Overlay layer {}: main {} | UITarget {} | context target {}{}", fmt::ptr(layer),
+            res_name(layer->get_main_target_state().get()), res_name(layer->get_ui_target()),
+            render_ctx != nullptr ? res_name(((sdk::renderer::RenderContext*)render_ctx)->get_render_target()) : std::string{"none"}, fields);
+    }
+
     // PragmataVR Build 17 test: force the engine's overlay layer draw off or on (Engine UI blend in the mod menu).
     {
         const auto t = pragmatavr::HudTuning::get().tune();
@@ -3553,7 +3599,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 17");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 18");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3640,7 +3686,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 17"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 17");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 18"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 18");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);

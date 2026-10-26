@@ -14,6 +14,7 @@
 #include <../../directxtk12-src/Inc/ScreenGrab.h>
 #include <../../directxtk12-src/Inc/DescriptorHeap.h>
 #include "PragmataHud.hpp"
+#include "PragmataGpuTrace.hpp"
 
 namespace {
 // PragmataVR: copies the VR mod menu (drawn by ImGui into REFramework's IMGUI render target) into the
@@ -717,6 +718,33 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto frame_count = vr->m_render_frame_count;
 
 #if defined(PRAGMATA)
+    // PragmataVR Build 18: GPU trace around snapshots (see PragmataGpuTrace.hpp).
+    {
+        auto& hud = pragmatavr::HudTuning::get();
+        static int trace_frames_left = 0;
+        pragmata_trace::install(g_framework->get_d3d12_hook()->get_device());
+        pragmata_trace::g_ui_buffer = vr->uiBufferTex[0];
+
+        if (hud.trace_requested.exchange(false) && !pragmata_trace::g_active.load()) {
+            {
+                std::scoped_lock _{pragmata_trace::g_events_mtx};
+                pragmata_trace::g_events.clear();
+                pragmata_trace::g_last_event.clear();
+            }
+            pragmata_trace::g_frame = 0;
+            pragmata_trace::g_active = true;
+            trace_frames_left = 2;
+            hud.dump_engine_targets = true;
+            spdlog::info("[PragmataVR] GPU trace started for two eye frames");
+        } else if (pragmata_trace::g_active.load()) {
+            pragmata_trace::g_frame++;
+            if (--trace_frames_left <= 0) {
+                pragmata_trace::g_active = false;
+                pragmata_trace::dump(backbuffer.Get());
+            }
+        }
+    }
+
     // PragmataVR Build 17: capture the UI buffer for the HUD panel (left-eye frames).
     if ((frame_count % 2) == vr->m_left_eye_interval) {
         pragmata_capture_ui_buffer(vr);
@@ -1259,10 +1287,18 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
 #if defined(PRAGMATA)
                 // Never let the menu layer cost the game its frames: drop it and use the eye-image fallback.
+                // Build 18: the runtime rejects some frames while VR starts up whatever layers are sent (Build 17 blamed the
+                // HUD panel for those and switched it off for good). Drop the HUD panel for this retry, and give up on it
+                // only if frames keep being rejected while it is shown.
+                static int hud_rejections = 0;
                 if (vr->m_openxr->hud_quad.visible) {
-                    spdlog::error("[PragmataVR] Runtime rejected the HUD panel layer; HUD panel turned off");
                     vr->m_openxr->hud_quad.visible = false;
-                    g_pragmata_hud.failed = true;
+                    if (++hud_rejections >= 120) {
+                        spdlog::error("[PragmataVR] Runtime keeps rejecting frames with the HUD panel layer; HUD panel turned off");
+                        g_pragmata_hud.failed = true;
+                    } else if (hud_rejections == 1 || hud_rejections % 30 == 0) {
+                        spdlog::warn("[PragmataVR] Frame rejected while the HUD panel was shown ({} so far); retrying without it", hud_rejections);
+                    }
                 } else if (vr->m_openxr->menu_quad.visible) {
                     spdlog::error("[PragmataVR] Runtime rejected the menu quad layer; switching to the eye-image menu");
                     vr->m_openxr->menu_quad.visible = false;

@@ -549,6 +549,8 @@ public:
     std::atomic<bool> snapshot_left_done{false};
     std::atomic<bool> snapshot_right_done{false};
     std::atomic<bool> snapshot_ui_done{false};
+    std::atomic<bool> trace_requested{false};     // Build 18: GPU trace for the next two eye frames
+    std::atomic<bool> dump_engine_targets{false}; // Build 18: log the overlay layer's render target setup once
     std::string snapshot_stem{};
 
     static std::filesystem::path data_dir() {
@@ -1101,6 +1103,7 @@ private:
         snapshot_left_done = false;
         snapshot_right_done = false;
         snapshot_ui_done = false;
+        trace_requested = true;
 
         std::error_code ec{};
         std::filesystem::create_directories(data_dir() / "snapshots", ec);
