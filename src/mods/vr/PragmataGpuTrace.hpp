@@ -69,6 +69,16 @@ inline std::atomic<uint64_t> g_ui_rtv_creates{0};
 
 inline constexpr size_t MAX_EVENTS = 4000;
 
+// Build 20 UI buffer hand-off state (see barrier()).
+inline std::atomic<ID3D12Resource*> g_capture{nullptr};   // HUD panel source, kept in D3D12_RESOURCE_STATE_COMMON
+inline std::atomic<bool> g_intercept{false};               // HUD panel mode on: capture at the hand-off
+inline std::atomic<bool> g_erase{false};                   // Glued HUD REMOVED: clear the element areas after the copy
+inline std::atomic<uint64_t> g_ui_rtv{0};                  // our own RTV of the UI buffer (for the clear)
+inline std::atomic<uint64_t> g_handoffs{0};                // hand-offs seen (all time)
+inline std::atomic<uint64_t> g_handoffs_window{0};         // hand-offs in the current 10 s report window
+inline std::mutex g_rects_mtx{};
+inline std::vector<D3D12_RECT> g_rects{};                  // element areas in UI buffer pixels
+
 // Build 19: the Glued HUD removal. When a render target set binds the UI buffer together with other targets (the
 // engine writing a UI draw into the eye image and the UI buffer at once), the other targets are swapped for throwaway
 // textures of the same size and format, so that UI reaches only the UI buffer.
@@ -345,14 +355,6 @@ inline void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* self, ID3
 // the buffer still holds the whole UI, it is copied to g_capture (the HUD panel's source) and the HUD elements' areas
 // are cleared from it (g_erase), so they reach the HUD panel but not the eye images. Recorded on the engine's own
 // command list, so it runs at exactly that point in the frame.
-inline std::atomic<ID3D12Resource*> g_capture{nullptr};   // HUD panel source, kept in D3D12_RESOURCE_STATE_COMMON
-inline std::atomic<bool> g_intercept{false};               // HUD panel mode on: capture at the hand-off
-inline std::atomic<bool> g_erase{false};                   // Glued HUD REMOVED: clear the element areas after the copy
-inline std::atomic<uint64_t> g_ui_rtv{0};                  // our own RTV of the UI buffer (for the clear)
-inline std::atomic<uint64_t> g_handoffs{0};                // hand-offs seen (all time)
-inline std::atomic<uint64_t> g_handoffs_window{0};         // hand-offs in the current 10 s report window
-inline std::mutex g_rects_mtx{};
-inline std::vector<D3D12_RECT> g_rects{};                  // element areas in UI buffer pixels
 
 inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     auto original = g_barrier_hook->get_original<decltype(barrier)>();
