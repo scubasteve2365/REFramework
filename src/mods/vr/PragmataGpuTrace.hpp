@@ -79,6 +79,20 @@ inline std::atomic<uint64_t> g_handoffs_window{0};         // hand-offs in the c
 inline std::mutex g_rects_mtx{};
 inline std::vector<D3D12_RECT> g_rects{};                  // element areas in UI buffer pixels
 
+// Build 26: the engine hands out a different UI buffer texture from frame to frame (a pool). The overlay layer hook
+// (VR::on_pre_overlay_layer_draw) reports each one as it is handed out (note_ui_buffer); the last few are remembered
+// and any of them counts as the UI buffer at a hand-off. Each gets its own RTV (slot) for the erase.
+inline constexpr int UI_RECENT = 8;
+inline std::mutex g_ui_mtx{};
+inline std::array<ID3D12Resource*, UI_RECENT> g_ui_recent{};
+inline std::array<uint64_t, UI_RECENT> g_ui_recent_rtv{};  // our RTV for each remembered buffer (0 = not made yet)
+inline int g_ui_recent_next{0};
+inline std::atomic<uint64_t> g_ui_notes_window{0};         // overlay hook reports in the 10 s window
+inline std::atomic<uint64_t> g_ui_new_window{0};           // reports of a buffer not seen among the recent ones
+inline std::atomic<uint64_t> g_handoff_current_window{0};  // hand-offs of the buffer reported last
+inline std::atomic<uint64_t> g_handoff_older_window{0};    // hand-offs of an older remembered buffer
+inline std::atomic<uint64_t> g_handoff_skipped_window{0};  // hand-offs not captured (size differs from the capture)
+
 // Build 19: the Glued HUD removal. When a render target set binds the UI buffer together with other targets (the
 // engine writing a UI draw into the eye image and the UI buffer at once), the other targets are swapped for throwaway
 // textures of the same size and format, so that UI reaches only the UI buffer.
@@ -166,12 +180,18 @@ inline void report_redirects() {
     const auto u = g_ui_unknown_sets.exchange(0);
     const auto m = g_ui_mrt_sets.exchange(0);
     const auto ho = g_handoffs_window.exchange(0);
+    const auto notes = g_ui_notes_window.exchange(0);
+    const auto fresh = g_ui_new_window.exchange(0);
+    const auto cur = g_handoff_current_window.exchange(0);
+    const auto older = g_handoff_older_window.exchange(0);
+    const auto skipped = g_handoff_skipped_window.exchange(0);
     static int reports = 0;
     if (reports < 60) {
         ++reports;
-        spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}), erase {}; UI-buffer target sets: {} with other "
+        spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}; {} of the buffer reported last, {} of an older one, "
+            "{} not captured), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
             "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
-            g_erase.load() ? "on" : "off", m, a, u);
+            cur, older, skipped, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
     }
 }
 
@@ -356,24 +376,98 @@ inline void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* self, ID3
 // are cleared from it (g_erase), so they reach the HUD panel but not the eye images. Recorded on the engine's own
 // command list, so it runs at exactly that point in the frame.
 
+// Build 26: the RTV slot heap for the remembered UI buffers.
+inline Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_ui_rtv_heap{};
+inline UINT g_ui_rtv_step{0};
+
+// Called from the overlay layer hook with the UI buffer the engine is handing out right now.
+inline void note_ui_buffer(ID3D12Resource* r) {
+    if (r == nullptr) {
+        return;
+    }
+    g_ui_notes_window++;
+    g_ui_buffer = r;
+    std::scoped_lock _{g_ui_mtx};
+    for (auto x : g_ui_recent) {
+        if (x == r) {
+            return;
+        }
+    }
+    g_ui_new_window++;
+    const int slot = g_ui_recent_next;
+    g_ui_recent_next = (g_ui_recent_next + 1) % UI_RECENT;
+    g_ui_recent[slot] = r;
+    g_ui_recent_rtv[slot] = 0; // made on first use (the device may not be known yet)
+}
+
+// The remembered buffer this resource is, with its RTV (made on demand). Returns false if it is not a UI buffer.
+inline bool find_ui_buffer(ID3D12Resource* r, uint64_t& rtv) {
+    std::scoped_lock _{g_ui_mtx};
+    for (int i = 0; i < UI_RECENT; ++i) {
+        if (g_ui_recent[i] != r) {
+            continue;
+        }
+        if (g_ui_recent_rtv[i] == 0 && g_device != nullptr) {
+            if (g_ui_rtv_heap == nullptr) {
+                D3D12_DESCRIPTOR_HEAP_DESC hd{};
+                hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                hd.NumDescriptors = UI_RECENT;
+                if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ui_rtv_heap)))) {
+                    g_ui_rtv_heap.Reset();
+                }
+                g_ui_rtv_step = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+            }
+            if (g_ui_rtv_heap != nullptr) {
+                auto h = g_ui_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+                h.ptr += (SIZE_T)i * g_ui_rtv_step;
+                if (g_create_rtv_hook != nullptr) {
+                    g_create_rtv_hook->get_original<decltype(create_rtv)>()(g_device, r, nullptr, h);
+                } else {
+                    g_device->CreateRenderTargetView(r, nullptr, h);
+                }
+                g_ui_recent_rtv[i] = (uint64_t)h.ptr;
+            }
+        }
+        rtv = g_ui_recent_rtv[i];
+        return true;
+    }
+    return false;
+}
+
 inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     auto original = g_barrier_hook->get_original<decltype(barrier)>();
-    auto ui = g_ui_buffer.load();
 
-    if (g_intercept.load() && ui != nullptr && b != nullptr) {
+    if (g_intercept.load() && b != nullptr) {
         bool handoff = false;
-        for (UINT i = 0; i < n; ++i) {
+        ID3D12Resource* ui = nullptr;
+        uint64_t ui_rtv = 0;
+        for (UINT i = 0; i < n && !handoff; ++i) {
             const auto& t = b[i];
-            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && t.Transition.pResource == ui &&
-                t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && t.Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && t.Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET &&
+                find_ui_buffer(t.Transition.pResource, ui_rtv)) {
                 handoff = true;
+                ui = t.Transition.pResource;
             }
         }
 
         if (handoff) {
             g_handoffs++;
             g_handoffs_window++;
+            if (ui == g_ui_buffer.load()) {
+                g_handoff_current_window++;
+            } else {
+                g_handoff_older_window++;
+            }
             auto cap = g_capture.load();
+            if (cap != nullptr) {
+                const auto dc = cap->GetDesc();
+                const auto du = ui->GetDesc();
+                if (dc.Width != du.Width || dc.Height != du.Height || dc.Format != du.Format) {
+                    cap = nullptr; // a UI buffer of another size (menus at the desktop size): not for the panel
+                    g_handoff_skipped_window++;
+                }
+            }
             if (cap != nullptr) {
                 D3D12_RESOURCE_BARRIER pre[2]{};
                 pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -400,7 +494,7 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                 original(self, 2, post);
             }
 
-            const auto rtv = g_ui_rtv.load();
+            const auto rtv = ui_rtv;
             if (g_erase.load() && rtv != 0) {
                 std::vector<D3D12_RECT> rects{};
                 {

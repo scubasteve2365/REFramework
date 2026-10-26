@@ -295,6 +295,10 @@ enum CompanionMode : int {
     CompanionHidden = 2,      // not drawn (test)
 };
 
+// Build 26: set by D3D12Component (pragmata_trace::note_ui_buffer); VR's overlay layer hook reports each UI buffer the
+// engine hands out through it.
+inline std::atomic<void (*)(void*)> g_note_ui_buffer{nullptr};
+
 inline thread_local size_t g_current_gui_hash = 0;
 inline thread_local std::string g_current_gui_name{};
 

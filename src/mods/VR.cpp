@@ -623,6 +623,12 @@ bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* r
     {
         if (parent_layer == scene_layers[i]) {
             uiBufferTex[i] = layer->get_ui_buffer_tex_d3d12();
+#if defined(PRAGMATA)
+            // Build 26: the engine hands out a different UI buffer from frame to frame; tell the hand-off hook now.
+            if (auto note = pragmatavr::g_note_ui_buffer.load(); note != nullptr) {
+                note((void*)uiBufferTex[i]);
+            }
+#endif
         }
     }
 
@@ -3590,7 +3596,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 25");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 26");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3678,7 +3684,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 25"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 25");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 26"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 26");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
