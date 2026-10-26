@@ -124,6 +124,7 @@ struct HudTune {
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
+    bool flat_test{false}; // Build 16 test: the 3D HUD drawn with the game's own flat projection, companions left flat
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
     // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
@@ -306,6 +307,7 @@ enum MenuAction : int {
     ActionSnapshot,
     ActionToggleScaleCenter,
     ActionToggleCompanion,
+    ActionToggleFlatTest,
     ActionSnapshotSeries,
     ActionClose,
 };
@@ -538,6 +540,7 @@ public:
     std::atomic<int> snapshot_frames_left{0};
     std::atomic<bool> snapshot_left_done{false};
     std::atomic<bool> snapshot_right_done{false};
+    std::atomic<bool> snapshot_ui_done{false};
     std::string snapshot_stem{};
 
     static std::filesystem::path data_dir() {
@@ -645,6 +648,8 @@ private:
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
             "A = WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleFlatTest, "Flat HUD test",
+            "A = test only: draw the HUD flat like on a monitor, then take a snapshot series");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
             "A = edit. How far away the room-fixed HUD sits (meters). Sizes look the same at any distance");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
@@ -721,6 +726,8 @@ private:
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
+        s += "# flat_test = 1: test only, the HUD is drawn flat as on a monitor (for the HUD capture test).\n";
+        s += fmt::format("flat_test={}\n", t.flat_test ? 1 : 0);
         s += "# screen.distance = HUD distance in meters (the room-fixed HUD is shown as a panel this far in front of you).\n";
         s += fmt::format("screen.distance={:.2f}\n", t.screen[ScreenDistance]);
         s += "# menu.distance in meters, menu.scale = text size (1.00 = 100%), menu.pitch in degrees,\n";
@@ -866,6 +873,7 @@ private:
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
                 else if (key == "companion_mode") t->companion_mode = std::clamp((int)val, 0, 2);
+                else if (key == "flat_test") t->flat_test = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1069,6 +1077,7 @@ private:
         snapshot_stem = fmt::format("snapshot_{}", secs);
         snapshot_left_done = false;
         snapshot_right_done = false;
+        snapshot_ui_done = false;
 
         std::error_code ec{};
         std::filesystem::create_directories(data_dir() / "snapshots", ec);
@@ -1222,6 +1231,11 @@ private:
                     t->hide_ghost = !t->hide_ghost;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
+                    play_click(true);
+                } else if (row.action == ActionToggleFlatTest) {
+                    t->flat_test = !t->flat_test;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: flat HUD test {}", t->flat_test ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleCompanion) {
                     t->companion_mode = (t->companion_mode + 1) % 3;

@@ -526,10 +526,64 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
+            // Build 16: also copy the engine's UI buffers (the HUD drawn on its own, with transparency, before it is
+            // mixed into the scene; PureDark's fork reads them for frame warp). Copied on the left-eye frame.
+            static std::array<ComPtr<ID3D12Resource>, 2> ui_tex{};
+            static std::array<bool, 2> ui_ok{};
+            if (left && !hud.snapshot_ui_done.load()) {
+                hud.snapshot_ui_done = true;
+                auto device = g_framework->get_d3d12_hook()->get_device();
+                for (int i = 0; i < 2; ++i) {
+                    ui_ok[i] = false;
+                    auto src = vr->uiBufferTex[i];
+                    if (src == nullptr) {
+                        spdlog::info("[PragmataVR] Snapshot: UI buffer {} is not available", i);
+                        continue;
+                    }
+                    const auto d0 = src->GetDesc();
+                    spdlog::info("[PragmataVR] Snapshot: UI buffer {}: {} x {}, format {}, flags {:x}, enable_ui_fix {}", i, d0.Width, d0.Height,
+                        (int)d0.Format, (int)d0.Flags, vr->m_enable_ui_fix->value());
+                    auto& tex = ui_tex[i];
+                    if (tex == nullptr || tex->GetDesc().Width != d0.Width || tex->GetDesc().Height != d0.Height || tex->GetDesc().Format != d0.Format) {
+                        tex.Reset();
+                        D3D12_RESOURCE_DESC d = d0;
+                        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+                        D3D12_HEAP_PROPERTIES hp{};
+                        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&tex)))) {
+                            tex.Reset();
+                            continue;
+                        }
+                    }
+                    if (snap_cmds_ready) {
+                        snap_cmds.wait(INFINITE);
+                        snap_cmds.copy(src, tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                        snap_cmds.execute();
+                        snap_cmds.wait(INFINITE);
+                        ui_ok[i] = true;
+                    }
+                }
+            }
+
             if (hud.snapshot_left_done.load() && hud.snapshot_right_done.load()) {
                 hud.snapshot_frames_left = 0;
                 CoInitializeEx(nullptr, COINIT_MULTITHREADED);
                 const auto dir = pragmatavr::HudTuning::data_dir() / "snapshots";
+
+                // UI buffers: PNG with transparency if WIC can convert the format, and always the exact DDS.
+                for (int i = 0; i < 2; ++i) {
+                    if (!ui_ok[i] || ui_tex[i] == nullptr) {
+                        continue;
+                    }
+                    const auto png = dir / (hud.snapshot_stem + fmt::format("_ui{}.png", i));
+                    auto hr = DirectX::SaveWICTextureToFile(command_queue, ui_tex[i].Get(), GUID_ContainerFormatPng, png.wstring().c_str(),
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, &GUID_WICPixelFormat32bppBGRA);
+                    spdlog::info("[PragmataVR] Snapshot UI buffer {} PNG {}", i, SUCCEEDED(hr) ? "saved" : "failed");
+                    const auto dds = dir / (hud.snapshot_stem + fmt::format("_ui{}.dds", i));
+                    hr = DirectX::SaveDDSTextureToFile(command_queue, ui_tex[i].Get(), dds.wstring().c_str(),
+                        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON);
+                    spdlog::info("[PragmataVR] Snapshot UI buffer {} DDS {}", i, SUCCEEDED(hr) ? "saved" : "failed");
+                }
 
                 for (int i = 0; i < 2; ++i) {
                     if (snap_tex[i] == nullptr) {

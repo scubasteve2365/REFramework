@@ -330,6 +330,11 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
     {
         const auto tune = pragmatavr::HudTuning::get().tune();
 
+        // Build 16 test: the game's own flat projection, so the 3D HUD lands where it would on a monitor.
+        if (tune->enabled && tune->flat_test) {
+            return original_func(camera, result);
+        }
+
         if (tune->enabled && tune->layout_mode == 1) {
             // Game-screen HUD: keep the game's own flat GUI projection and map it onto a virtual screen in each eye.
             original_func(camera, result);
@@ -3348,6 +3353,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
             break;
+        case pragmatavr::ActionToggleFlatTest:
+            v.value = t.flat_test ? "ON" : "OFF";
+            v.value_color = t.flat_test ? AMBER : ACCENT;
+            break;
         case pragmatavr::ActionToggleCompanion:
             v.value = t.companion_mode == pragmatavr::CompanionWithElement ? "WITH ELEMENT" :
                       (t.companion_mode == pragmatavr::CompanionReframework ? "REFRAMEWORK" : "HIDDEN");
@@ -3517,7 +3526,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 15");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 16");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3604,7 +3613,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 15"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 15");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 16"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 16");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4332,6 +4341,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             const auto tune = pragmatavr::HudTuning::get().tune();
 
             if (cgroup >= 0 && tune->enabled) {
+                if (tune->flat_test) {
+                    return true; // Build 16 test: leave the companion flat (Screen mode), skip REFramework's sheet
+                }
                 if (tune->companion_mode == pragmatavr::CompanionHidden) {
                     return false; // test: do not draw the companion at all
                 }
@@ -4425,7 +4437,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 const auto tune = pragmatavr::HudTuning::get().tune();
                 auto pview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
 
-                if (tune->enabled && pview != nullptr &&
+                if (tune->enabled && !tune->flat_test && pview != nullptr &&
                     sdk::call_object_func<uint32_t>(pview, "get_ViewType", context, pview) == (uint32_t)via::gui::ViewType::World)
                 {
                     const auto& gt = tune->groups[group];
