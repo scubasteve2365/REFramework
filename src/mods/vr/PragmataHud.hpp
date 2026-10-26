@@ -124,7 +124,7 @@ struct HudTune {
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
-    int companion_mode{CompanionWithElement}; // Build 15: how the elements' Screen-mode companion layers are drawn
+    int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
     // HUD layout. 0 = per-element (Builds 2-6, and Build 11 onward). 1 = "game screen" (Builds 7-10): the whole 3D HUD
     // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
