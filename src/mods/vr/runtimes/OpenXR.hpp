@@ -139,6 +139,8 @@ public:
         XrExtent2Df size{1.0f, 1.0f}; // meters
         bool visible{false};
     } menu_quad{};
+    // PragmataVR Build 17: the HUD panel, another room-fixed quad (the engine's UI buffer), submitted under the menu.
+    MenuQuad hud_quad{};
 
     bool supportsEyeGazeInteraction{false};
     XrActionSet eyeGazeActionSet{NULL};

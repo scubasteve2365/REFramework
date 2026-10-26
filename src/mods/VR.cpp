@@ -631,6 +631,25 @@ bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* r
         return true;
     }
 
+#if defined(PRAGMATA)
+    // PragmataVR Build 17 test: force the engine's overlay layer draw off or on (Engine UI blend in the mod menu).
+    {
+        const auto t = pragmatavr::HudTuning::get().tune();
+        static int logged_mode = -1;
+        if (logged_mode != t->engine_overlay) {
+            logged_mode = t->engine_overlay;
+            spdlog::info("[PragmataVR] Engine overlay layer draw: {} (REFramework allow_engine_overlays = {})",
+                t->engine_overlay == 0 ? "default" : (t->engine_overlay == 1 ? "forced off" : "forced on"), m_allow_engine_overlays->value());
+        }
+        if (t->engine_overlay == 1) {
+            return false;
+        }
+        if (t->engine_overlay == 2) {
+            return true;
+        }
+    }
+#endif
+
     // NOT RE3
     // for some reason RE3 has weird issues with the overlay rendering
     // causing double vision
@@ -3326,7 +3345,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         if (row.group == pragmatavr::GROUP_SCREEN) {
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
-            v.dim = !t.hud_fixed; // HUD distance only applies to the room-fixed HUD
+            v.dim = !t.hud_panel && !t.hud_fixed; // the HUD panel rows apply to the panel and the room-fixed 3D HUD
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
@@ -3352,6 +3371,14 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             break;
         case pragmatavr::ActionToggleGhost:
             v.value = t.hide_ghost ? "HIDDEN" : "SHOWN";
+            break;
+        case pragmatavr::ActionToggleHudPanel:
+            v.value = t.hud_panel ? "PANEL" : "3D";
+            v.value_color = t.hud_panel ? ACCENT : AMBER;
+            break;
+        case pragmatavr::ActionToggleEngineOverlay:
+            v.value = t.engine_overlay == 0 ? "DEFAULT" : (t.engine_overlay == 1 ? "OFF" : "ON");
+            v.value_color = t.engine_overlay == 0 ? ACCENT : AMBER;
             break;
         case pragmatavr::ActionToggleFlatTest:
             v.value = t.flat_test ? "ON" : "OFF";
@@ -3488,7 +3515,7 @@ void VR::on_frame() {
     // ---- Measure: column widths fit every label, value and header in both bands ----
     float value_w = 0.0f;
     for (const char* s : {"GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
-             "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN", "WITH ELEMENT", "REFRAMEWORK"}) {
+             "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN", "WITH ELEMENT", "REFRAMEWORK", "DEFAULT", "PANEL"}) {
         value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
 
@@ -3526,7 +3553,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 16");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 17");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3613,7 +3640,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 16"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 16");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 17"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 17");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4333,6 +4360,44 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 #if defined(PRAGMATA)
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
+
+        // PragmataVR Build 17: HUD panel mode. Health, stamina, weapon wheel and tutorial (their 3D panels and their
+        // Screen-mode companions) are drawn flat in Screen mode, exactly as on a monitor, into the engine's UI buffer.
+        // D3D12Component copies that buffer each frame onto a room-fixed OpenXR quad. REFramework's generic
+        // Screen-to-World sheet and the per-element 3D tuning are skipped for them.
+        {
+            const auto ptune = pragmatavr::HudTuning::get().tune();
+            std::string_view pn{};
+            const int pgroup = pragmatavr::group_for(name);
+            const bool element = (pgroup >= 0 && pgroup != pragmatavr::GroupHack) || pragmatavr::companion_group(name, pn) >= 0;
+
+            if (element && ptune->enabled && ptune->hud_panel) {
+                auto v = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
+                if (v != nullptr) {
+                    const auto vt = sdk::call_object_func<uint32_t>(v, "get_ViewType", context, v);
+                    if (vt != (uint32_t)via::gui::ViewType::Screen) {
+                        PragmataPanelRestore restore{};
+                        restore.view = v;
+                        restore.companion = true; // reuse the companion restore: view type, overlay, detonemap, scale, world
+                        restore.position = sdk::call_object_func_easy<Vector4f>(v, "get_Position");
+                        restore.view_scale = sdk::call_object_func_easy<Vector4f>(v, "get_Scale");
+                        restore.view_type = vt;
+                        restore.overlay = sdk::call_object_func<bool>(v, "get_Overlay", context, v);
+                        restore.detonemap = sdk::call_object_func<bool>(v, "get_Detonemap", context, v);
+                        restore.transform = game_object->transform;
+                        restore.world = game_object->transform->worldTransform;
+                        sdk::call_object_func<void*>(v, "set_ViewType", context, v, (uint32_t)via::gui::ViewType::Screen);
+                        g_pragmata_panel_restore.push_back(std::move(restore));
+                    }
+
+                    static thread_local std::unordered_map<size_t, bool> logged_panel{};
+                    if (logged_panel.emplace(name_hash, true).second) {
+                        spdlog::info("[PragmataVR] HUD panel: {} drawn flat (was view type {})", name, vt);
+                    }
+                }
+                return true; // skip REFramework's generic sheet and the 3D tuning
+            }
+        }
 
         // PragmataVR Build 15: Screen-mode companion layers of the HUD elements (see pragmatavr::companion_group).
         {

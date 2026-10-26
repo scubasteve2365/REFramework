@@ -1534,6 +1534,7 @@ XrResult OpenXR::end_frame() {
     std::vector<XrCompositionLayerProjectionView> projection_layer_views{};
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad hud_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
 
     // we CANT push the layers every time, it cause some layer error
     // in xrEndFrame, so we must only do it when shouldRender is true
@@ -1555,6 +1556,21 @@ XrResult OpenXR::end_frame() {
         layer.viewCount = (uint32_t)projection_layer_views.size();
         layer.views = projection_layer_views.data();
         layers.push_back((XrCompositionLayerBaseHeader*)&layer);
+
+        // Room-fixed HUD panel (PragmataVR Build 17), under the menu. The UI buffer holds premultiplied alpha.
+        const auto& hq = this->hud_quad;
+        if (hq.visible && hq.swapchain != XR_NULL_HANDLE && hq.owner == this->session && hq.used_width > 0 && hq.used_height > 0) {
+            hud_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            hud_layer.space = this->stage_space;
+            hud_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            hud_layer.subImage.swapchain = hq.swapchain;
+            hud_layer.subImage.imageRect.offset = {0, 0};
+            hud_layer.subImage.imageRect.extent = {hq.used_width, hq.used_height};
+            hud_layer.subImage.imageArrayIndex = 0;
+            hud_layer.pose = hq.pose;
+            hud_layer.size = hq.size;
+            layers.push_back((XrCompositionLayerBaseHeader*)&hud_layer);
+        }
 
         // Room-fixed menu panel, composited by the runtime on top of the eye images (PragmataVR mod menu).
         const auto& mq = this->menu_quad;

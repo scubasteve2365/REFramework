@@ -124,6 +124,12 @@ struct HudTune {
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
     bool scale_about_center{true}; // Size grows each element around its own center (off = around the panel origin)
+    // Build 17: HUD panel. 1 = health, stamina, weapon wheel and tutorial are drawn flat (Screen mode, as on a monitor)
+    // into the engine's UI buffer, which is copied each frame onto a room-fixed OpenXR quad (screen.* place and size it).
+    // 0 = the Builds 11-15 3D placement.
+    int hud_panel{1};
+    // Build 17 test: the engine's overlay layer draw. 0 = REFramework's default, 1 = always skipped, 2 = always drawn.
+    int engine_overlay{0};
     bool flat_test{false}; // Build 16 test: the 3D HUD drawn with the game's own flat projection, companions left flat
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
@@ -308,6 +314,8 @@ enum MenuAction : int {
     ActionToggleScaleCenter,
     ActionToggleCompanion,
     ActionToggleFlatTest,
+    ActionToggleHudPanel,
+    ActionToggleEngineOverlay,
     ActionSnapshotSeries,
     ActionClose,
 };
@@ -648,10 +656,15 @@ private:
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
             "A = WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleFlatTest, "Flat HUD test",
-            "A = test only: draw the HUD flat like on a monitor, then take a snapshot series");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
+            "A = PANEL (health, stamina, weapons, tutorial on a room-fixed panel) or 3D (the older placement)");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Width of the HUD panel (degrees)");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
-            "A = edit. How far away the room-fixed HUD sits (meters). Sizes look the same at any distance");
+            "A = edit. How far away the HUD panel sits (meters). Its size in view stays the same");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
+            "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
             "A = element center (keeps it in place) or panel origin (old behaviour). Hacking circle always uses the old way");
@@ -726,6 +739,14 @@ private:
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
+        s += "# hud_panel = 1: health / stamina / weapons / tutorial shown on a room-fixed panel (screen.* = size, distance, place).\n";
+        s += fmt::format("hud_panel={}\n", t.hud_panel);
+        s += "# engine_overlay: test of the engine's overlay layer draw (0 = default, 1 = skipped, 2 = drawn).\n";
+        s += fmt::format("engine_overlay={}\n", t.engine_overlay);
+        for (int i = 0; i < 4; ++i) {
+            if (i == ScreenDistance) continue; // written below
+            s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
+        }
         s += "# flat_test = 1: test only, the HUD is drawn flat as on a monitor (for the HUD capture test).\n";
         s += fmt::format("flat_test={}\n", t.flat_test ? 1 : 0);
         s += "# screen.distance = HUD distance in meters (the room-fixed HUD is shown as a panel this far in front of you).\n";
@@ -874,6 +895,8 @@ private:
                 else if (key == "scale_about_center") t->scale_about_center = val != 0.0f;
                 else if (key == "companion_mode") t->companion_mode = std::clamp((int)val, 0, 2);
                 else if (key == "flat_test") t->flat_test = val != 0.0f;
+                else if (key == "hud_panel") t->hud_panel = val != 0.0f ? 1 : 0;
+                else if (key == "engine_overlay") t->engine_overlay = std::clamp((int)val, 0, 2);
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1232,6 +1255,16 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
                     play_click(true);
+                } else if (row.action == ActionToggleHudPanel) {
+                    t->hud_panel = t->hud_panel ? 0 : 1;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: HUD mode {}", t->hud_panel ? "panel" : "3D");
+                    play_click(true);
+                } else if (row.action == ActionToggleEngineOverlay) {
+                    t->engine_overlay = (t->engine_overlay + 1) % 3;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: engine UI blend {}", t->engine_overlay == 0 ? "default" : (t->engine_overlay == 1 ? "off" : "on"));
+                    play_click(true);
                 } else if (row.action == ActionToggleFlatTest) {
                     t->flat_test = !t->flat_test;
                     commit(t);
@@ -1501,6 +1534,23 @@ inline MenuQuadPlacement menu_quad_placement(const HudTune& t, const HudTuning::
     out.position = anchor.pos + glm::vec3{r * glm::vec4{0.0f, 0.0f, -dist, 0.0f}};
     out.width_m = image_w_px * meters_per_px;
     out.height_m = image_h_px * meters_per_px;
+    return out;
+}
+
+// Build 17: the HUD panel quad in stage space: screen.width degrees wide at screen.distance meters, turned screen.yaw
+// right and screen.pitch up from the HUD anchor, with the UI buffer's aspect.
+inline MenuQuadPlacement hud_panel_placement(const HudTune& t, const HudTuning::Pose& anchor, float image_w_px, float image_h_px) {
+    const float dist = t.screen[ScreenDistance];
+    const float width_m = 2.0f * dist * std::tan(glm::radians(t.screen[ScreenWidth]) * 0.5f);
+    const glm::mat4 aim = glm::rotate(glm::mat4{1.0f}, -glm::radians(t.screen[ScreenYaw]), glm::vec3{0.0f, 1.0f, 0.0f}) *
+                          glm::rotate(glm::mat4{1.0f}, glm::radians(t.screen[ScreenPitch]), glm::vec3{1.0f, 0.0f, 0.0f});
+    const glm::mat4 r = anchor.rot * aim;
+
+    MenuQuadPlacement out{};
+    out.orientation = glm::normalize(glm::quat_cast(glm::mat3{r}));
+    out.position = anchor.pos + glm::vec3{r * glm::vec4{0.0f, 0.0f, -dist, 0.0f}};
+    out.width_m = width_m;
+    out.height_m = image_w_px > 0.0f ? width_m * image_h_px / image_w_px : width_m;
     return out;
 }
 

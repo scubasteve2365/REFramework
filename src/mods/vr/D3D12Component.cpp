@@ -422,6 +422,241 @@ bool pragmata_update_menu_quad(runtimes::OpenXR* openxr) {
 
     return true;
 }
+// PragmataVR Build 17: the HUD panel. Each left-eye frame the engine's UI buffer (health, stamina, weapon wheel and
+// tutorial drawn flat in Screen mode, plus the rest of the UI) is copied to src; right before end_frame src is copied
+// into its own OpenXR swapchain and submitted as a room-fixed quad (OpenXR::hud_quad). Same pattern as the menu.
+struct PragmataHudPanel {
+    Microsoft::WRL::ComPtr<ID3D12Resource> src{};
+    d3d12::CommandContext src_cmds{};
+    bool src_cmds_ready{false};
+    std::chrono::steady_clock::time_point src_time{};
+    int32_t src_w{0};
+    int32_t src_h{0};
+    DXGI_FORMAT src_format{DXGI_FORMAT_UNKNOWN};
+    std::vector<XrSwapchainImageD3D12KHR> images{};
+    std::vector<std::unique_ptr<d3d12::CommandContext>> cmds{};
+    bool failed{false};
+};
+
+PragmataHudPanel g_pragmata_hud{};
+
+// Called on left-eye frames from on_frame, while the UI buffer still holds this frame's UI.
+void pragmata_capture_ui_buffer(VR* vr) {
+    auto& p = g_pragmata_hud;
+    const auto tune = pragmatavr::HudTuning::get().tune();
+    if (!tune->enabled || !tune->hud_panel || p.failed) {
+        return;
+    }
+
+    auto ui = vr->uiBufferTex[0];
+    if (ui == nullptr) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            spdlog::warn("[PragmataVR] HUD panel: the engine UI buffer is not available yet");
+        }
+        return;
+    }
+
+    auto device = g_framework->get_d3d12_hook()->get_device();
+    const auto d0 = ui->GetDesc();
+
+    if (!p.src_cmds_ready) {
+        p.src_cmds_ready = p.src_cmds.setup(L"PragmataVR HUD capture");
+        if (!p.src_cmds_ready) {
+            p.failed = true;
+            return;
+        }
+    }
+
+    if (p.src == nullptr || p.src_w != (int32_t)d0.Width || p.src_h != (int32_t)d0.Height || p.src_format != d0.Format) {
+        p.src_cmds.wait(INFINITE);
+        p.src.Reset();
+        D3D12_RESOURCE_DESC d = d0;
+        d.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.src)))) {
+            spdlog::error("[PragmataVR] HUD panel: could not create the capture texture");
+            p.failed = true;
+            return;
+        }
+        p.src_w = (int32_t)d0.Width;
+        p.src_h = (int32_t)d0.Height;
+        p.src_format = d0.Format;
+        spdlog::info("[PragmataVR] HUD panel: capturing the UI buffer, {} x {}, format {}", p.src_w, p.src_h, (int)p.src_format);
+    }
+
+    p.src_cmds.wait(INFINITE);
+    p.src_cmds.copy(ui, p.src.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    p.src_cmds.execute();
+    p.src_time = std::chrono::steady_clock::now();
+}
+
+void pragmata_drop_hud_swapchain(runtimes::OpenXR* openxr) {
+    auto& hq = openxr->hud_quad;
+    auto& p = g_pragmata_hud;
+    for (auto& c : p.cmds) {
+        if (c != nullptr) {
+            c->wait(INFINITE);
+        }
+    }
+    if (hq.swapchain != XR_NULL_HANDLE && hq.owner == openxr->session) {
+        xrDestroySwapchain(hq.swapchain);
+    }
+    hq.swapchain = XR_NULL_HANDLE;
+    hq.owner = XR_NULL_HANDLE;
+    hq.width = 0;
+    hq.height = 0;
+    p.images.clear();
+    p.cmds.clear();
+}
+
+bool pragmata_create_hud_swapchain(runtimes::OpenXR* openxr, int32_t w, int32_t h, DXGI_FORMAT src_format) {
+    auto& hq = openxr->hud_quad;
+    auto& p = g_pragmata_hud;
+
+    uint32_t format_count = 0;
+    xrEnumerateSwapchainFormats(openxr->session, 0, &format_count, nullptr);
+    std::vector<int64_t> formats(format_count);
+    if (format_count > 0) {
+        xrEnumerateSwapchainFormats(openxr->session, format_count, &format_count, formats.data());
+    }
+
+    // The UI buffer's own format first (a plain copy), then the R8G8B8A8 family.
+    int64_t format = 0;
+    for (const auto wanted : {(int64_t)src_format, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM}) {
+        if (std::find(formats.begin(), formats.end(), wanted) != formats.end()) {
+            format = wanted;
+            break;
+        }
+    }
+    if (format == 0) {
+        spdlog::error("[PragmataVR] HUD panel: no matching OpenXR swapchain format for UI buffer format {}", (int)src_format);
+        p.failed = true;
+        return false;
+    }
+
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = format;
+    ci.sampleCount = 1;
+    ci.width = (uint32_t)w;
+    ci.height = (uint32_t)h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+
+    XrSwapchain handle{XR_NULL_HANDLE};
+    auto result = xrCreateSwapchain(openxr->session, &ci, &handle);
+    if (result != XR_SUCCESS) {
+        spdlog::error("[PragmataVR] HUD panel: could not create the swapchain ({} x {}): {}", ci.width, ci.height, openxr->get_result_string(result));
+        p.failed = true;
+        return false;
+    }
+
+    uint32_t image_count = 0;
+    xrEnumerateSwapchainImages(handle, 0, &image_count, nullptr);
+    p.images.assign(image_count, XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+    result = xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)p.images.data());
+    if (result != XR_SUCCESS || image_count == 0) {
+        xrDestroySwapchain(handle);
+        p.images.clear();
+        p.failed = true;
+        return false;
+    }
+
+    p.cmds.clear();
+    for (uint32_t i = 0; i < image_count; ++i) {
+        auto c = std::make_unique<d3d12::CommandContext>();
+        if (!c->setup((std::wstring{L"PragmataVR HUD quad "} + std::to_wstring(i)).c_str())) {
+            xrDestroySwapchain(handle);
+            p.images.clear();
+            p.cmds.clear();
+            p.failed = true;
+            return false;
+        }
+        p.cmds.push_back(std::move(c));
+    }
+
+    hq.swapchain = handle;
+    hq.owner = openxr->session;
+    hq.width = (int32_t)ci.width;
+    hq.height = (int32_t)ci.height;
+    spdlog::info("[PragmataVR] HUD panel quad ready: {} x {}, format {}, {} images", ci.width, ci.height, format, image_count);
+    return true;
+}
+
+// Called right before OpenXR::end_frame.
+void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
+    auto& hq = openxr->hud_quad;
+    auto& p = g_pragmata_hud;
+    auto& hud = pragmatavr::HudTuning::get();
+    hq.visible = false;
+
+    const auto tune = hud.tune();
+    if (p.failed || !tune->enabled || !tune->hud_panel || p.src == nullptr) {
+        return;
+    }
+    if (!openxr->ready() || openxr->frame_state.shouldRender != XR_TRUE) {
+        return;
+    }
+    if (std::chrono::steady_clock::now() - p.src_time > std::chrono::milliseconds(200)) {
+        return; // nothing captured recently
+    }
+    const auto st = hud.head_state();
+    if (!st.valid) {
+        return;
+    }
+
+    if (hq.swapchain != XR_NULL_HANDLE && (hq.owner != openxr->session || hq.width != p.src_w || hq.height != p.src_h)) {
+        pragmata_drop_hud_swapchain(openxr);
+    }
+    if (hq.swapchain == XR_NULL_HANDLE && !pragmata_create_hud_swapchain(openxr, p.src_w, p.src_h, p.src_format)) {
+        return;
+    }
+
+    XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t index = 0;
+    auto result = xrAcquireSwapchainImage(hq.swapchain, &acquire_info, &index);
+    if (result != XR_SUCCESS || index >= p.images.size()) {
+        return;
+    }
+    XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wait_info.timeout = XR_INFINITE_DURATION;
+    result = xrWaitSwapchainImage(hq.swapchain, &wait_info);
+    if (result != XR_SUCCESS) {
+        XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(hq.swapchain, &release_info);
+        return;
+    }
+
+    auto& cmds = *p.cmds[index];
+    cmds.wait(INFINITE);
+    p.src_cmds.wait(INFINITE); // the capture copy must be finished
+    cmds.copy(p.src.Get(), p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cmds.execute();
+
+    XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    if (xrReleaseSwapchainImage(hq.swapchain, &release_info) != XR_SUCCESS) {
+        return;
+    }
+
+    const auto placement = pragmatavr::hud_panel_placement(*tune, st.hud, (float)p.src_w, (float)p.src_h);
+    hq.pose.orientation = XrQuaternionf{placement.orientation.x, placement.orientation.y, placement.orientation.z, placement.orientation.w};
+    hq.pose.position = XrVector3f{placement.position.x, placement.position.y, placement.position.z};
+    hq.size = XrExtent2Df{placement.width_m, placement.height_m};
+    hq.used_width = p.src_w;
+    hq.used_height = p.src_h;
+    hq.visible = true;
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        spdlog::info("[PragmataVR] HUD panel shown: {:.2f} x {:.2f} m at ({:.2f}, {:.2f}, {:.2f})",
+            placement.width_m, placement.height_m, placement.position.x, placement.position.y, placement.position.z);
+    }
+}
 } // namespace
 #endif
 
@@ -482,6 +717,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto frame_count = vr->m_render_frame_count;
 
 #if defined(PRAGMATA)
+    // PragmataVR Build 17: capture the UI buffer for the HUD panel (left-eye frames).
+    if ((frame_count % 2) == vr->m_left_eye_interval) {
+        pragmata_capture_ui_buffer(vr);
+    }
+
     // PragmataVR snapshot (Build 15): copy this eye's image and the other eye's next one (about 11 ms apart, so the two
     // match even while the head moves), then save both. Builds 3-14 saved each eye as it was captured, 0.7 s apart.
     {
@@ -1008,6 +1248,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
 #if defined(PRAGMATA)
+            pragmata_update_hud_quad(vr->m_openxr.get());
             pragmata_update_menu_quad(vr->m_openxr.get());
 #endif
 
@@ -1018,7 +1259,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
 #if defined(PRAGMATA)
                 // Never let the menu layer cost the game its frames: drop it and use the eye-image fallback.
-                if (vr->m_openxr->menu_quad.visible) {
+                if (vr->m_openxr->hud_quad.visible) {
+                    spdlog::error("[PragmataVR] Runtime rejected the HUD panel layer; HUD panel turned off");
+                    vr->m_openxr->hud_quad.visible = false;
+                    g_pragmata_hud.failed = true;
+                } else if (vr->m_openxr->menu_quad.visible) {
                     spdlog::error("[PragmataVR] Runtime rejected the menu quad layer; switching to the eye-image menu");
                     vr->m_openxr->menu_quad.visible = false;
                     g_pragmata_quad.failed = true;
