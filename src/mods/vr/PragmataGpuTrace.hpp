@@ -21,6 +21,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <optional>
+#include <chrono>
 
 #include <utility/FunctionHook.hpp>
 
@@ -66,6 +68,99 @@ inline std::atomic<uint64_t> g_ui_rtv_creates{0};
 
 inline constexpr size_t MAX_EVENTS = 4000;
 
+// Build 19: the Glued HUD removal. When a render target set binds the UI buffer together with other targets (the
+// engine writing a UI draw into the eye image and the UI buffer at once), the other targets are swapped for throwaway
+// textures of the same size and format, so that UI reaches only the UI buffer.
+inline std::atomic<bool> g_redirect{false};
+inline std::atomic<uint64_t> g_redirected_sets{0};
+inline std::atomic<uint64_t> g_ui_alone_sets{0};
+inline std::atomic<uint64_t> g_ui_unknown_sets{0};
+inline std::atomic<uint64_t> g_ui_mrt_sets{0};
+inline ID3D12Device* g_device{nullptr};
+
+struct Scratch {
+    Microsoft::WRL::ComPtr<ID3D12Resource> tex{};
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+};
+inline std::mutex g_scratch_mtx{};
+inline Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_scratch_heap{};
+inline uint32_t g_scratch_used{0};
+inline std::unordered_map<uint64_t, Scratch> g_scratch{}; // key: width, height, format
+inline constexpr uint32_t SCRATCH_MAX = 32;
+
+inline std::optional<D3D12_CPU_DESCRIPTOR_HANDLE> scratch_rtv(const RtvInfo& info) {
+    if (g_device == nullptr || info.w == 0 || info.h == 0 || info.format == 0) {
+        return std::nullopt;
+    }
+    const uint64_t key = ((uint64_t)info.w << 40) ^ ((uint64_t)info.h << 16) ^ (uint64_t)info.format;
+    std::scoped_lock _{g_scratch_mtx};
+    auto it = g_scratch.find(key);
+    if (it != g_scratch.end()) {
+        return it->second.rtv;
+    }
+    if (g_scratch_heap == nullptr) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = SCRATCH_MAX;
+        if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_scratch_heap)))) {
+            return std::nullopt;
+        }
+    }
+    if (g_scratch_used >= SCRATCH_MAX) {
+        return std::nullopt;
+    }
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = info.w;
+    d.Height = info.h;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = 1;
+    d.Format = (DXGI_FORMAT)info.format;
+    d.SampleDesc.Count = 1;
+    d.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    Scratch sc{};
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&sc.tex)))) {
+        spdlog::error("[PragmataVR] Glued HUD: could not create a {} x {} format {} throwaway target", info.w, info.h, info.format);
+        g_scratch[key] = Scratch{}; // do not retry every draw
+        return std::nullopt;
+    }
+    sc.rtv = g_scratch_heap->GetCPUDescriptorHandleForHeapStart();
+    sc.rtv.ptr += (SIZE_T)g_scratch_used * g_rtv_increment;
+    ++g_scratch_used;
+    // Created through the original function so the trace map does not record it.
+    if (g_create_rtv_hook != nullptr) {
+        g_create_rtv_hook->get_original<void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
+            D3D12_CPU_DESCRIPTOR_HANDLE)>()(g_device, sc.tex.Get(), nullptr, sc.rtv);
+    } else {
+        g_device->CreateRenderTargetView(sc.tex.Get(), nullptr, sc.rtv);
+    }
+    spdlog::info("[PragmataVR] Glued HUD: throwaway target {} x {} format {} ready", info.w, info.h, info.format);
+    g_scratch[key] = sc;
+    return sc.rtv;
+}
+
+inline void report_redirects() {
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) {
+        return;
+    }
+    last = now;
+    const auto r = g_redirected_sets.exchange(0);
+    const auto a = g_ui_alone_sets.exchange(0);
+    const auto u = g_ui_unknown_sets.exchange(0);
+    const auto m = g_ui_mrt_sets.exchange(0);
+    static int reports = 0;
+    if (reports < 60) {
+        ++reports;
+        spdlog::info("[PragmataVR] Glued HUD {}: last 10 s, UI-buffer target sets: {} with other targets, {} redirected, {} alone, "
+            "{} with unknown targets; RTVs created since hooks {}", g_redirect.load() ? "removal on" : "removal off", m, r, a, u,
+            g_creates_total.load());
+    }
+}
+
 inline void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     auto original = g_create_rtv_hook->get_original<decltype(create_rtv)>();
@@ -90,6 +185,64 @@ inline void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* res
 inline void STDMETHODCALLTYPE om_set(ID3D12GraphicsCommandList* self, UINT num, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single,
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     auto original = g_om_set_hook->get_original<decltype(om_set)>();
+
+    // Build 19: Glued HUD removal (see g_redirect).
+    if (rtvs != nullptr && num >= 1 && num <= 8 && g_ui_buffer.load() != nullptr) {
+        D3D12_CPU_DESCRIPTOR_HANDLE handles[8]{};
+        RtvInfo infos[8]{};
+        bool has_ui = false;
+        bool all_known = true;
+        {
+            std::shared_lock _{g_rtv_mtx};
+            for (UINT i = 0; i < num; ++i) {
+                handles[i].ptr = single ? rtvs[0].ptr + (SIZE_T)i * g_rtv_increment : rtvs[i].ptr;
+                auto it = g_rtvs.find(handles[i].ptr);
+                if (it != g_rtvs.end()) {
+                    infos[i] = it->second;
+                    has_ui = has_ui || infos[i].res == g_ui_buffer.load();
+                } else {
+                    all_known = false;
+                }
+            }
+        }
+        if (has_ui && num == 1) {
+            g_ui_alone_sets++;
+        } else if (has_ui && !all_known) {
+            g_ui_unknown_sets++;
+        } else if (has_ui && g_redirect.load()) {
+            bool ok = true;
+            for (UINT i = 0; i < num && ok; ++i) {
+                if (infos[i].res != g_ui_buffer.load()) {
+                    auto sc = scratch_rtv(infos[i]);
+                    if (sc) {
+                        handles[i] = *sc;
+                    } else {
+                        ok = false;
+                    }
+                }
+            }
+            if (ok) {
+                g_redirected_sets++;
+                if (g_active.load()) {
+                    Event e{};
+                    e.tid = GetCurrentThreadId();
+                    e.list = self;
+                    e.kind = 'X'; // redirected
+                    e.n = num;
+                    e.frame = g_frame.load();
+                    std::scoped_lock _{g_events_mtx};
+                    if (g_events.size() < MAX_EVENTS) {
+                        g_events.push_back(e);
+                    }
+                }
+                original(self, num, handles, FALSE, dsv);
+                return;
+            }
+        }
+        if (has_ui && num > 1 && all_known) {
+            g_ui_mrt_sets++;
+        }
+    }
 
     if (g_active.load() && rtvs != nullptr) {
         Event e{};
@@ -198,6 +351,7 @@ inline bool install(ID3D12Device* device) {
     }
 
     g_rtv_increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    g_device = device;
 
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc{};
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list{};
@@ -294,7 +448,9 @@ inline void dump(ID3D12Resource* backbuffer) {
         for (uint32_t i = 0; i < e.n && i < 4; ++i) {
             targets += (i > 0 ? ", " : "") + describe(e.info[i], e.known[i], e.handle[i], backbuffer);
         }
-        if (e.kind == 'C') {
+        if (e.kind == 'X') {
+            lines += fmt::format("\n  #{} f{} t{} list {:x} REDIRECTED a UI-buffer set of {} targets", k, e.frame, e.tid, (uintptr_t)e.list, e.n);
+        } else if (e.kind == 'C') {
             lines += fmt::format("\n  #{} f{} t{} list {:x} COPY dst {} <- src {}", k, e.frame, e.tid, (uintptr_t)e.list,
                 describe(e.info[0], e.known[0], 0, backbuffer), describe(e.info[1], e.known[1], 0, backbuffer));
         } else {

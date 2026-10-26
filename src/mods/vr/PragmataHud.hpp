@@ -130,6 +130,9 @@ struct HudTune {
     int hud_panel{1};
     // Build 17 test: the engine's overlay layer draw. 0 = REFramework's default, 1 = always skipped, 2 = always drawn.
     int engine_overlay{0};
+    // Build 19 test: draws that write the eye image and the UI buffer together get a throwaway image instead of the eye
+    // image, so the UI reaches only the UI buffer (and the HUD panel). Off = the engine's normal drawing.
+    bool glued_hud_removed{false};
     bool flat_test{false}; // Build 16 test: the 3D HUD drawn with the game's own flat projection, companions left flat
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
@@ -316,6 +319,7 @@ enum MenuAction : int {
     ActionToggleFlatTest,
     ActionToggleHudPanel,
     ActionToggleEngineOverlay,
+    ActionToggleGluedHud,
     ActionSnapshotSeries,
     ActionClose,
 };
@@ -665,6 +669,8 @@ private:
             "A = edit. How far away the HUD panel sits (meters). Its size in view stays the same");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGluedHud, "Glued HUD",
+            "A = test: SHOWN, or REMOVED (the game's HUD kept out of your eyes, shown only on the HUD panel)");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
             "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
@@ -745,6 +751,8 @@ private:
         s += fmt::format("hud_panel={}\n", t.hud_panel);
         s += "# engine_overlay: test of the engine's overlay layer draw (0 = default, 1 = skipped, 2 = drawn).\n";
         s += fmt::format("engine_overlay={}\n", t.engine_overlay);
+        s += "# glued_hud_removed = 1: test, the UI is kept out of the eye images (only the HUD panel shows it).\n";
+        s += fmt::format("glued_hud_removed={}\n", t.glued_hud_removed ? 1 : 0);
         for (int i = 0; i < 4; ++i) {
             if (i == ScreenDistance) continue; // written below
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
@@ -899,6 +907,7 @@ private:
                 else if (key == "flat_test") t->flat_test = val != 0.0f;
                 else if (key == "hud_panel") t->hud_panel = val != 0.0f ? 1 : 0;
                 else if (key == "engine_overlay") t->engine_overlay = std::clamp((int)val, 0, 2);
+                else if (key == "glued_hud_removed") t->glued_hud_removed = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1103,7 +1112,7 @@ private:
         snapshot_left_done = false;
         snapshot_right_done = false;
         snapshot_ui_done = false;
-        trace_requested = true;
+        trace_requested = true; // Build 19: the overlay layer dump of Build 18 is gone (it most likely caused the crash)
 
         std::error_code ec{};
         std::filesystem::create_directories(data_dir() / "snapshots", ec);
@@ -1262,6 +1271,11 @@ private:
                     t->hud_panel = t->hud_panel ? 0 : 1;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: HUD mode {}", t->hud_panel ? "panel" : "3D");
+                    play_click(true);
+                } else if (row.action == ActionToggleGluedHud) {
+                    t->glued_hud_removed = !t->glued_hud_removed;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: glued HUD {}", t->glued_hud_removed ? "removed" : "shown");
                     play_click(true);
                 } else if (row.action == ActionToggleEngineOverlay) {
                     t->engine_overlay = (t->engine_overlay + 1) % 3;

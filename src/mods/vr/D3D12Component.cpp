@@ -724,6 +724,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         static int trace_frames_left = 0;
         pragmata_trace::install(g_framework->get_d3d12_hook()->get_device());
         pragmata_trace::g_ui_buffer = vr->uiBufferTex[0];
+        pragmata_trace::g_redirect = pragmatavr::HudTuning::get().tune()->glued_hud_removed;
+        pragmata_trace::report_redirects();
 
         if (hud.trace_requested.exchange(false) && !pragmata_trace::g_active.load()) {
             {
@@ -734,7 +736,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             pragmata_trace::g_frame = 0;
             pragmata_trace::g_active = true;
             trace_frames_left = 2;
-            hud.dump_engine_targets = true;
             spdlog::info("[PragmataVR] GPU trace started for two eye frames");
         } else if (pragmata_trace::g_active.load()) {
             pragmata_trace::g_frame++;
