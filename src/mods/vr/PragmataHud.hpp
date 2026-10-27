@@ -277,7 +277,9 @@ inline const char* hud_mode_name(int m) {
 // Which element a GUI GameObject belongs to. ui2160Gui is no longer tuned: the fix pack lists it with the hacking
 // target brackets (ui3203), which sit on enemies in the world and must not be moved or scaled with the HUD.
 inline int group_for(std::string_view name) {
-    if (name == "ui3400Gui") return GroupHack;
+    // Build 33: the door hacking HUD (ui3510Gui, seen opening a door) and ui3500Gui (listed with it as the other hacking
+    // HUD by the fix pack's hack effects script, not seen yet) share the enemy hacking circle's values.
+    if (name == "ui3400Gui" || name == "ui3510Gui" || name == "ui3500Gui") return GroupHack;
     if (name == "ui2130Gui") return GroupHealth;
     if (name == "ui2140Gui") return GroupStamina;
     if (name == "ui2150Gui") return GroupWeapons;
