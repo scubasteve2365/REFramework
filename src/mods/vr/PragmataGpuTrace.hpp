@@ -91,7 +91,8 @@ inline std::atomic<uint64_t> g_ui_notes_window{0};         // overlay hook repor
 inline std::atomic<uint64_t> g_ui_new_window{0};           // reports of a buffer not seen among the recent ones
 inline std::atomic<uint64_t> g_handoff_current_window{0};  // hand-offs of the buffer reported last
 inline std::atomic<uint64_t> g_handoff_older_window{0};    // hand-offs of an older remembered buffer
-inline std::atomic<uint64_t> g_handoff_skipped_window{0};  // hand-offs not captured (size differs from the capture)
+inline std::atomic<uint64_t> g_handoff_skipped_window{0};
+inline std::atomic<uint64_t> g_captures_window{0};         // Build 28: hand-offs copied to the panel (first pass only)  // hand-offs not captured (size differs from the capture)
 
 // Build 19: the Glued HUD removal. When a render target set binds the UI buffer together with other targets (the
 // engine writing a UI draw into the eye image and the UI buffer at once), the other targets are swapped for throwaway
@@ -396,7 +397,6 @@ inline std::atomic<int> g_game_ui_fmt{0};
 // right after the overlay hook hands the buffer out still holds the HUD (a later pass sees it wiped). The capture is
 // taken only on that first pass: note_ui_buffer arms the buffer, the first hand-off of it disarms it.
 inline std::atomic<ID3D12Resource*> g_ui_armed{nullptr};
-inline std::atomic<uint64_t> g_captures_window{0};
 
 // Called from the overlay layer hook with the UI buffer the engine is handing out right now.
 inline void note_ui_buffer(ID3D12Resource* r) {
