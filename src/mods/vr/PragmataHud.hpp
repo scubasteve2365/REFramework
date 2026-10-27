@@ -1809,7 +1809,7 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
     for (int g = GroupHealth; g <= GroupTutorial; ++g) {
         if (frame >= 0) {
             const int age = frame - g_group_drawn_frame[g].load();
-            if (age < 0 || age > 4) {
+            if (age < 0 || age > 10) { // Build 29: 10 frames (was 4)
                 continue; // not drawn in the last few frames
             }
         }

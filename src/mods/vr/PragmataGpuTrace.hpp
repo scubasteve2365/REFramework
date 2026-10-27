@@ -92,7 +92,58 @@ inline std::atomic<uint64_t> g_ui_new_window{0};           // reports of a buffe
 inline std::atomic<uint64_t> g_handoff_current_window{0};  // hand-offs of the buffer reported last
 inline std::atomic<uint64_t> g_handoff_older_window{0};    // hand-offs of an older remembered buffer
 inline std::atomic<uint64_t> g_handoff_skipped_window{0};
-inline std::atomic<uint64_t> g_captures_window{0};         // Build 28: hand-offs copied to the panel (first pass only)  // hand-offs not captured (size differs from the capture)
+inline std::atomic<uint32_t> g_game_ui_w{0};
+inline std::atomic<uint32_t> g_game_ui_h{0};
+inline std::atomic<int> g_game_ui_fmt{0};
+inline std::atomic<uint64_t> g_captures_window{0};         // hand-offs copied to the panel
+inline std::atomic<uint64_t> g_drawn_handoffs_window{0};   // Build 29: hand-offs with draws since the previous one
+inline std::atomic<uint64_t> g_fallback_window{0};         // Build 29: copies made by the every-pass fallback
+
+// Build 29: which pass of the UI buffer holds the HUD varies from frame to frame (some passes see it wiped). So the
+// draws made into each UI buffer are counted (OMSetRenderTargets binding a remembered UI buffer, then draws on that
+// command list) and the panel copy is taken only at a hand-off that had draws since the previous hand-off. If no such
+// hand-off has been seen for a second (draws the hooks do not see), every pass is copied again (the Build 27 way).
+struct UiDraws {
+    ID3D12Resource* res{nullptr};
+    uint64_t draws{0};
+};
+inline std::mutex g_draws_mtx{};
+inline std::array<UiDraws, 16> g_ui_draws{};
+inline int g_ui_draws_next{0};
+inline thread_local ID3D12GraphicsCommandList* t_ui_list{nullptr};
+inline thread_local ID3D12Resource* t_ui_res{nullptr};
+inline std::atomic<int64_t> g_last_drawn_handoff_ms{0};
+
+inline int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+inline void add_ui_draw(ID3D12Resource* r) {
+    std::scoped_lock _{g_draws_mtx};
+    for (auto& d : g_ui_draws) {
+        if (d.res == r) {
+            d.draws++;
+            return;
+        }
+    }
+    auto& d = g_ui_draws[g_ui_draws_next];
+    g_ui_draws_next = (g_ui_draws_next + 1) % (int)g_ui_draws.size();
+    d.res = r;
+    d.draws = 1;
+}
+
+// Draws made into r since the last call for r (then reset).
+inline uint64_t take_ui_draws(ID3D12Resource* r) {
+    std::scoped_lock _{g_draws_mtx};
+    for (auto& d : g_ui_draws) {
+        if (d.res == r) {
+            const auto n = d.draws;
+            d.draws = 0;
+            return n;
+        }
+    }
+    return 0;
+}  // hand-offs not captured (size differs from the capture)
 
 // Build 19: the Glued HUD removal. When a render target set binds the UI buffer together with other targets (the
 // engine writing a UI draw into the eye image and the UI buffer at once), the other targets are swapped for throwaway
@@ -187,13 +238,15 @@ inline void report_redirects() {
     const auto older = g_handoff_older_window.exchange(0);
     const auto skipped = g_handoff_skipped_window.exchange(0);
     const auto captures = g_captures_window.exchange(0);
+    const auto drawn = g_drawn_handoffs_window.exchange(0);
+    const auto fallback = g_fallback_window.exchange(0);
     static int reports = 0;
     if (reports < 60) {
         ++reports;
         spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}; {} of the buffer reported last, {} of an older one, "
-            "{} not the in-game buffer, {} copied to the panel), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
+            "{} not the in-game buffer, {} with draws, {} copied to the panel, {} of them by the every-pass fallback), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
             "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
-            cur, older, skipped, captures, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
+            cur, older, skipped, drawn, captures, fallback, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
     }
 }
 
@@ -221,6 +274,36 @@ inline void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* res
 inline void STDMETHODCALLTYPE om_set(ID3D12GraphicsCommandList* self, UINT num, const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single,
     const D3D12_CPU_DESCRIPTOR_HANDLE* dsv) {
     auto original = g_om_set_hook->get_original<decltype(om_set)>();
+
+    // Build 29: is a remembered UI buffer (in-game size) being bound on this command list? Then its draws are counted.
+    if (g_intercept.load()) {
+        ID3D12Resource* bound = nullptr;
+        if (rtvs != nullptr && num >= 1 && num <= 8) {
+            const auto gw = g_game_ui_w.load();
+            const auto gh = g_game_ui_h.load();
+            std::shared_lock _{g_rtv_mtx};
+            for (UINT i = 0; i < num && bound == nullptr; ++i) {
+                const uint64_t h = single ? rtvs[0].ptr + (uint64_t)i * g_rtv_increment : rtvs[i].ptr;
+                auto it = g_rtvs.find(h);
+                if (it != g_rtvs.end() && it->second.res != nullptr && it->second.w == gw && it->second.h == gh) {
+                    std::scoped_lock __{g_ui_mtx};
+                    for (auto x : g_ui_recent) {
+                        if (x == it->second.res) {
+                            bound = x;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (bound != nullptr) {
+            t_ui_list = self;
+            t_ui_res = bound;
+        } else if (t_ui_list == self) {
+            t_ui_list = nullptr;
+            t_ui_res = nullptr;
+        }
+    }
 
     // Build 19: Glued HUD removal (see g_redirect).
     if (rtvs != nullptr && num >= 1 && num <= 8 && g_ui_buffer.load() != nullptr) {
@@ -321,11 +404,17 @@ inline void count_draw(ID3D12GraphicsCommandList* self) {
 }
 
 inline void STDMETHODCALLTYPE draw(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d) {
+    if (t_ui_list == self && t_ui_res != nullptr) {
+        add_ui_draw(t_ui_res);
+    }
     count_draw(self);
     g_draw_hook->get_original<decltype(draw)>()(self, a, b, c, d);
 }
 
 inline void STDMETHODCALLTYPE draw_indexed(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, INT d, UINT e) {
+    if (t_ui_list == self && t_ui_res != nullptr) {
+        add_ui_draw(t_ui_res);
+    }
     count_draw(self);
     g_draw_indexed_hook->get_original<decltype(draw_indexed)>()(self, a, b, c, d, e);
 }
@@ -389,9 +478,7 @@ inline std::atomic<uint32_t> g_ui_rtv_next{0};
 
 // The in-game UI buffer size and format: the largest render-target 2D texture the overlay hook has reported (menus use
 // a smaller desktop-size one). Read from the texture in the hook, while it is certainly alive.
-inline std::atomic<uint32_t> g_game_ui_w{0};
-inline std::atomic<uint32_t> g_game_ui_h{0};
-inline std::atomic<int> g_game_ui_fmt{0};
+// (g_game_ui_w / g_game_ui_h / g_game_ui_fmt are declared with the other hand-off state near the top.)
 
 // Build 28: the engine passes the UI buffer through RENDER_TARGET -> other more than once per frame, and only the pass
 // right after the overlay hook hands the buffer out still holds the HUD (a later pass sees it wiped). The capture is
@@ -505,11 +592,19 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                 g_handoff_skipped_window++;
             } else {
                 ui_rtv = fresh_rtv(ui, du.Format);
-                ID3D12Resource* expected = ui;
-                if (!g_ui_armed.compare_exchange_strong(expected, nullptr)) {
-                    cap = nullptr; // not the first pass after the hand-out: the buffer may already be wiped
-                } else {
+                // Build 29: copy only a pass that had draws since the previous hand-off (a wiped pass has none),
+                // unless no such pass has been seen for a second (fallback: every pass, as in Build 27).
+                const auto draws = take_ui_draws(ui);
+                const auto now = now_ms();
+                if (draws > 0) {
+                    g_drawn_handoffs_window++;
+                    g_last_drawn_handoff_ms = now;
                     g_captures_window++;
+                } else if (now - g_last_drawn_handoff_ms.load() > 1000) {
+                    g_fallback_window++;
+                    g_captures_window++;
+                } else {
+                    cap = nullptr;
                 }
             }
             if (cap != nullptr) {
