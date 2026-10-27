@@ -376,9 +376,20 @@ inline void STDMETHODCALLTYPE copy_resource(ID3D12GraphicsCommandList* self, ID3
 // are cleared from it (g_erase), so they reach the HUD panel but not the eye images. Recorded on the engine's own
 // command list, so it runs at exactly that point in the frame.
 
-// Build 26: the RTV slot heap for the remembered UI buffers.
+// Build 27: a ring of RTV slots. A fresh RTV is written for the UI buffer at every hand-off (Build 26 cached one per
+// address, and when the engine freed a texture and reused its address the cached RTV pointed at the freed texture:
+// crash in the driver at startup). ClearRenderTargetView reads the descriptor when it is recorded, so a slot can be
+// reused once the ring comes round.
+inline constexpr int RTV_RING = 16;
 inline Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> g_ui_rtv_heap{};
 inline UINT g_ui_rtv_step{0};
+inline std::atomic<uint32_t> g_ui_rtv_next{0};
+
+// The in-game UI buffer size and format: the largest render-target 2D texture the overlay hook has reported (menus use
+// a smaller desktop-size one). Read from the texture in the hook, while it is certainly alive.
+inline std::atomic<uint32_t> g_game_ui_w{0};
+inline std::atomic<uint32_t> g_game_ui_h{0};
+inline std::atomic<int> g_game_ui_fmt{0};
 
 // Called from the overlay layer hook with the UI buffer the engine is handing out right now.
 inline void note_ui_buffer(ID3D12Resource* r) {
@@ -387,6 +398,13 @@ inline void note_ui_buffer(ID3D12Resource* r) {
     }
     g_ui_notes_window++;
     g_ui_buffer = r;
+    const auto d = r->GetDesc();
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+        (uint64_t)d.Width * d.Height > (uint64_t)g_game_ui_w.load() * g_game_ui_h.load()) {
+        g_game_ui_fmt = (int)d.Format;
+        g_game_ui_h = d.Height;
+        g_game_ui_w = (uint32_t)d.Width;
+    }
     std::scoped_lock _{g_ui_mtx};
     for (auto x : g_ui_recent) {
         if (x == r) {
@@ -394,44 +412,49 @@ inline void note_ui_buffer(ID3D12Resource* r) {
         }
     }
     g_ui_new_window++;
-    const int slot = g_ui_recent_next;
+    g_ui_recent[g_ui_recent_next] = r;
     g_ui_recent_next = (g_ui_recent_next + 1) % UI_RECENT;
-    g_ui_recent[slot] = r;
-    g_ui_recent_rtv[slot] = 0; // made on first use (the device may not be known yet)
 }
 
-// The remembered buffer this resource is, with its RTV (made on demand). Returns false if it is not a UI buffer.
-inline bool find_ui_buffer(ID3D12Resource* r, uint64_t& rtv) {
+inline bool is_recent_ui_buffer(ID3D12Resource* r) {
     std::scoped_lock _{g_ui_mtx};
-    for (int i = 0; i < UI_RECENT; ++i) {
-        if (g_ui_recent[i] != r) {
-            continue;
+    for (auto x : g_ui_recent) {
+        if (x == r) {
+            return true;
         }
-        if (g_ui_recent_rtv[i] == 0 && g_device != nullptr) {
-            if (g_ui_rtv_heap == nullptr) {
-                D3D12_DESCRIPTOR_HEAP_DESC hd{};
-                hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-                hd.NumDescriptors = UI_RECENT;
-                if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ui_rtv_heap)))) {
-                    g_ui_rtv_heap.Reset();
-                }
-                g_ui_rtv_step = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            }
-            if (g_ui_rtv_heap != nullptr) {
-                auto h = g_ui_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-                h.ptr += (SIZE_T)i * g_ui_rtv_step;
-                if (g_create_rtv_hook != nullptr) {
-                    g_create_rtv_hook->get_original<decltype(create_rtv)>()(g_device, r, nullptr, h);
-                } else {
-                    g_device->CreateRenderTargetView(r, nullptr, h);
-                }
-                g_ui_recent_rtv[i] = (uint64_t)h.ptr;
-            }
-        }
-        rtv = g_ui_recent_rtv[i];
-        return true;
     }
     return false;
+}
+
+// A fresh RTV for r (typed with its own format), or 0.
+inline uint64_t fresh_rtv(ID3D12Resource* r, DXGI_FORMAT format) {
+    if (g_device == nullptr) {
+        return 0;
+    }
+    {
+        std::scoped_lock _{g_ui_mtx};
+        if (g_ui_rtv_heap == nullptr) {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+            hd.NumDescriptors = RTV_RING;
+            if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ui_rtv_heap)))) {
+                g_ui_rtv_heap.Reset();
+                return 0;
+            }
+            g_ui_rtv_step = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        }
+    }
+    auto h = g_ui_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += (SIZE_T)(g_ui_rtv_next.fetch_add(1) % RTV_RING) * g_ui_rtv_step;
+    D3D12_RENDER_TARGET_VIEW_DESC vd{};
+    vd.Format = format;
+    vd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    if (g_create_rtv_hook != nullptr) {
+        g_create_rtv_hook->get_original<decltype(create_rtv)>()(g_device, r, &vd, h);
+    } else {
+        g_device->CreateRenderTargetView(r, &vd, h);
+    }
+    return (uint64_t)h.ptr;
 }
 
 inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
@@ -443,9 +466,9 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
         uint64_t ui_rtv = 0;
         for (UINT i = 0; i < n && !handoff; ++i) {
             const auto& t = b[i];
-            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && t.Transition.pResource != nullptr &&
                 t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && t.Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET &&
-                find_ui_buffer(t.Transition.pResource, ui_rtv)) {
+                is_recent_ui_buffer(t.Transition.pResource)) {
                 handoff = true;
                 ui = t.Transition.pResource;
             }
@@ -459,14 +482,21 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             } else {
                 g_handoff_older_window++;
             }
+            // Build 27: only the in-game UI buffer (2D render target with the capture's size and format) is captured or
+            // cleared. The texture is the one being transitioned, so it is alive here.
             auto cap = g_capture.load();
-            if (cap != nullptr) {
+            const auto du = ui->GetDesc();
+            bool game_ui = cap != nullptr && du.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                           (du.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 && du.MipLevels == 1 && du.DepthOrArraySize == 1;
+            if (game_ui) {
                 const auto dc = cap->GetDesc();
-                const auto du = ui->GetDesc();
-                if (dc.Width != du.Width || dc.Height != du.Height || dc.Format != du.Format) {
-                    cap = nullptr; // a UI buffer of another size (menus at the desktop size): not for the panel
-                    g_handoff_skipped_window++;
-                }
+                game_ui = dc.Width == du.Width && dc.Height == du.Height && dc.Format == du.Format;
+            }
+            if (!game_ui) {
+                cap = nullptr;
+                g_handoff_skipped_window++;
+            } else {
+                ui_rtv = fresh_rtv(ui, du.Format);
             }
             if (cap != nullptr) {
                 D3D12_RESOURCE_BARRIER pre[2]{};
@@ -495,7 +525,7 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             }
 
             const auto rtv = ui_rtv;
-            if (g_erase.load() && rtv != 0) {
+            if (g_erase.load() && game_ui && rtv != 0) {
                 std::vector<D3D12_RECT> rects{};
                 {
                     std::scoped_lock _{g_rects_mtx};

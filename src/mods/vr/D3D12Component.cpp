@@ -483,18 +483,25 @@ void pragmata_capture_ui_buffer(VR* vr) {
         return;
     }
 
-    auto ui = vr->uiBufferTex[0];
-    if (ui == nullptr) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            spdlog::warn("[PragmataVR] HUD panel: the engine UI buffer is not available yet");
-        }
+    // Build 27: the in-game UI buffer's size and format as recorded by the overlay hook (vr->uiBufferTex[0] may point
+    // at a texture the engine has already freed, so it is not touched here).
+    const auto gw = pragmata_trace::g_game_ui_w.load();
+    const auto gh = pragmata_trace::g_game_ui_h.load();
+    const auto gf = (DXGI_FORMAT)pragmata_trace::g_game_ui_fmt.load();
+    if (gw == 0 || gh == 0 || gf == DXGI_FORMAT_UNKNOWN) {
         return;
     }
 
     auto device = g_framework->get_d3d12_hook()->get_device();
-    const auto d0 = ui->GetDesc();
+    D3D12_RESOURCE_DESC d0{};
+    d0.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d0.Width = gw;
+    d0.Height = gh;
+    d0.DepthOrArraySize = 1;
+    d0.MipLevels = 1;
+    d0.Format = gf;
+    d0.SampleDesc.Count = 1;
+    d0.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
     if (!p.src_cmds_ready) {
         p.src_cmds_ready = p.src_cmds.setup(L"PragmataVR HUD capture");
@@ -507,6 +514,11 @@ void pragmata_capture_ui_buffer(VR* vr) {
     if (p.src == nullptr || p.src_w != (int32_t)d0.Width || p.src_h != (int32_t)d0.Height || p.src_format != d0.Format) {
         pragmata_trace::g_capture = nullptr;
         p.src_cmds.wait(INFINITE);
+        // Build 27: the old capture is kept alive (a render thread may still be recording a copy into it).
+        static std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired{};
+        if (p.src != nullptr) {
+            retired.push_back(p.src);
+        }
         p.src.Reset();
         D3D12_RESOURCE_DESC d = d0;
         d.Flags = D3D12_RESOURCE_FLAG_NONE;
@@ -539,10 +551,7 @@ void pragmata_capture_ui_buffer(VR* vr) {
         }
         return;
     }
-
-    p.src_cmds.wait(INFINITE);
-    p.src_cmds.copy(ui, p.src.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    p.src_cmds.execute();
+    // Build 27: no copy at present time any more (it read vr->uiBufferTex[0], which may be freed).
     p.src_time = std::chrono::steady_clock::now();
 }
 
@@ -848,8 +857,8 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             pragmata_trace::g_erase = t->enabled && t->hud_panel && t->glued_hud_removed;
 
             // Build 25: ANCHORED element areas, from the FLAT tuning, every frame (they follow the menu edits).
-            if (t->enabled && t->hud_panel && vr->uiBufferTex[0] != nullptr) {
-                const auto d = vr->uiBufferTex[0]->GetDesc();
+            if (t->enabled && t->hud_panel && pragmata_trace::g_game_ui_w.load() != 0) {
+                struct { uint32_t Width; uint32_t Height; } d{pragmata_trace::g_game_ui_w.load(), pragmata_trace::g_game_ui_h.load()};
                 const auto boxes = pragmatavr::anchored_boxes_px(*t, (float)d.Width, (float)d.Height);
                 std::vector<D3D12_RECT> rects{};
                 for (const auto& b : boxes) {
