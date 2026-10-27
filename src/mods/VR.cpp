@@ -3596,7 +3596,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 27");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 28");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3684,7 +3684,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 27"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 27");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 28"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 28");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4607,6 +4607,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 }
 
                 if (fgroup >= 0) {
+                    pragmatavr::g_group_drawn_frame[fgroup] = m_frame_count; // Build 28: ANCHORED uses boxes of drawn elements only
                     auto fview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
                     const auto& gt = ftune->flat_groups[fgroup];
                     // Build 25: ANCHORED takes depth from the panel distance, so the anchored elements get no eye gap

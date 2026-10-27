@@ -859,7 +859,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // Build 25: ANCHORED element areas, from the FLAT tuning, every frame (they follow the menu edits).
             if (t->enabled && t->hud_panel && pragmata_trace::g_game_ui_w.load() != 0) {
                 struct { uint32_t Width; uint32_t Height; } d{pragmata_trace::g_game_ui_w.load(), pragmata_trace::g_game_ui_h.load()};
-                const auto boxes = pragmatavr::anchored_boxes_px(*t, (float)d.Width, (float)d.Height);
+                const auto boxes = pragmatavr::anchored_boxes_px(*t, (float)d.Width, (float)d.Height, vr->m_frame_count);
                 std::vector<D3D12_RECT> rects{};
                 for (const auto& b : boxes) {
                     rects.push_back(D3D12_RECT{(LONG)b.x0, (LONG)b.y0, (LONG)b.x1, (LONG)b.y1});
@@ -951,14 +951,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             // mixed into the scene; PureDark's fork reads them for frame warp). Copied on the left-eye frame.
             // Build 26: slot 0 is the UI buffer the engine handed out last (it changes from frame to frame), slot 2 is
             // what the ANCHORED panel received (its capture texture).
-            static std::array<ComPtr<ID3D12Resource>, 3> ui_tex{};
-            static std::array<bool, 3> ui_ok{};
+            static std::array<ComPtr<ID3D12Resource>, 4> ui_tex{};
+            static std::array<bool, 4> ui_ok{};
             if (left && !hud.snapshot_ui_done.load()) {
                 hud.snapshot_ui_done = true;
                 auto device = g_framework->get_d3d12_hook()->get_device();
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 4; ++i) {
                     ui_ok[i] = false;
-                    ID3D12Resource* src = i == 0 ? pragmata_trace::g_ui_buffer.load() : (i == 1 ? vr->uiBufferTex[1] : g_pragmata_hud.src.Get());
+                    // Build 28: slot 3 = the panel image (what the anchored panel was last given). Slot 1 is no longer read.
+                    ID3D12Resource* src = i == 0 ? pragmata_trace::g_ui_buffer.load() : (i == 1 ? nullptr : (i == 2 ? g_pragmata_hud.src.Get() : g_pragmata_hud.comp.Get()));
                     if (src == nullptr) {
                         spdlog::info("[PragmataVR] Snapshot: UI buffer {} is not available", i);
                         continue;
@@ -980,7 +981,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     }
                     if (snap_cmds_ready) {
                         snap_cmds.wait(INFINITE);
-                        snap_cmds.copy(src, tex.Get(), i == 2 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                        snap_cmds.copy(src, tex.Get(), i >= 2 ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                         snap_cmds.execute();
                         snap_cmds.wait(INFINITE);
                         ui_ok[i] = true;
@@ -995,11 +996,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                 // UI buffers: PNG with transparency if WIC can convert the format, and always the exact DDS.
                 // Build 26: PNG only (the 49 MB DDS copies are gone). _ui0 = UI buffer, _cap = the ANCHORED panel's capture.
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 4; ++i) {
                     if (!ui_ok[i] || ui_tex[i] == nullptr) {
                         continue;
                     }
-                    const auto png = dir / (hud.snapshot_stem + (i == 2 ? std::string{"_cap.png"} : fmt::format("_ui{}.png", i)));
+                    const auto png = dir / (hud.snapshot_stem + (i == 3 ? std::string{"_panel.png"} : (i == 2 ? std::string{"_cap.png"} : fmt::format("_ui{}.png", i))));
                     auto hr = DirectX::SaveWICTextureToFile(command_queue, ui_tex[i].Get(), GUID_ContainerFormatPng, png.wstring().c_str(),
                         D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, &GUID_WICPixelFormat32bppBGRA);
                     spdlog::info("[PragmataVR] Snapshot {} PNG {}", i == 2 ? std::string{"panel capture"} : fmt::format("UI buffer {}", i), SUCCEEDED(hr) ? "saved" : "failed");

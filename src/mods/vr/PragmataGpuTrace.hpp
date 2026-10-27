@@ -185,13 +185,14 @@ inline void report_redirects() {
     const auto cur = g_handoff_current_window.exchange(0);
     const auto older = g_handoff_older_window.exchange(0);
     const auto skipped = g_handoff_skipped_window.exchange(0);
+    const auto captures = g_captures_window.exchange(0);
     static int reports = 0;
     if (reports < 60) {
         ++reports;
         spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}; {} of the buffer reported last, {} of an older one, "
-            "{} not captured), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
+            "{} not the in-game buffer, {} copied to the panel), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
             "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
-            cur, older, skipped, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
+            cur, older, skipped, captures, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
     }
 }
 
@@ -391,6 +392,12 @@ inline std::atomic<uint32_t> g_game_ui_w{0};
 inline std::atomic<uint32_t> g_game_ui_h{0};
 inline std::atomic<int> g_game_ui_fmt{0};
 
+// Build 28: the engine passes the UI buffer through RENDER_TARGET -> other more than once per frame, and only the pass
+// right after the overlay hook hands the buffer out still holds the HUD (a later pass sees it wiped). The capture is
+// taken only on that first pass: note_ui_buffer arms the buffer, the first hand-off of it disarms it.
+inline std::atomic<ID3D12Resource*> g_ui_armed{nullptr};
+inline std::atomic<uint64_t> g_captures_window{0};
+
 // Called from the overlay layer hook with the UI buffer the engine is handing out right now.
 inline void note_ui_buffer(ID3D12Resource* r) {
     if (r == nullptr) {
@@ -398,6 +405,7 @@ inline void note_ui_buffer(ID3D12Resource* r) {
     }
     g_ui_notes_window++;
     g_ui_buffer = r;
+    g_ui_armed = r;
     const auto d = r->GetDesc();
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
         (uint64_t)d.Width * d.Height > (uint64_t)g_game_ui_w.load() * g_game_ui_h.load()) {
@@ -497,6 +505,12 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                 g_handoff_skipped_window++;
             } else {
                 ui_rtv = fresh_rtv(ui, du.Format);
+                ID3D12Resource* expected = ui;
+                if (!g_ui_armed.compare_exchange_strong(expected, nullptr)) {
+                    cap = nullptr; // not the first pass after the hand-out: the buffer may already be wiped
+                } else {
+                    g_captures_window++;
+                }
             }
             if (cap != nullptr) {
                 D3D12_RESOURCE_BARRIER pre[2]{};

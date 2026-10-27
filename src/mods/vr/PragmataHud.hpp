@@ -127,7 +127,7 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
     {70.0f, 900.0f, 400.0f, 1030.0f},  // health
     {720.0f, 950.0f, 1200.0f, 1050.0f}, // stamina
-    {1300.0f, 690.0f, 1920.0f, 1070.0f}, // weapon wheel
+    {1180.0f, 500.0f, 1920.0f, 1080.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box)
     {60.0f, 200.0f, 620.0f, 480.0f},   // tutorial box
 }};
 
@@ -206,7 +206,15 @@ struct HudTune {
     std::array<GroupTune, GroupCount> flat_groups{};
 
     void apply_hud_mode() {
-        hud_mode = std::clamp(hud_mode, 0, 2);
+        // Build 28: the old 3D mode is retired (FLAT or ANCHORED only), and the developer settings that could break
+        // FLAT or ANCHORED are fixed at their working values (their menu rows are gone).
+        hud_mode = hud_mode == HudModeAnchored ? HudModeAnchored : HudModeFlat;
+        hud_fixed = true;
+        glued_hud_removed = true;
+        flat_screen = true;
+        hide_blur = true;
+        hide_ghost = true;
+        engine_overlay = 0;
         flat_test = hud_mode == HudModeFlat || hud_mode == HudModeAnchored; // ANCHORED draws the HUD exactly like FLAT
         hud_panel = hud_mode == HudModeAnchored ? 1 : 0;                     // ... and moves the four elements to the panel
     }
@@ -821,7 +829,7 @@ private:
         column = 0;
         add_section(SectionView, "VIEW");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
-            "A = FLAT (follows your head), ANCHORED (health, stamina, weapons, tutorial fixed in the room) or 3D (older)");
+            "A = FLAT (follows your head) or ANCHORED (health, stamina, weapons, tutorial fixed in the room)");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
             "A = edit. How far away the anchored HUD sits (meters). Its size in view stays the same");
@@ -833,20 +841,8 @@ private:
         add_section(SectionDeveloper, "DEVELOPER");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
             "A = ANCHORED: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGluedHud, "Glued HUD",
-            "A = ANCHORED: REMOVED (elements only on the room-fixed panel) or SHOWN (also stuck to your view)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleFlatScreen, "FLAT 3D panels",
-            "A = FLAT mode: SCREEN (3D panels drawn as flat screen pieces, like their bars and text) or WORLD (Builds 21-23)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBlur, "Frosted glass",
-            "A = FLAT mode: hide or show the blurred glass behind HUD elements (it does not follow size and position)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleGhost, "Ghost layer", "A = show or hide the game's grey double image behind HUD boxes");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudFixed, "HUD position", "A = 3D mode: HUD fixed in the room, or follows your head");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleCompanion, "Companion layers",
-            "A = 3D mode: WITH ELEMENT (bars and numbers move with their element), REFRAMEWORK (old floating sheet), or HIDDEN");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleScaleCenter, "Size grows from",
-            "A = 3D mode: element center (keeps it in place) or panel origin (old behaviour)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleEngineOverlay, "Engine UI blend",
-            "A = test: DEFAULT, OFF (skip the engine's overlay draw) or ON. Note what disappears from view");
+        // Build 28: Glued HUD, FLAT 3D panels, Frosted glass, Ghost layer, HUD position, Companion layers, Size grows from
+        // and Engine UI blend are gone (fixed in HudTune::apply_hud_mode).
 
         column = 1;
         add_element(GroupHack);
@@ -1481,8 +1477,8 @@ private:
                     spdlog::info("[PragmataVR] Menu: ghost layer {}", t->hide_ghost ? "hidden" : "shown");
                     play_click(true);
                 } else if (row.action == ActionToggleHudPanel) {
-                    // 3D -> FLAT -> PANEL -> 3D
-                    t->hud_mode = (t->hud_mode + 1) % 3;
+                    // Build 28: FLAT <-> ANCHORED
+                    t->hud_mode = t->hud_mode == HudModeAnchored ? HudModeFlat : HudModeAnchored;
                     t->apply_hud_mode();
                     commit(t);
                     companion_generation++;
@@ -1801,12 +1797,22 @@ struct AnchoredBox {
     long x0{0}, y0{0}, x1{0}, y1{0};
 };
 
-inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h) {
+// Build 28: the frame (VR frame count) each element last drew in FLAT / ANCHORED. Its box is only used while it draws,
+// so menus and windows that hide the HUD are not cut.
+inline std::array<std::atomic<int>, GroupCount> g_group_drawn_frame{};
+
+inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h, int frame = -1) {
     std::vector<AnchoredBox> out{};
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
     const float ox = (w - 1920.0f * s) * 0.5f;
     const float oy = (h - 1080.0f * s) * 0.5f;
     for (int g = GroupHealth; g <= GroupTutorial; ++g) {
+        if (frame >= 0) {
+            const int age = frame - g_group_drawn_frame[g].load();
+            if (age < 0 || age > 4) {
+                continue; // not drawn in the last few frames
+            }
+        }
         const auto& b = FLAT_BOXES[g];
         const auto& gt = t.flat_groups[g];
         const float px = FLAT_PIVOTS[g][0];
