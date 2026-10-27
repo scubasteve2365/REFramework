@@ -125,7 +125,7 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
 // and position) from the eye images to the room-fixed panel. The hacking circle is not anchored.
 inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
-    {70.0f, 900.0f, 400.0f, 1030.0f},  // health
+    {0.0f, 900.0f, 400.0f, 1030.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes)
     {720.0f, 950.0f, 1200.0f, 1050.0f}, // stamina
     {1180.0f, 500.0f, 1920.0f, 1080.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box)
     {60.0f, 200.0f, 620.0f, 480.0f},   // tutorial box

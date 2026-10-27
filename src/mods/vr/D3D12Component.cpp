@@ -440,6 +440,8 @@ struct PragmataHudPanel {
     // Build 25: the panel image, built from the element areas only (everything else transparent), plus box outlines.
     Microsoft::WRL::ComPtr<ID3D12Resource> comp{};
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> comp_heap{};
+    // Build 30: more capture textures (src is slot 0), one per UI buffer texture in flight; see pragmata_trace::Slot.
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, pragmata_trace::SLOT_COUNT - 1> more{};
 };
 
 PragmataHudPanel g_pragmata_hud{};
@@ -513,11 +515,18 @@ void pragmata_capture_ui_buffer(VR* vr) {
 
     if (p.src == nullptr || p.src_w != (int32_t)d0.Width || p.src_h != (int32_t)d0.Height || p.src_format != d0.Format) {
         pragmata_trace::g_capture = nullptr;
+        pragmata_trace::set_slots({});
         p.src_cmds.wait(INFINITE);
         // Build 27: the old capture is kept alive (a render thread may still be recording a copy into it).
         static std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> retired{};
         if (p.src != nullptr) {
             retired.push_back(p.src);
+        }
+        for (auto& m : p.more) {
+            if (m != nullptr) {
+                retired.push_back(m);
+            }
+            m.Reset();
         }
         p.src.Reset();
         D3D12_RESOURCE_DESC d = d0;
@@ -529,10 +538,22 @@ void pragmata_capture_ui_buffer(VR* vr) {
             p.failed = true;
             return;
         }
+        std::array<ID3D12Resource*, pragmata_trace::SLOT_COUNT> slots{};
+        slots[0] = p.src.Get();
+        int made = 1;
+        for (size_t i = 0; i < p.more.size(); ++i) {
+            if (SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&p.more[i])))) {
+                slots[i + 1] = p.more[i].Get();
+                ++made;
+            } else {
+                p.more[i].Reset();
+            }
+        }
         p.src_w = (int32_t)d0.Width;
         p.src_h = (int32_t)d0.Height;
         p.src_format = d0.Format;
-        spdlog::info("[PragmataVR] HUD panel: capturing the UI buffer, {} x {}, format {}", p.src_w, p.src_h, (int)p.src_format);
+        pragmata_trace::set_slots(slots);
+        spdlog::info("[PragmataVR] HUD panel: capturing the UI buffer, {} x {}, format {}, {} capture slots", p.src_w, p.src_h, (int)p.src_format, made);
     }
 
     // Build 20: the copy is normally taken at the UI buffer hand-off, on the engine's command list (see
@@ -697,6 +718,12 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     cmds.wait(INFINITE);
     p.src_cmds.wait(INFINITE); // the capture copy must be finished
 
+    // Build 30: the capture slot written at the latest hand-off.
+    ID3D12Resource* cap = pragmata_trace::latest_slot_res();
+    if (cap == nullptr) {
+        cap = p.src.Get();
+    }
+
     // Build 25: the panel shows only the element areas (the same areas cleared from the eye images), so the hacking
     // circle and enemy markers stay in the eyes only. Show element boxes adds a cyan outline around each area.
     if (pragmata_ensure_comp(p)) {
@@ -722,10 +749,10 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         tr(p.comp.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
         cl->ClearRenderTargetView(rtv, clear, 0, nullptr);
         tr(p.comp.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
-        tr(p.src.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        tr(cap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
         D3D12_TEXTURE_COPY_LOCATION src_loc{};
-        src_loc.pResource = p.src.Get();
+        src_loc.pResource = cap;
         src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         D3D12_TEXTURE_COPY_LOCATION dst_loc{};
         dst_loc.pResource = p.comp.Get();
@@ -734,7 +761,7 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
             D3D12_BOX box{(UINT)r.left, (UINT)r.top, 0u, (UINT)r.right, (UINT)r.bottom, 1u};
             cl->CopyTextureRegion(&dst_loc, (UINT)r.left, (UINT)r.top, 0, &src_loc, &box);
         }
-        tr(p.src.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        tr(cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
         if (tune->show_boxes && !rects.empty()) {
             tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -759,7 +786,7 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         cmds.has_commands = true;
     } else {
-        cmds.copy(p.src.Get(), p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmds.copy(cap, p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     cmds.execute();
 
@@ -959,7 +986,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 for (int i = 0; i < 4; ++i) {
                     ui_ok[i] = false;
                     // Build 28: slot 3 = the panel image (what the anchored panel was last given). Slot 1 is no longer read.
-                    ID3D12Resource* src = i == 0 ? pragmata_trace::g_ui_buffer.load() : (i == 1 ? nullptr : (i == 2 ? g_pragmata_hud.src.Get() : g_pragmata_hud.comp.Get()));
+                    ID3D12Resource* src = i == 0 ? pragmata_trace::g_ui_buffer.load() : (i == 1 ? nullptr : (i == 2 ? pragmata_trace::latest_slot_res() : g_pragmata_hud.comp.Get()));
                     if (src == nullptr) {
                         spdlog::info("[PragmataVR] Snapshot: UI buffer {} is not available", i);
                         continue;

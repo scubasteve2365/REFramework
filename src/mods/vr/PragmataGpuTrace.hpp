@@ -23,6 +23,8 @@
 #include <vector>
 #include <optional>
 #include <chrono>
+#include <array>
+#include <string>
 
 #include <utility/FunctionHook.hpp>
 
@@ -53,6 +55,9 @@ inline std::unique_ptr<FunctionHook> g_draw_indexed_hook{};
 inline std::unique_ptr<FunctionHook> g_copy_region_hook{};
 inline std::unique_ptr<FunctionHook> g_copy_resource_hook{};
 inline std::unique_ptr<FunctionHook> g_barrier_hook{};
+inline std::unique_ptr<FunctionHook> g_clear_rtv_hook{};       // Build 30: diagnostics only
+inline std::unique_ptr<FunctionHook> g_execute_indirect_hook{}; // Build 30: diagnostics only
+inline std::unique_ptr<FunctionHook> g_execute_bundle_hook{};   // Build 30: diagnostics only
 
 inline std::shared_mutex g_rtv_mtx{};
 inline std::unordered_map<uint64_t, RtvInfo> g_rtvs{};
@@ -98,6 +103,53 @@ inline std::atomic<int> g_game_ui_fmt{0};
 inline std::atomic<uint64_t> g_captures_window{0};         // hand-offs copied to the panel
 inline std::atomic<uint64_t> g_drawn_handoffs_window{0};   // Build 29: hand-offs with draws since the previous one
 inline std::atomic<uint64_t> g_fallback_window{0};         // Build 29: copies made by the every-pass fallback
+
+// Build 30: why the ANCHORED panel was empty (Builds 27-29). The Build 29 snapshots show the capture full of HUD at the
+// left eye's present while the panel image, built later just before xrEndFrame, had only empty boxes, and the UI buffer
+// itself held only the reticle. In Two Frame Sequential the engine hands the same UI buffer out again for the right
+// eye without drawing the UI again, so the second hand-off copied our own erased buffer over the good capture. FLAT
+// shows the HUD in both eyes for the same reason (nothing is erased there).
+//
+// Fix: the erase is undone right after the eye blend. When the engine turns the UI buffer back into a render target
+// (other -> RENDER_TARGET, after the blend has read it), the cleared element areas are copied back from the capture
+// taken at the hand-off. The buffer then always holds the full HUD outside the blend, so every hand-off copy is good,
+// whether the engine draws the UI again or not. If the engine does draw again, it simply overwrites the restore.
+//
+// Captures go into a few slots (one per UI buffer texture, the engine may rotate several), each remembering which
+// buffer it holds and the areas cleared from it. The panel reads the slot written last.
+inline constexpr int SLOT_COUNT = 3;
+struct Slot {
+    ID3D12Resource* res{nullptr};       // capture texture (owned by D3D12Component), kept in D3D12_RESOURCE_STATE_COMMON
+    ID3D12Resource* owner{nullptr};     // UI buffer it was copied from
+    std::vector<D3D12_RECT> rects{};    // areas cleared from owner after the copy
+    bool pending{false};                // owner is erased and not restored yet
+    uint64_t used{0};                   // hand-off number of the last copy (least recently used gets reused)
+};
+inline std::mutex g_slot_mtx{};
+inline std::array<Slot, SLOT_COUNT> g_slots{};
+inline std::atomic<int> g_latest_slot{0};                  // slot the panel reads
+inline std::atomic<uint64_t> g_restores_window{0};         // erases undone after the blend
+inline std::atomic<uint64_t> g_unrestored_window{0};       // hand-offs that found their buffer still erased (copy skipped)
+inline std::atomic<uint64_t> g_evicted_window{0};          // slots reused while their buffer was still erased
+inline std::atomic<uint64_t> g_engine_clears_window{0};    // engine ClearRenderTargetView on a UI buffer
+inline std::atomic<uint64_t> g_indirect_ui_window{0};      // ExecuteIndirect while a UI buffer is bound
+inline std::atomic<uint64_t> g_bundle_ui_window{0};        // ExecuteBundle while a UI buffer is bound
+inline std::atomic<uint64_t> g_draws_ui_window{0};         // DrawInstanced / DrawIndexedInstanced while a UI buffer is bound
+
+// Called by D3D12Component when it (re)creates the capture textures. Pass nullptrs to stop capturing.
+inline void set_slots(const std::array<ID3D12Resource*, SLOT_COUNT>& res) {
+    std::scoped_lock _{g_slot_mtx};
+    for (int i = 0; i < SLOT_COUNT; ++i) {
+        g_slots[i] = Slot{};
+        g_slots[i].res = res[i];
+    }
+    g_latest_slot = 0;
+}
+
+inline ID3D12Resource* latest_slot_res() {
+    std::scoped_lock _{g_slot_mtx};
+    return g_slots[g_latest_slot.load() % SLOT_COUNT].res;
+}
 
 // Build 29: which pass of the UI buffer holds the HUD varies from frame to frame (some passes see it wiped). So the
 // draws made into each UI buffer are counted (OMSetRenderTargets binding a remembered UI buffer, then draws on that
@@ -240,6 +292,20 @@ inline void report_redirects() {
     const auto captures = g_captures_window.exchange(0);
     const auto drawn = g_drawn_handoffs_window.exchange(0);
     const auto fallback = g_fallback_window.exchange(0);
+    const auto restores = g_restores_window.exchange(0);
+    const auto unrestored = g_unrestored_window.exchange(0);
+    const auto evicted = g_evicted_window.exchange(0);
+    const auto clears = g_engine_clears_window.exchange(0);
+    const auto indirect = g_indirect_ui_window.exchange(0);
+    const auto bundles = g_bundle_ui_window.exchange(0);
+    const auto draws_ui = g_draws_ui_window.exchange(0);
+    int slots_used = 0;
+    {
+        std::scoped_lock _{g_slot_mtx};
+        for (const auto& sl : g_slots) {
+            slots_used += sl.owner != nullptr ? 1 : 0;
+        }
+    }
     static int reports = 0;
     if (reports < 60) {
         ++reports;
@@ -247,6 +313,10 @@ inline void report_redirects() {
             "{} not the in-game buffer, {} with draws, {} copied to the panel, {} of them by the every-pass fallback), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
             "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
             cur, older, skipped, drawn, captures, fallback, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
+        spdlog::info("[PragmataVR] HUD restore: last 10 s, {} erases undone after the blend, {} hand-offs found their buffer still "
+            "erased (copy skipped), {} slots reused while erased, {} of {} capture slots in use (panel reads slot {}); while a UI buffer "
+            "was bound: {} engine clears, {} draws, {} ExecuteIndirect, {} ExecuteBundle",
+            restores, unrestored, evicted, slots_used, SLOT_COUNT, g_latest_slot.load(), clears, draws_ui, indirect, bundles);
     }
 }
 
@@ -406,6 +476,7 @@ inline void count_draw(ID3D12GraphicsCommandList* self) {
 inline void STDMETHODCALLTYPE draw(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, UINT d) {
     if (t_ui_list == self && t_ui_res != nullptr) {
         add_ui_draw(t_ui_res);
+        g_draws_ui_window++;
     }
     count_draw(self);
     g_draw_hook->get_original<decltype(draw)>()(self, a, b, c, d);
@@ -414,9 +485,47 @@ inline void STDMETHODCALLTYPE draw(ID3D12GraphicsCommandList* self, UINT a, UINT
 inline void STDMETHODCALLTYPE draw_indexed(ID3D12GraphicsCommandList* self, UINT a, UINT b, UINT c, INT d, UINT e) {
     if (t_ui_list == self && t_ui_res != nullptr) {
         add_ui_draw(t_ui_res);
+        g_draws_ui_window++;
     }
     count_draw(self);
     g_draw_indexed_hook->get_original<decltype(draw_indexed)>()(self, a, b, c, d, e);
+}
+
+inline bool is_recent_ui_buffer(ID3D12Resource* r);
+
+// Build 30 diagnostics: how does the engine draw its UI? Builds 18-29 never saw a DrawInstanced / DrawIndexedInstanced
+// while the UI buffer was bound. These count the other ways (and engine clears of the UI buffer) for the log line.
+inline void STDMETHODCALLTYPE execute_indirect(ID3D12GraphicsCommandList* self, ID3D12CommandSignature* sig, UINT max_count,
+    ID3D12Resource* args, UINT64 args_offset, ID3D12Resource* count_buf, UINT64 count_offset) {
+    if (t_ui_list == self && t_ui_res != nullptr) {
+        g_indirect_ui_window++;
+    }
+    g_execute_indirect_hook->get_original<decltype(execute_indirect)>()(self, sig, max_count, args, args_offset, count_buf, count_offset);
+}
+
+inline void STDMETHODCALLTYPE execute_bundle(ID3D12GraphicsCommandList* self, ID3D12GraphicsCommandList* bundle) {
+    if (t_ui_list == self && t_ui_res != nullptr) {
+        g_bundle_ui_window++;
+    }
+    g_execute_bundle_hook->get_original<decltype(execute_bundle)>()(self, bundle);
+}
+
+inline void STDMETHODCALLTYPE clear_rtv(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT color[4], UINT n,
+    const D3D12_RECT* rects) {
+    if (g_intercept.load()) {
+        ID3D12Resource* res = nullptr;
+        {
+            std::shared_lock _{g_rtv_mtx};
+            auto it = g_rtvs.find(h.ptr);
+            if (it != g_rtvs.end()) {
+                res = it->second.res;
+            }
+        }
+        if (res != nullptr && is_recent_ui_buffer(res)) {
+            g_engine_clears_window++;
+        }
+    }
+    g_clear_rtv_hook->get_original<decltype(clear_rtv)>()(self, h, color, n, rects);
 }
 
 inline void log_copy(ID3D12GraphicsCommandList* self, ID3D12Resource* dst, ID3D12Resource* src) {
@@ -552,105 +661,212 @@ inline uint64_t fresh_rtv(ID3D12Resource* r, DXGI_FORMAT format) {
     return (uint64_t)h.ptr;
 }
 
+inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b);
+
+inline void transition(ID3D12GraphicsCommandList* self, ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to,
+    ID3D12Resource* r2 = nullptr, D3D12_RESOURCE_STATES from2 = D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATES to2 = D3D12_RESOURCE_STATE_COMMON) {
+    D3D12_RESOURCE_BARRIER br[2]{};
+    for (int i = 0; i < 2; ++i) {
+        br[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        br[i].Transition.pResource = i == 0 ? r : r2;
+        br[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        br[i].Transition.StateBefore = i == 0 ? from : from2;
+        br[i].Transition.StateAfter = i == 0 ? to : to2;
+    }
+    g_barrier_hook->get_original<decltype(barrier)>()(self, r2 != nullptr ? 2u : 1u, br);
+}
+
+inline void raw_copy_region(ID3D12GraphicsCommandList* self, ID3D12Resource* dst, ID3D12Resource* src, const D3D12_RECT& r) {
+    D3D12_TEXTURE_COPY_LOCATION s{};
+    s.pResource = src;
+    s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION d{};
+    d.pResource = dst;
+    d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_BOX box{(UINT)r.left, (UINT)r.top, 0u, (UINT)r.right, (UINT)r.bottom, 1u};
+    if (g_copy_region_hook != nullptr) {
+        g_copy_region_hook->get_original<decltype(copy_region)>()(self, &d, (UINT)r.left, (UINT)r.top, 0, &s, &box);
+    } else {
+        self->CopyTextureRegion(&d, (UINT)r.left, (UINT)r.top, 0, &s, &box);
+    }
+}
+
 inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
     auto original = g_barrier_hook->get_original<decltype(barrier)>();
 
-    if (g_intercept.load() && b != nullptr) {
-        bool handoff = false;
-        ID3D12Resource* ui = nullptr;
-        uint64_t ui_rtv = 0;
-        for (UINT i = 0; i < n && !handoff; ++i) {
-            const auto& t = b[i];
-            if (t.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION && t.Transition.pResource != nullptr &&
-                t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET && t.Transition.StateAfter != D3D12_RESOURCE_STATE_RENDER_TARGET &&
-                is_recent_ui_buffer(t.Transition.pResource)) {
-                handoff = true;
-                ui = t.Transition.pResource;
-            }
-        }
+    if (!g_intercept.load() || b == nullptr) {
+        original(self, n, b);
+        return;
+    }
 
-        if (handoff) {
-            g_handoffs++;
-            g_handoffs_window++;
-            if (ui == g_ui_buffer.load()) {
-                g_handoff_current_window++;
-            } else {
-                g_handoff_older_window++;
+    bool handoff = false;
+    ID3D12Resource* ui = nullptr;
+    ID3D12Resource* back_to_rt[4]{};
+    int back_count = 0;
+    for (UINT i = 0; i < n; ++i) {
+        const auto& t = b[i];
+        if (t.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || t.Transition.pResource == nullptr) {
+            continue;
+        }
+        const bool from_rt = t.Transition.StateBefore == D3D12_RESOURCE_STATE_RENDER_TARGET;
+        const bool to_rt = t.Transition.StateAfter == D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (from_rt && !to_rt && !handoff && is_recent_ui_buffer(t.Transition.pResource)) {
+            handoff = true;
+            ui = t.Transition.pResource;
+        } else if (!from_rt && to_rt && (t.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) == 0 && back_count < 4 &&
+                   is_recent_ui_buffer(t.Transition.pResource)) {
+            back_to_rt[back_count++] = t.Transition.pResource;
+        }
+    }
+
+    if (handoff) {
+        g_handoffs++;
+        g_handoffs_window++;
+        if (ui == g_ui_buffer.load()) {
+            g_handoff_current_window++;
+        } else {
+            g_handoff_older_window++;
+        }
+        // Build 27: only the in-game UI buffer (2D render target with the capture's size and format) is captured or
+        // cleared. The texture is the one being transitioned, so it is alive here.
+        auto cap0 = g_capture.load();
+        const auto du = ui->GetDesc();
+        bool game_ui = cap0 != nullptr && du.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                       (du.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 && du.MipLevels == 1 && du.DepthOrArraySize == 1;
+        if (game_ui) {
+            const auto dc = cap0->GetDesc();
+            game_ui = dc.Width == du.Width && dc.Height == du.Height && dc.Format == du.Format;
+        }
+        if (!game_ui) {
+            g_handoff_skipped_window++;
+        } else {
+            if (take_ui_draws(ui) > 0) {
+                g_drawn_handoffs_window++;
             }
-            // Build 27: only the in-game UI buffer (2D render target with the capture's size and format) is captured or
-            // cleared. The texture is the one being transitioned, so it is alive here.
-            auto cap = g_capture.load();
-            const auto du = ui->GetDesc();
-            bool game_ui = cap != nullptr && du.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-                           (du.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 && du.MipLevels == 1 && du.DepthOrArraySize == 1;
-            if (game_ui) {
-                const auto dc = cap->GetDesc();
-                game_ui = dc.Width == du.Width && dc.Height == du.Height && dc.Format == du.Format;
+
+            std::vector<D3D12_RECT> rects{};
+            if (g_erase.load()) {
+                std::scoped_lock _{g_rects_mtx};
+                rects = g_rects;
             }
-            if (!game_ui) {
-                cap = nullptr;
-                g_handoff_skipped_window++;
-            } else {
-                ui_rtv = fresh_rtv(ui, du.Format);
-                // Build 29: copy only a pass that had draws since the previous hand-off (a wiped pass has none),
-                // unless no such pass has been seen for a second (fallback: every pass, as in Build 27).
-                const auto draws = take_ui_draws(ui);
-                const auto now = now_ms();
-                if (draws > 0) {
-                    g_drawn_handoffs_window++;
-                    g_last_drawn_handoff_ms = now;
-                    g_captures_window++;
-                } else if (now - g_last_drawn_handoff_ms.load() > 1000) {
-                    g_fallback_window++;
-                    g_captures_window++;
-                } else {
-                    cap = nullptr;
+
+            // Pick the slot: the one already holding this buffer, else the least recently used (preferring one whose
+            // buffer is not waiting for a restore).
+            ID3D12Resource* cap = nullptr;
+            bool copy = true;
+            {
+                std::scoped_lock _{g_slot_mtx};
+                int pick = -1;
+                for (int i = 0; i < SLOT_COUNT; ++i) {
+                    if (g_slots[i].res != nullptr && g_slots[i].owner == ui) {
+                        pick = i;
+                        break;
+                    }
+                }
+                if (pick < 0) {
+                    for (int pass = 0; pass < 2 && pick < 0; ++pass) {
+                        uint64_t oldest = UINT64_MAX;
+                        for (int i = 0; i < SLOT_COUNT; ++i) {
+                            const auto& sl = g_slots[i];
+                            if (sl.res == nullptr || (pass == 0 && sl.pending)) {
+                                continue;
+                            }
+                            if (sl.used < oldest) {
+                                oldest = sl.used;
+                                pick = i;
+                            }
+                        }
+                    }
+                }
+                if (pick >= 0) {
+                    auto& sl = g_slots[pick];
+                    if (sl.owner == ui && sl.pending) {
+                        // Still erased from the last hand-off (no turn back to render target seen): copying now would
+                        // take our own empty areas. Keep the slot as it is; erase again below.
+                        copy = false;
+                        g_unrestored_window++;
+                    } else if (sl.owner != ui && sl.pending) {
+                        g_evicted_window++;
+                    }
+                    if (copy) {
+                        sl.owner = ui;
+                        sl.used = g_handoffs.load();
+                        g_latest_slot = pick;
+                    }
+                    sl.rects = rects;
+                    sl.pending = !rects.empty();
+                    cap = copy ? sl.res : nullptr;
                 }
             }
-            if (cap != nullptr) {
-                D3D12_RESOURCE_BARRIER pre[2]{};
-                pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                pre[0].Transition.pResource = ui;
-                pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                pre[1].Transition.pResource = cap;
-                pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-                pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                original(self, 2, pre);
 
+            if (cap != nullptr) {
+                g_captures_window++;
+                transition(self, ui, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    cap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
                 if (g_copy_resource_hook != nullptr) {
                     g_copy_resource_hook->get_original<decltype(copy_resource)>()(self, cap, ui);
                 } else {
                     self->CopyResource(cap, ui);
                 }
-
-                D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
-                std::swap(post[0].Transition.StateBefore, post[0].Transition.StateAfter);
-                std::swap(post[1].Transition.StateBefore, post[1].Transition.StateAfter);
-                original(self, 2, post);
+                transition(self, ui, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    cap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             }
 
-            const auto rtv = ui_rtv;
-            if (g_erase.load() && game_ui && rtv != 0) {
-                std::vector<D3D12_RECT> rects{};
-                {
-                    std::scoped_lock _{g_rects_mtx};
-                    rects = g_rects;
-                }
-                if (!rects.empty()) {
+            // Erase the element areas so they do not reach the eye images (undone after the blend, see below).
+            if (!rects.empty()) {
+                const auto rtv = fresh_rtv(ui, du.Format);
+                if (rtv != 0) {
                     const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
                     D3D12_CPU_DESCRIPTOR_HANDLE h{};
                     h.ptr = (SIZE_T)rtv;
-                    self->ClearRenderTargetView(h, clear, (UINT)rects.size(), rects.data());
+                    if (g_clear_rtv_hook != nullptr) {
+                        g_clear_rtv_hook->get_original<decltype(clear_rtv)>()(self, h, clear, (UINT)rects.size(), rects.data());
+                    } else {
+                        self->ClearRenderTargetView(h, clear, (UINT)rects.size(), rects.data());
+                    }
+                } else {
+                    std::scoped_lock _{g_slot_mtx};
+                    for (auto& sl : g_slots) {
+                        if (sl.owner == ui) {
+                            sl.pending = false; // nothing was erased
+                        }
+                    }
                 }
             }
         }
     }
 
     original(self, n, b);
+
+    // Build 30: the buffer is a render target again (the blend has read it): put the erased areas back from the capture
+    // taken at its hand-off, so the next hand-off (often the right eye, with no new UI drawn) still holds the full HUD.
+    for (int k = 0; k < back_count; ++k) {
+        ID3D12Resource* r = back_to_rt[k];
+        ID3D12Resource* cap = nullptr;
+        std::vector<D3D12_RECT> rects{};
+        {
+            std::scoped_lock _{g_slot_mtx};
+            for (auto& sl : g_slots) {
+                if (sl.res != nullptr && sl.owner == r && sl.pending) {
+                    sl.pending = false;
+                    cap = sl.res;
+                    rects = sl.rects;
+                    break;
+                }
+            }
+        }
+        if (cap == nullptr || rects.empty()) {
+            continue;
+        }
+        g_restores_window++;
+        transition(self, r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST,
+            cap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (const auto& rc : rects) {
+            raw_copy_region(self, r, cap, rc);
+        }
+        transition(self, r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET,
+            cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
 }
 
 // Our own RTV of the UI buffer for the clear; recreated when the buffer changes. Called from the present thread.
@@ -746,6 +962,10 @@ inline bool install(ID3D12Device* device) {
     ok = make(g_copy_region_hook, list_vt[16], (uintptr_t)&copy_region, "CopyTextureRegion") && ok;
     ok = make(g_copy_resource_hook, list_vt[17], (uintptr_t)&copy_resource, "CopyResource") && ok;
     ok = make(g_barrier_hook, list_vt[26], (uintptr_t)&barrier, "ResourceBarrier") && ok;
+    // Build 30 diagnostics (a failure here does not stop the HUD).
+    make(g_execute_bundle_hook, list_vt[27], (uintptr_t)&execute_bundle, "ExecuteBundle");
+    make(g_clear_rtv_hook, list_vt[48], (uintptr_t)&clear_rtv, "ClearRenderTargetView");
+    make(g_execute_indirect_hook, list_vt[59], (uintptr_t)&execute_indirect, "ExecuteIndirect");
 
     spdlog::info("[PragmataVR] GPU trace hooks {} (RTV descriptor size {})", ok ? "installed" : "partly failed", g_rtv_increment);
     return ok;
