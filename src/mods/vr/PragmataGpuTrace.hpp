@@ -104,51 +104,187 @@ inline std::atomic<uint64_t> g_captures_window{0};         // hand-offs copied t
 inline std::atomic<uint64_t> g_drawn_handoffs_window{0};   // Build 29: hand-offs with draws since the previous one
 inline std::atomic<uint64_t> g_fallback_window{0};         // Build 29: copies made by the every-pass fallback
 
-// Build 30: why the ANCHORED panel was empty (Builds 27-29). The Build 29 snapshots show the capture full of HUD at the
-// left eye's present while the panel image, built later just before xrEndFrame, had only empty boxes, and the UI buffer
-// itself held only the reticle. In Two Frame Sequential the engine hands the same UI buffer out again for the right
-// eye without drawing the UI again, so the second hand-off copied our own erased buffer over the good capture. FLAT
-// shows the HUD in both eyes for the same reason (nothing is erased there).
+// Build 31: pick the HUD capture by its content.
 //
-// Fix: the erase is undone right after the eye blend. When the engine turns the UI buffer back into a render target
-// (other -> RENDER_TARGET, after the blend has read it), the cleared element areas are copied back from the capture
-// taken at the hand-off. The buffer then always holds the full HUD outside the blend, so every hand-off copy is good,
-// whether the engine draws the UI again or not. If the engine does draw again, it simply overwrites the restore.
+// Build 29 / 30 snapshots: the capture taken at a hand-off is often full (all four elements), but the panel built
+// right before xrEndFrame was empty every time. The engine hands its UI buffer off about twice per eye frame and some
+// of those passes are completely blank (not even the reticle; Build 30 run: a new pool texture almost every frame and
+// one engine clear per frame). Which pass comes last before the panel is built is not the full one. Draw counting
+// cannot tell them apart (the hooks never see the engine's UI draws: 0 draws, 0 ExecuteIndirect, 0 ExecuteBundle).
 //
-// Captures go into a few slots (one per UI buffer texture, the engine may rotate several), each remembering which
-// buffer it holds and the areas cleared from it. The panel reads the slot written last.
-inline constexpr int SLOT_COUNT = 3;
+// So every hand-off is copied (element boxes only) into one of a few capture slots, and some rows of each element box
+// are copied into a small CPU-readable buffer ("probes"). Two presents later a fence signalled on the game's queue
+// says the GPU has finished, the probe rows are read, and each slot is marked with which elements actually have pixels.
+// At the panel, each element is taken from the newest slot that really holds it and kept in a "good" texture, so the
+// panel never shows a blank pass and keeps the last good image until a newer one arrives. An element that stops
+// drawing leaves the panel through the existing 10-frame check (its box is dropped).
+inline constexpr int SLOT_COUNT = 8;
+inline constexpr int PROBE_ROWS_MAX = 24;
+inline constexpr UINT64 PROBE_BYTES = 1600ull * 1024ull;
+inline constexpr int PROBE_GROUPS = 8;
+enum SlotState : int {
+    SlotFree = 0,
+    SlotPending = 1, // copy recorded, GPU result not known yet
+    SlotReady = 2,   // probes read
+    SlotInUse = 3,   // the panel is copying from it this frame
+};
+struct Probe {
+    int group{0};
+    UINT64 offset{0};
+    UINT width{0};
+};
 struct Slot {
-    ID3D12Resource* res{nullptr};       // capture texture (owned by D3D12Component), kept in D3D12_RESOURCE_STATE_COMMON
-    ID3D12Resource* owner{nullptr};     // UI buffer it was copied from
-    std::vector<D3D12_RECT> rects{};    // areas cleared from owner after the copy
-    bool pending{false};                // owner is erased and not restored yet
-    uint64_t used{0};                   // hand-off number of the last copy (least recently used gets reused)
+    ID3D12Resource* res{nullptr};      // capture texture (owned by D3D12Component), kept in D3D12_RESOURCE_STATE_COMMON
+    ID3D12Resource* readback{nullptr}; // probe rows (owned by D3D12Component), readback heap, always COPY_DEST
+    const uint8_t* mapped{nullptr};
+    int state{SlotFree};
+    uint64_t seq{0};                   // hand-off order
+    int presents{0};                   // presents since the copy was recorded
+    uint64_t fence{0};                 // probe fence value that covers the copy (0 = not assigned yet)
+    std::vector<D3D12_RECT> rects{};   // element boxes copied into res (same coordinates as the UI buffer)
+    std::vector<int> groups{};
+    std::vector<Probe> probes{};
+    std::array<bool, PROBE_GROUPS> has{};
 };
 inline std::mutex g_slot_mtx{};
 inline std::array<Slot, SLOT_COUNT> g_slots{};
-inline std::atomic<int> g_latest_slot{0};                  // slot the panel reads
-inline std::atomic<uint64_t> g_restores_window{0};         // erases undone after the blend
-inline std::atomic<uint64_t> g_unrestored_window{0};       // hand-offs that found their buffer still erased (copy skipped)
-inline std::atomic<uint64_t> g_evicted_window{0};          // slots reused while their buffer was still erased
+inline uint64_t g_slot_seq{0};                             // guarded by g_slot_mtx
+inline std::vector<int> g_rect_groups{};                   // group of each g_rects entry (guarded by g_rects_mtx)
+inline Microsoft::WRL::ComPtr<ID3D12Fence> g_probe_fence{};
+inline uint64_t g_probe_fence_value{0};                    // guarded by g_slot_mtx
+inline std::atomic<uint64_t> g_probe_captures_window{0};   // hand-offs copied into a slot
+inline std::atomic<uint64_t> g_probe_read_window{0};       // slots whose probes were read
+inline std::atomic<uint64_t> g_probe_blank_window{0};      // ... with no element pixels at all
+inline std::atomic<uint64_t> g_probe_evicted_window{0};    // slots reused before their probes were read
+inline std::atomic<uint64_t> g_probe_noslot_window{0};     // hand-offs with no slot free
+inline std::array<std::atomic<uint64_t>, PROBE_GROUPS> g_probe_has_window{};   // read slots holding each element
+inline std::array<std::atomic<uint64_t>, PROBE_GROUPS> g_panel_update_window{}; // panel updates of each element
 inline std::atomic<uint64_t> g_engine_clears_window{0};    // engine ClearRenderTargetView on a UI buffer
 inline std::atomic<uint64_t> g_indirect_ui_window{0};      // ExecuteIndirect while a UI buffer is bound
 inline std::atomic<uint64_t> g_bundle_ui_window{0};        // ExecuteBundle while a UI buffer is bound
 inline std::atomic<uint64_t> g_draws_ui_window{0};         // DrawInstanced / DrawIndexedInstanced while a UI buffer is bound
 
-// Called by D3D12Component when it (re)creates the capture textures. Pass nullptrs to stop capturing.
-inline void set_slots(const std::array<ID3D12Resource*, SLOT_COUNT>& res) {
+// Called by D3D12Component when it (re)creates the capture textures and probe buffers. Pass nullptrs to stop.
+inline void set_slots(const std::array<ID3D12Resource*, SLOT_COUNT>& res, const std::array<ID3D12Resource*, SLOT_COUNT>& readback) {
     std::scoped_lock _{g_slot_mtx};
     for (int i = 0; i < SLOT_COUNT; ++i) {
         g_slots[i] = Slot{};
+        if (res[i] == nullptr || readback[i] == nullptr) {
+            continue;
+        }
+        void* ptr = nullptr;
+        D3D12_RANGE range{0, (SIZE_T)PROBE_BYTES};
+        if (FAILED(readback[i]->Map(0, &range, &ptr)) || ptr == nullptr) {
+            continue;
+        }
         g_slots[i].res = res[i];
+        g_slots[i].readback = readback[i];
+        g_slots[i].mapped = (const uint8_t*)ptr;
     }
-    g_latest_slot = 0;
 }
 
-inline ID3D12Resource* latest_slot_res() {
+// Called on every present (each eye) from D3D12Component::on_frame, on the game's queue: signals the probe fence and
+// assigns it to copies recorded two or more presents ago (the engine submits a frame's lists before presenting it).
+inline void on_present(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    if (device == nullptr || queue == nullptr) {
+        return;
+    }
+    if (g_probe_fence == nullptr) {
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_probe_fence)))) {
+            g_probe_fence.Reset();
+            return;
+        }
+    }
     std::scoped_lock _{g_slot_mtx};
-    return g_slots[g_latest_slot.load() % SLOT_COUNT].res;
+    const auto v = ++g_probe_fence_value;
+    bool any = false;
+    for (auto& sl : g_slots) {
+        if (sl.state == SlotPending && sl.fence == 0 && ++sl.presents >= 2) {
+            sl.fence = v;
+            any = true;
+        }
+    }
+    if (any) {
+        queue->Signal(g_probe_fence.Get(), v);
+    }
+}
+
+// A copy the panel should make: an element box from a slot into the good texture.
+struct PanelCopy {
+    ID3D12Resource* src{nullptr};
+    D3D12_RECT rect{};
+    int group{0};
+};
+
+// Called by the panel (before xrEndFrame): reads finished probes, then for each element in want_groups picks the
+// newest slot that holds it. Slots chosen are kept from reuse until the next call (InUse); the rest are freed.
+inline std::vector<PanelCopy> panel_copies(const std::vector<int>& want_groups) {
+    std::vector<PanelCopy> out{};
+    std::scoped_lock _{g_slot_mtx};
+    for (auto& sl : g_slots) {
+        if (sl.state == SlotInUse) {
+            sl.state = SlotFree;
+        }
+    }
+    const uint64_t done = g_probe_fence != nullptr ? g_probe_fence->GetCompletedValue() : 0;
+    for (auto& sl : g_slots) {
+        if (sl.state != SlotPending || sl.fence == 0 || done < sl.fence || sl.mapped == nullptr) {
+            continue;
+        }
+        sl.has.fill(false);
+        for (const auto& pr : sl.probes) {
+            if (pr.group < 0 || pr.group >= PROBE_GROUPS || sl.has[pr.group]) {
+                continue;
+            }
+            const uint8_t* row = sl.mapped + pr.offset;
+            for (UINT x = 0; x < pr.width; ++x) {
+                if (row[x * 4 + 3] > 8) {
+                    sl.has[pr.group] = true;
+                    break;
+                }
+            }
+        }
+        sl.state = SlotReady;
+        g_probe_read_window++;
+        bool any = false;
+        for (int g = 0; g < PROBE_GROUPS; ++g) {
+            if (sl.has[g]) {
+                g_probe_has_window[g]++;
+                any = true;
+            }
+        }
+        if (!any) {
+            g_probe_blank_window++;
+        }
+    }
+    for (const int g : want_groups) {
+        int best = -1;
+        for (int i = 0; i < SLOT_COUNT; ++i) {
+            const auto& sl = g_slots[i];
+            if ((sl.state == SlotReady || sl.state == SlotInUse) && g >= 0 && g < PROBE_GROUPS && sl.has[g] &&
+                (best < 0 || sl.seq > g_slots[best].seq)) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            continue;
+        }
+        auto& sl = g_slots[best];
+        for (size_t k = 0; k < sl.groups.size() && k < sl.rects.size(); ++k) {
+            if (sl.groups[k] == g) {
+                out.push_back(PanelCopy{sl.res, sl.rects[k], g});
+                g_panel_update_window[g]++;
+                break;
+            }
+        }
+        sl.state = SlotInUse;
+    }
+    for (auto& sl : g_slots) {
+        if (sl.state == SlotReady) {
+            sl.state = SlotFree;
+        }
+    }
+    return out;
 }
 
 // Build 29: which pass of the UI buffer holds the HUD varies from frame to frame (some passes see it wiped). So the
@@ -292,20 +428,21 @@ inline void report_redirects() {
     const auto captures = g_captures_window.exchange(0);
     const auto drawn = g_drawn_handoffs_window.exchange(0);
     const auto fallback = g_fallback_window.exchange(0);
-    const auto restores = g_restores_window.exchange(0);
-    const auto unrestored = g_unrestored_window.exchange(0);
-    const auto evicted = g_evicted_window.exchange(0);
+    const auto pc = g_probe_captures_window.exchange(0);
+    const auto pr = g_probe_read_window.exchange(0);
+    const auto pb = g_probe_blank_window.exchange(0);
+    const auto pe = g_probe_evicted_window.exchange(0);
+    const auto pn = g_probe_noslot_window.exchange(0);
+    std::array<uint64_t, PROBE_GROUPS> has{};
+    std::array<uint64_t, PROBE_GROUPS> upd{};
+    for (int g = 0; g < PROBE_GROUPS; ++g) {
+        has[g] = g_probe_has_window[g].exchange(0);
+        upd[g] = g_panel_update_window[g].exchange(0);
+    }
     const auto clears = g_engine_clears_window.exchange(0);
     const auto indirect = g_indirect_ui_window.exchange(0);
     const auto bundles = g_bundle_ui_window.exchange(0);
     const auto draws_ui = g_draws_ui_window.exchange(0);
-    int slots_used = 0;
-    {
-        std::scoped_lock _{g_slot_mtx};
-        for (const auto& sl : g_slots) {
-            slots_used += sl.owner != nullptr ? 1 : 0;
-        }
-    }
     static int reports = 0;
     if (reports < 60) {
         ++reports;
@@ -313,10 +450,11 @@ inline void report_redirects() {
             "{} not the in-game buffer, {} with draws, {} copied to the panel, {} of them by the every-pass fallback), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
             "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
             cur, older, skipped, drawn, captures, fallback, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
-        spdlog::info("[PragmataVR] HUD restore: last 10 s, {} erases undone after the blend, {} hand-offs found their buffer still "
-            "erased (copy skipped), {} slots reused while erased, {} of {} capture slots in use (panel reads slot {}); while a UI buffer "
-            "was bound: {} engine clears, {} draws, {} ExecuteIndirect, {} ExecuteBundle",
-            restores, unrestored, evicted, slots_used, SLOT_COUNT, g_latest_slot.load(), clears, draws_ui, indirect, bundles);
+        // Groups: 1 health, 2 stamina, 3 weapon wheel, 4 tutorial.
+        spdlog::info("[PragmataVR] HUD probes: last 10 s, {} hand-offs captured, {} checked ({} blank), {} reused before checked, {} with no slot "
+            "free; checked captures holding health {}, stamina {}, weapons {}, tutorial {}; panel updates health {}, stamina {}, weapons {}, "
+            "tutorial {}; while a UI buffer was bound: {} engine clears, {} draws, {} ExecuteIndirect, {} ExecuteBundle",
+            pc, pr, pb, pe, pn, has[1], has[2], has[3], has[4], upd[1], upd[2], upd[3], upd[4], clears, draws_ui, indirect, bundles);
     }
 }
 
@@ -701,8 +839,6 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
 
     bool handoff = false;
     ID3D12Resource* ui = nullptr;
-    ID3D12Resource* back_to_rt[4]{};
-    int back_count = 0;
     for (UINT i = 0; i < n; ++i) {
         const auto& t = b[i];
         if (t.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || t.Transition.pResource == nullptr) {
@@ -713,9 +849,6 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
         if (from_rt && !to_rt && !handoff && is_recent_ui_buffer(t.Transition.pResource)) {
             handoff = true;
             ui = t.Transition.pResource;
-        } else if (!from_rt && to_rt && (t.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) == 0 && back_count < 4 &&
-                   is_recent_ui_buffer(t.Transition.pResource)) {
-            back_to_rt[back_count++] = t.Transition.pResource;
         }
     }
 
@@ -745,75 +878,122 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             }
 
             std::vector<D3D12_RECT> rects{};
-            if (g_erase.load()) {
+            std::vector<int> groups{};
+            {
                 std::scoped_lock _{g_rects_mtx};
                 rects = g_rects;
+                groups = g_rect_groups;
+            }
+            if (groups.size() != rects.size()) {
+                groups.assign(rects.size(), -1);
             }
 
-            // Pick the slot: the one already holding this buffer, else the least recently used (preferring one whose
-            // buffer is not waiting for a restore).
-            ID3D12Resource* cap = nullptr;
-            bool copy = true;
-            {
+            // Build 31: copy the element boxes into a free slot and probe rows into its readback buffer.
+            Slot* slot = nullptr;
+            if (!rects.empty()) {
                 std::scoped_lock _{g_slot_mtx};
                 int pick = -1;
-                for (int i = 0; i < SLOT_COUNT; ++i) {
-                    if (g_slots[i].res != nullptr && g_slots[i].owner == ui) {
-                        pick = i;
-                        break;
-                    }
-                }
-                if (pick < 0) {
-                    for (int pass = 0; pass < 2 && pick < 0; ++pass) {
-                        uint64_t oldest = UINT64_MAX;
-                        for (int i = 0; i < SLOT_COUNT; ++i) {
-                            const auto& sl = g_slots[i];
-                            if (sl.res == nullptr || (pass == 0 && sl.pending)) {
-                                continue;
-                            }
-                            if (sl.used < oldest) {
-                                oldest = sl.used;
-                                pick = i;
-                            }
+                for (int pass = 0; pass < 3 && pick < 0; ++pass) {
+                    const int want = pass == 0 ? SlotFree : (pass == 1 ? SlotPending : SlotReady);
+                    for (int i = 0; i < SLOT_COUNT; ++i) {
+                        const auto& sl = g_slots[i];
+                        if (sl.res == nullptr || sl.state != want) {
+                            continue;
+                        }
+                        if (pick < 0 || sl.seq < g_slots[pick].seq) {
+                            pick = i;
                         }
                     }
                 }
-                if (pick >= 0) {
+                if (pick < 0) {
+                    g_probe_noslot_window++;
+                } else {
                     auto& sl = g_slots[pick];
-                    if (sl.owner == ui && sl.pending) {
-                        // Still erased from the last hand-off (no turn back to render target seen): copying now would
-                        // take our own empty areas. Keep the slot as it is; erase again below.
-                        copy = false;
-                        g_unrestored_window++;
-                    } else if (sl.owner != ui && sl.pending) {
-                        g_evicted_window++;
+                    if (sl.state == SlotPending) {
+                        g_probe_evicted_window++;
                     }
-                    if (copy) {
-                        sl.owner = ui;
-                        sl.used = g_handoffs.load();
-                        g_latest_slot = pick;
-                    }
+                    sl.state = SlotPending;
+                    sl.seq = ++g_slot_seq;
+                    sl.presents = 0;
+                    sl.fence = 0;
                     sl.rects = rects;
-                    sl.pending = !rects.empty();
-                    cap = copy ? sl.res : nullptr;
+                    sl.groups = groups;
+                    sl.has.fill(false);
+                    sl.probes.clear();
+                    UINT64 off = 0;
+                    for (size_t k = 0; k < rects.size(); ++k) {
+                        const auto& r = rects[k];
+                        const LONG h = r.bottom - r.top;
+                        const UINT w = (UINT)(r.right - r.left);
+                        if (h <= 0 || w == 0) {
+                            continue;
+                        }
+                        const UINT64 pitch = ((UINT64)w * 4 + 255) & ~255ull;
+                        const int rows = std::clamp((int)(h / 6), 1, PROBE_ROWS_MAX);
+                        for (int j = 0; j < rows; ++j) {
+                            off = (off + 511) & ~511ull;
+                            if (off + pitch > PROBE_BYTES) {
+                                break;
+                            }
+                            Probe pr{};
+                            pr.group = groups[k];
+                            pr.offset = off;
+                            pr.width = w;
+                            sl.probes.push_back(pr);
+                            off += pitch;
+                        }
+                    }
+                    slot = &sl;
                 }
             }
 
-            if (cap != nullptr) {
+            if (slot != nullptr) {
                 g_captures_window++;
+                g_probe_captures_window++;
+                auto cap = slot->res;
                 transition(self, ui, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE,
                     cap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-                if (g_copy_resource_hook != nullptr) {
-                    g_copy_resource_hook->get_original<decltype(copy_resource)>()(self, cap, ui);
-                } else {
-                    self->CopyResource(cap, ui);
+                for (const auto& r : rects) {
+                    raw_copy_region(self, cap, ui, r);
+                }
+                // Probe rows: evenly spaced rows of each box, in the order the probes were laid out above.
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = ui;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                size_t pi = 0;
+                for (size_t k = 0; k < rects.size() && pi < slot->probes.size(); ++k) {
+                    const auto& r = rects[k];
+                    const LONG h = r.bottom - r.top;
+                    const UINT w = (UINT)(r.right - r.left);
+                    if (h <= 0 || w == 0) {
+                        continue;
+                    }
+                    const int rows = std::clamp((int)(h / 6), 1, PROBE_ROWS_MAX);
+                    for (int j = 0; j < rows && pi < slot->probes.size(); ++j, ++pi) {
+                        const LONG y = r.top + (LONG)(((float)j + 0.5f) * (float)h / (float)rows);
+                        D3D12_TEXTURE_COPY_LOCATION dst{};
+                        dst.pResource = slot->readback;
+                        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        dst.PlacedFootprint.Offset = slot->probes[pi].offset;
+                        dst.PlacedFootprint.Footprint.Format = du.Format;
+                        dst.PlacedFootprint.Footprint.Width = w;
+                        dst.PlacedFootprint.Footprint.Height = 1;
+                        dst.PlacedFootprint.Footprint.Depth = 1;
+                        dst.PlacedFootprint.Footprint.RowPitch = (UINT)(((UINT64)w * 4 + 255) & ~255ull);
+                        D3D12_BOX box{(UINT)r.left, (UINT)y, 0u, (UINT)r.right, (UINT)y + 1, 1u};
+                        if (g_copy_region_hook != nullptr) {
+                            g_copy_region_hook->get_original<decltype(copy_region)>()(self, &dst, 0, 0, 0, &src, &box);
+                        } else {
+                            self->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+                        }
+                    }
                 }
                 transition(self, ui, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
                     cap, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
             }
 
-            // Erase the element areas so they do not reach the eye images (undone after the blend, see below).
-            if (!rects.empty()) {
+            // Erase the element areas so they do not reach the eye images.
+            if (g_erase.load() && !rects.empty()) {
                 const auto rtv = fresh_rtv(ui, du.Format);
                 if (rtv != 0) {
                     const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
@@ -824,49 +1004,12 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                     } else {
                         self->ClearRenderTargetView(h, clear, (UINT)rects.size(), rects.data());
                     }
-                } else {
-                    std::scoped_lock _{g_slot_mtx};
-                    for (auto& sl : g_slots) {
-                        if (sl.owner == ui) {
-                            sl.pending = false; // nothing was erased
-                        }
-                    }
                 }
             }
         }
     }
 
     original(self, n, b);
-
-    // Build 30: the buffer is a render target again (the blend has read it): put the erased areas back from the capture
-    // taken at its hand-off, so the next hand-off (often the right eye, with no new UI drawn) still holds the full HUD.
-    for (int k = 0; k < back_count; ++k) {
-        ID3D12Resource* r = back_to_rt[k];
-        ID3D12Resource* cap = nullptr;
-        std::vector<D3D12_RECT> rects{};
-        {
-            std::scoped_lock _{g_slot_mtx};
-            for (auto& sl : g_slots) {
-                if (sl.res != nullptr && sl.owner == r && sl.pending) {
-                    sl.pending = false;
-                    cap = sl.res;
-                    rects = sl.rects;
-                    break;
-                }
-            }
-        }
-        if (cap == nullptr || rects.empty()) {
-            continue;
-        }
-        g_restores_window++;
-        transition(self, r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST,
-            cap, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        for (const auto& rc : rects) {
-            raw_copy_region(self, r, cap, rc);
-        }
-        transition(self, r, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET,
-            cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    }
 }
 
 // Our own RTV of the UI buffer for the clear; recreated when the buffer changes. Called from the present thread.
