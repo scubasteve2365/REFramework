@@ -24,6 +24,7 @@
 #include <optional>
 #include <chrono>
 #include <array>
+#include <climits>
 #include <string>
 
 #include <utility/FunctionHook.hpp>
@@ -132,6 +133,8 @@ struct Probe {
     int group{0};
     UINT64 offset{0};
     UINT width{0};
+    LONG x{0}; // Build 32: left edge and row of the probe in the UI buffer (for the content extent log)
+    LONG y{0};
 };
 struct Slot {
     ID3D12Resource* res{nullptr};      // capture texture (owned by D3D12Component), kept in D3D12_RESOURCE_STATE_COMMON
@@ -159,6 +162,14 @@ inline std::atomic<uint64_t> g_probe_evicted_window{0};    // slots reused befor
 inline std::atomic<uint64_t> g_probe_noslot_window{0};     // hand-offs with no slot free
 inline std::array<std::atomic<uint64_t>, PROBE_GROUPS> g_probe_has_window{};   // read slots holding each element
 inline std::array<std::atomic<uint64_t>, PROBE_GROUPS> g_panel_update_window{}; // panel updates of each element
+// Build 32: where each element's pixels actually were (UI buffer pixels, from the probe rows) over the 10 s window,
+// next to its box, to size the boxes from measurements. Guarded by g_slot_mtx.
+struct Extent {
+    LONG x0{LONG_MAX}, y0{LONG_MAX}, x1{LONG_MIN}, y1{LONG_MIN};
+    D3D12_RECT box{};
+    bool any{false};
+};
+inline std::array<Extent, PROBE_GROUPS> g_extent_window{};
 inline std::atomic<uint64_t> g_engine_clears_window{0};    // engine ClearRenderTargetView on a UI buffer
 inline std::atomic<uint64_t> g_indirect_ui_window{0};      // ExecuteIndirect while a UI buffer is bound
 inline std::atomic<uint64_t> g_bundle_ui_window{0};        // ExecuteBundle while a UI buffer is bound
@@ -233,14 +244,32 @@ inline std::vector<PanelCopy> panel_copies(const std::vector<int>& want_groups) 
         }
         sl.has.fill(false);
         for (const auto& pr : sl.probes) {
-            if (pr.group < 0 || pr.group >= PROBE_GROUPS || sl.has[pr.group]) {
+            if (pr.group < 0 || pr.group >= PROBE_GROUPS) {
                 continue;
             }
             const uint8_t* row = sl.mapped + pr.offset;
+            LONG first = -1;
+            LONG last = -1;
             for (UINT x = 0; x < pr.width; ++x) {
                 if (row[x * 4 + 3] > 8) {
-                    sl.has[pr.group] = true;
-                    break;
+                    if (first < 0) {
+                        first = (LONG)x;
+                    }
+                    last = (LONG)x;
+                }
+            }
+            if (first >= 0) {
+                sl.has[pr.group] = true;
+                auto& e = g_extent_window[pr.group];
+                e.x0 = (std::min)(e.x0, pr.x + first);
+                e.x1 = (std::max)(e.x1, pr.x + last);
+                e.y0 = (std::min)(e.y0, pr.y);
+                e.y1 = (std::max)(e.y1, pr.y);
+                e.any = true;
+                for (size_t k = 0; k < sl.groups.size() && k < sl.rects.size(); ++k) {
+                    if (sl.groups[k] == pr.group) {
+                        e.box = sl.rects[k];
+                    }
                 }
             }
         }
@@ -439,12 +468,25 @@ inline void report_redirects() {
         has[g] = g_probe_has_window[g].exchange(0);
         upd[g] = g_panel_update_window[g].exchange(0);
     }
+    std::string extents{};
+    {
+        std::scoped_lock _{g_slot_mtx};
+        static constexpr const char* names[PROBE_GROUPS]{"", "health", "stamina", "weapons", "tutorial", "", "", ""};
+        for (int g = 1; g <= 4; ++g) {
+            auto& e = g_extent_window[g];
+            if (e.any) {
+                extents += fmt::format(" {} ({},{})-({},{}) in box ({},{})-({},{});", names[g], e.x0, e.y0, e.x1, e.y1,
+                    e.box.left, e.box.top, e.box.right, e.box.bottom);
+            }
+            e = Extent{};
+        }
+    }
     const auto clears = g_engine_clears_window.exchange(0);
     const auto indirect = g_indirect_ui_window.exchange(0);
     const auto bundles = g_bundle_ui_window.exchange(0);
     const auto draws_ui = g_draws_ui_window.exchange(0);
     static int reports = 0;
-    if (reports < 60) {
+    if (reports < 360) { // Build 32: one hour (was 10 minutes)
         ++reports;
         spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}; {} of the buffer reported last, {} of an older one, "
             "{} not the in-game buffer, {} with draws, {} copied to the panel, {} of them by the every-pass fallback), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
@@ -455,6 +497,9 @@ inline void report_redirects() {
             "free; checked captures holding health {}, stamina {}, weapons {}, tutorial {}; panel updates health {}, stamina {}, weapons {}, "
             "tutorial {}; while a UI buffer was bound: {} engine clears, {} draws, {} ExecuteIndirect, {} ExecuteBundle",
             pc, pr, pb, pe, pn, has[1], has[2], has[3], has[4], upd[1], upd[2], upd[3], upd[4], clears, draws_ui, indirect, bundles);
+        if (!extents.empty()) {
+            spdlog::info("[PragmataVR] HUD content extents (UI buffer px, last 10 s):{}", extents);
+        }
     }
 }
 
@@ -939,6 +984,8 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
                             pr.group = groups[k];
                             pr.offset = off;
                             pr.width = w;
+                            pr.x = r.left;
+                            pr.y = r.top + (LONG)(((float)j + 0.5f) * (float)h / (float)rows);
                             sl.probes.push_back(pr);
                             off += pitch;
                         }

@@ -128,7 +128,8 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 900.0f, 400.0f, 1030.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes)
     {720.0f, 950.0f, 1200.0f, 1050.0f}, // stamina
     {1180.0f, 500.0f, 1920.0f, 1080.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box)
-    {60.0f, 200.0f, 620.0f, 480.0f},   // tutorial box
+    {60.0f, 200.0f, 590.0f, 400.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; the box reached far past
+                                       // the longest text seen, and enemy health bars passing through it went to the panel)
 }};
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
@@ -280,7 +281,10 @@ inline int group_for(std::string_view name) {
     if (name == "ui2130Gui") return GroupHealth;
     if (name == "ui2140Gui") return GroupStamina;
     if (name == "ui2150Gui") return GroupWeapons;
-    if (name == "ui2201Gui" || name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
+    // Build 32: ui2201Gui (the large tutorial window, "Hacking Enemies" with video and A = Close) is no longer in the
+    // tutorial group: FLAT shrank it with the tutorial box values and ANCHORED cut a piece of it onto the panel. It is a
+    // Screen view and is now drawn like the game's other menus.
+    if (name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     return -1;
 }
 
