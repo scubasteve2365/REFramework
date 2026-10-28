@@ -19,6 +19,9 @@
 #include "mods/LooseFileLoader.hpp"
 #include "mods/FaultyFileDetector.hpp"
 #include "mods/vr/games/RE8VR.hpp"
+#if defined(PRAGMATA)
+#include "mods/vr/PragmataFixes.hpp"
+#endif
 
 #include "Mods.hpp"
 
@@ -79,6 +82,10 @@ Mods::Mods() {
     m_mods.emplace_back(APIProxy::get());
     m_mods.emplace_back(PluginLoader::get());
     m_mods.emplace_back(ScriptRunner::get());
+#if defined(PRAGMATA)
+    // PragmataVR Build 36: the fix pack's Lua HUD fixes in C++, at the point the Lua scripts ran (after ScriptRunner).
+    m_mods.emplace_back(PragmataFixes::get());
+#endif
 }
 
 std::optional<std::string> Mods::on_initialize() const {

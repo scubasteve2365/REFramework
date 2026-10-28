@@ -397,7 +397,18 @@ struct MenuRow {
     std::string label{};
     std::string hint{}; // footer help line while this row is selected (headers: small tag after the title)
     int section{-1};    // Build 25: collapsible section (MenuSection) this row belongs to; headers with one can be selected
+    int tab{0};         // Build 36: menu tab (MenuTab) the row is on; only the current tab is shown and navigated
 };
+
+// Build 36: menu tabs, switched with LT / RT (Page Up / Page Down on the keyboard).
+enum MenuTab : int {
+    TabGeneral = 0,
+    TabHud = 1,
+    TabAdvanced = 2,
+    TabMenu = 3,
+    TabCount = 4,
+};
+inline constexpr std::array<const char*, TabCount> TAB_TITLES{"GENERAL", "HUD", "ADVANCED", "MOD MENU"};
 
 // Build 25: collapsible sections of the GAME HUD band (bit numbers in HudTune::collapsed).
 enum MenuSection : int {
@@ -601,6 +612,16 @@ public:
 
         const bool big = (buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
 
+        // Build 36: LT / RT switch tabs (edge-triggered, past half pull).
+        const bool lt = have && st.Gamepad.bLeftTrigger > 128;
+        const bool rt = have && st.Gamepad.bRightTrigger > 128;
+        const bool lt_new = lt && !m_lt_prev;
+        const bool rt_new = rt && !m_rt_prev;
+        m_lt_prev = lt;
+        m_rt_prev = rt;
+        if (lt_new) handle_key(VK_PRIOR, big);
+        if (rt_new) handle_key(VK_NEXT, big);
+
         if (pressed(XINPUT_GAMEPAD_DPAD_UP) || (stick_new && stick_dir == 1)) handle_key(VK_UP, big);
         if (pressed(XINPUT_GAMEPAD_DPAD_DOWN) || (stick_new && stick_dir == 2)) handle_key(VK_DOWN, big);
         if (pressed(XINPUT_GAMEPAD_DPAD_LEFT) || (stick_new && stick_dir == 3)) handle_key(VK_LEFT, big);
@@ -693,6 +714,7 @@ public:
     // ---- Menu state, read by VR::on_frame (draw) and D3D12Component::on_frame (composite) ----
     std::atomic<bool> menu_open{false};
     std::atomic<int> menu_selected{0};
+    std::atomic<int> menu_tab{TabGeneral}; // Build 36: tab shown in the mod menu
     std::atomic<bool> menu_editing{false};   // A on a value row: Left / Right change it until A or B
     std::atomic<bool> menu_on_invert{false}; // highlight is on the row's INV box (A flips it)
     std::atomic<float> menu_rect_x{0.0f};
@@ -748,7 +770,7 @@ public:
     }
 
 private:
-    static constexpr std::array<int, 8> KEYS{VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_BACK, VK_PAUSE};
+    static constexpr std::array<int, 10> KEYS{VK_F1, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_BACK, VK_PAUSE, VK_PRIOR, VK_NEXT};
 
     HudTuning() {
         m_tune = std::make_shared<HudTune>();
@@ -770,7 +792,7 @@ private:
             const auto& r = m_rows[i];
             const int c = std::clamp(r.column, 0, 1);
             const int bd = std::clamp(r.band, 0, 1);
-            if (row_hidden(collapsed, r)) {
+            if (r.tab != menu_tab.load() || row_hidden(collapsed, r)) {
                 continue;
             }
             if (r.kind == MenuRow::Kind::Header) {
@@ -810,79 +832,95 @@ private:
         };
 
         const std::string value_hint = "A = edit this value";
-
-        // ==== MOD MENU SETTINGS (top band) ====
-        band = 0;
-        column = 0;
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "PLACEMENT", "FIXED WHERE IT OPENS");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Distance", "A = edit. Text keeps the same size at any distance");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuScale, ActionNone, "Text size", value_hint);
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Up / down", value_hint);
-        add(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement", "A = default distance, size and height, and move the menu in front of you");
-
-        column = 1;
-        add(MenuRow::Kind::Header, -1, -1, ActionNone, "SOUND AND TOOLS", "");
-        add(MenuRow::Kind::Value, GROUP_MENU, MenuClickVolume, ActionNone, "Click volume", "A = edit. Volume of the menu click sounds (0 = off)");
-        add(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
-        add(MenuRow::Kind::Action, -1, -1, ActionSnapshotSeries, "Snapshot series",
-            "A = close the menu, wait 3 s, then 5 snapshots 1 s apart (move your head to record HUD motion)");
-        add(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
-
-        // ==== GAME HUD SETTINGS (lower band) ====
-        // Build 11: every HUD element has its own block. The game-screen "one panel" rows are gone.
-        band = 1;
+        int tab = TabGeneral;
+        const auto add_row = [&](MenuRow::Kind kind, int group, int field, int action, std::string label, std::string hint) {
+            add(kind, group, field, action, std::move(label), std::move(hint));
+            m_rows.back().tab = tab;
+        };
+        // A plain (not collapsible) section header; hint = small grey tag on the right.
+        const auto add_header = [&](std::string title, std::string tag) {
+            section = -1;
+            add_row(MenuRow::Kind::Header, -1, -1, ActionNone, std::move(title), std::move(tag));
+        };
         const auto add_section = [&](int sec, std::string title) {
             section = sec;
-            add(MenuRow::Kind::Header, -1, -1, ActionNone, std::move(title), "");
+            add_row(MenuRow::Kind::Header, -1, -1, ActionNone, std::move(title), "");
             m_rows.back().section = sec;
         };
         const auto add_element = [&](int g) {
             add_section(SectionElement0 + g, GROUP_TITLES[g]);
             m_rows.back().group = g;
-            add(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
-            add(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
-            add(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
-            add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
-            add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap",
+            add_row(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
+            add_row(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
+            add_row(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
+            add_row(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
+            add_row(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap",
                 "A = edit the gap between eyes. In Follows Head mode, higher = closer to you (Fixed uses HUD distance)");
-            add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = back to the starting values for this HUD mode (blocked while locked)");
+            add_row(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = back to the starting values for this HUD mode (blocked while locked)");
         };
 
+        // Build 36: four tabs (LT / RT). Every tab uses one band with two columns.
+        band = 0;
+
+        // ==== GENERAL ====
+        tab = TabGeneral;
         column = 0;
-        add_section(SectionView, "VIEW");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
+        add_header("VR", "THE BASICS");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleRenderMode, "Render mode",
+            "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
             "A = Fixed (the HUD stays put in one place in front of you) or Follows Head (the HUD moves with your headset)");
-        add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
+        add_row(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
+        column = 1;
+        add_header("FIXED HUD", "FIXED MODE");
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
             "A = edit. How far away the Fixed HUD sits (meters). Its size in view stays the same");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Size of the Fixed HUD (degrees wide)");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Size of the Fixed HUD (degrees wide)");
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
+
+        // ==== HUD: each element ====
+        tab = TabHud;
+        column = 0;
         add_element(GroupHealth);
         add_element(GroupStamina);
-        add_section(SectionDeveloper, "DEVELOPER");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
-            "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
-        // Build 28: Glued HUD, FLAT 3D panels, Frosted glass, Ghost layer, HUD position, Companion layers, Size grows from
-        // and Engine UI blend are gone (fixed in HudTune::apply_hud_mode).
-
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
         add_element(GroupTutorial);
-        // Build 35: VR rendering settings that cost or save frame time.
-        add_section(SectionPerformance, "PERFORMANCE");
-        m_rows.back().hint = "VR RENDERING";
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleRenderMode, "Render mode",
-            "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleSharpening, "Sharpening", "A = turn the sharpening pass on or off (small GPU cost)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleDesktopMirror, "Desktop mirror",
+
+        // ==== ADVANCED ====
+        tab = TabAdvanced;
+        column = 0;
+        add_header("RENDERING", "VR RENDERING");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleSharpening, "Sharpening", "A = turn the sharpening pass on or off (small GPU cost)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleDesktopMirror, "Desktop mirror",
             "A = show the headset image in the game window on your monitor (costs GPU time, only for recording)");
-        add(MenuRow::Kind::Toggle, -1, -1, ActionTogglePerfLog, "Performance log",
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionTogglePerfLog, "Performance log",
             "A = write frame time numbers to re2_framework_log.txt every 10 seconds");
+        column = 1;
+        add_header("DEVELOPER", "TOOLS");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
+            "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
+        add_row(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
+        add_row(MenuRow::Kind::Action, -1, -1, ActionSnapshotSeries, "Snapshot series",
+            "A = close the menu, wait 3 s, then 5 snapshots 1 s apart (move your head to record HUD motion)");
+
+        // ==== MOD MENU ====
+        tab = TabMenu;
+        column = 0;
+        add_header("PLACEMENT", "FIXED WHERE IT OPENS");
+        add_row(MenuRow::Kind::Value, GROUP_MENU, MenuDistance, ActionNone, "Distance", "A = edit. Text keeps the same size at any distance");
+        add_row(MenuRow::Kind::Value, GROUP_MENU, MenuScale, ActionNone, "Text size", value_hint);
+        add_row(MenuRow::Kind::Value, GROUP_MENU, MenuPitch, ActionNone, "Up / down", value_hint);
+        add_row(MenuRow::Kind::Action, GROUP_MENU, -1, ActionResetMenu, "Reset menu placement", "A = default distance, size and height, and move the menu in front of you");
+        column = 1;
+        add_header("SOUND", "");
+        add_row(MenuRow::Kind::Value, GROUP_MENU, MenuClickVolume, ActionNone, "Click volume", "A = edit. Volume of the menu click sounds (0 = off)");
+        add_row(MenuRow::Kind::Action, -1, -1, ActionClose, "Close menu", "A = close. B or both thumbsticks also close the menu");
 
         rebuild_nav(HudTune{}.collapsed);
-        menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
+        select_first();
     }
 
     static std::filesystem::path path() {
@@ -1225,6 +1263,16 @@ private:
         return std::make_shared<HudTune>(*m_tune);
     }
 
+    // Build 36: first selectable row of the current tab (left column, or the right one if the left is empty).
+    void select_first() {
+        if (!m_nav[0].empty()) {
+            menu_selected = m_nav[0].front();
+        } else if (!m_nav[1].empty()) {
+            menu_selected = m_nav[1].front();
+        }
+        menu_on_invert = false;
+    }
+
     // Up / Down: next selectable row in the same column, through both bands, wrapping around.
     void move_vertical(int dir) {
         const int sel = menu_selected.load();
@@ -1366,8 +1414,8 @@ private:
                 menu_place_requested = true;
                 rebuild_nav(copy_current()->collapsed);
                 const int s0 = menu_selected.load();
-                if (s0 < 0 || s0 >= (int)m_rows.size() || row_hidden(copy_current()->collapsed, m_rows[s0])) {
-                    menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
+                if (s0 < 0 || s0 >= (int)m_rows.size() || m_rows[s0].tab != menu_tab.load() || row_hidden(copy_current()->collapsed, m_rows[s0])) {
+                    select_first();
                 }
             }
             spdlog::info("[PragmataVR] Menu {}", menu_open.load() ? "opened" : "closed");
@@ -1380,6 +1428,22 @@ private:
         }
 
         const bool editing = menu_editing.load();
+
+        // Build 36: LT / RT (Page Up / Page Down): previous / next tab, wrapping around. Not while editing a value.
+        if (vk == VK_PRIOR || vk == VK_NEXT) {
+            if (editing) {
+                play_click(false);
+                return;
+            }
+            const int tab = (menu_tab.load() + (vk == VK_NEXT ? 1 : TabCount - 1)) % TabCount;
+            menu_tab = tab;
+            menu_on_invert = false;
+            rebuild_nav(copy_current()->collapsed);
+            select_first();
+            spdlog::info("[PragmataVR] Menu: tab {}", TAB_TITLES[tab]);
+            play_click(true);
+            return;
+        }
 
         switch (vk) {
         case VK_BACK:
@@ -1743,6 +1807,8 @@ private:
     std::array<bool, KEYS.size()> m_key_down{};
     std::array<std::chrono::steady_clock::time_point, KEYS.size()> m_last_press{};
     std::vector<MenuRow> m_rows{};
+    bool m_lt_prev{false}; // Build 36: trigger state for tab switching
+    bool m_rt_prev{false};
     std::array<std::vector<int>, 2> m_nav{}; // selectable rows per column, top to bottom
     std::vector<float> m_row_y{};             // row center height within its band, in row units
     std::mutex m_head_mtx{};

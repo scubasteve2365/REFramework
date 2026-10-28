@@ -3476,6 +3476,7 @@ void VR::on_frame() {
     const int sel = hud.menu_selected.load();
     const bool editing = hud.menu_editing.load();
     const bool on_invert = hud.menu_on_invert.load() && !editing;
+    const int cur_tab = std::clamp(hud.menu_tab.load(), 0, (int)pragmatavr::TabCount - 1); // Build 36
 
     ImFont* font = pragmatavr::g_menu_font != nullptr ? pragmatavr::g_menu_font : ImGui::GetFont();
     ImFont* bold = pragmatavr::g_menu_font_bold != nullptr ? pragmatavr::g_menu_font_bold : font;
@@ -3499,7 +3500,6 @@ void VR::on_frame() {
     const float header_gap = std::round(fs * 0.75f);
     const float header_body = std::round(header_size * 1.6f);
     const float tier_block = std::round(tier_size * 1.3f + fs * 0.55f);
-    const float band_gap = std::round(fs * 1.0f);
 
     const auto text_w = [&](ImFont* f, float size, const char* s) {
         return f->CalcTextSizeA(size, NO_LIMIT, 0.0f, s).x;
@@ -3535,9 +3535,10 @@ void VR::on_frame() {
         return bw + small_size * 0.45f + text_w(font, small_size, what) + small_size * 1.6f;
     };
 
-    using ChipList = std::array<std::pair<const char*, const char*>, 4>;
+    using ChipList = std::array<std::pair<const char*, const char*>, 5>;
     static constexpr ChipList NAV_CHIPS{{
         {"L3 + R3", "Open / close"},
+        {"LT / RT", "Tabs"},
         {"D-PAD", "Navigate"},
         {"A", "Select / edit"},
         {"B", "Close"},
@@ -3547,18 +3548,17 @@ void VR::on_frame() {
         {"RB", "Bigger steps"},
         {"A", "Done"},
         {"B", "Done"},
+        {"", ""},
     }};
-    const char* KEYBOARD_LINE = "KEYBOARD    Arrows = navigate / change    Shift = bigger steps    Enter = select / edit / done    Backspace = back / close    F1 = open / close";
+    const char* KEYBOARD_LINE = "KEYBOARD    Arrows = navigate / change    PgUp / PgDn = tabs    Shift = bigger steps    Enter = select / edit / done    Backspace = back / close    F1 = open / close";
     const char* EDIT_HINT = "EDITING    Left / Right to change    RB = bigger steps    A or B = done";
     const char* INV_HINT = "A = flip which way Left / Right moves this value";
     const char* PER_PANEL_HINT = "Used only in the per-panel HUD layout (switch it under HUD SCREEN)";
 
-    static constexpr std::array<const char*, 2> TIER_TITLES{"MOD MENU SETTINGS", "GAME HUD SETTINGS"};
-    static constexpr std::array<const char*, 2> TIER_TAGS{"THIS MENU", "IN-GAME HUD"};
 
     // ---- Measure: column widths fit every label, value and header in both bands ----
     float value_w = 0.0f;
-    for (const char* s : {"GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
+    for (const char* s : {"NATIVE", "GAME SCREEN", "FIXED IN ROOM", "FOLLOWS HEAD", "PER-PANEL", "UNLOCKED", "FLIPPED", "HIDDEN",
              "+4000", "-4000", "10.0 m", "+60 deg", "140 deg", "200%", "100%", "OFF", "8.00x", "ELEMENT CENTER", "PANEL ORIGIN", "WITH ELEMENT", "REFRAMEWORK", "DEFAULT", "PANEL", "REMOVED"}) {
         value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
@@ -3589,20 +3589,27 @@ void VR::on_frame() {
         if (pragmatavr::row_hidden(t.collapsed, row)) {
             continue;
         }
+        // Build 36: column widths fit the rows of every tab (the panel keeps its width when the tab changes);
+        // heights count only the current tab.
+        const bool on_tab = row.tab == cur_tab;
 
         if (row.kind == Kind::Header) {
             const auto htag = header_tag(row);
             const float title = header_size * 0.95f + spaced(bold, header_size, 0, 0, 0, row.label.c_str(), header_size * 0.14f, false);
             const float tag = htag.empty() ? 0.0f : gap + text_w(font, small_size, htag.c_str());
             col_w[c] = (std::max)(col_w[c], title + tag);
-            col_h[bd][c] += (col_first[bd][c] ? header_gap_first : header_gap) + header_body;
-            col_first[bd][c] = false;
+            if (on_tab) {
+                col_h[bd][c] += (col_first[bd][c] ? header_gap_first : header_gap) + header_body;
+                col_first[bd][c] = false;
+            }
             continue;
         }
 
         const float label = (std::max)(text_w(font, fs, row.label.c_str()), text_w(bold, fs, row.label.c_str()));
         col_w[c] = (std::max)(col_w[c], indent + label + gap + value_w + invert_gap + invert_w + indent * 0.5f);
-        col_h[bd][c] += line_h;
+        if (on_tab) {
+            col_h[bd][c] += line_h;
+        }
     }
 
     const std::array<float, 2> band_h{(std::max)(col_h[0][0], col_h[0][1]), (std::max)(col_h[1][0], col_h[1][1])};
@@ -3611,18 +3618,23 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 35");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 36");
 
-    float tier_w = 0.0f;
-    for (int bd = 0; bd < 2; ++bd) {
-        tier_w = (std::max)(tier_w, spaced(bold, tier_size, 0, 0, 0, TIER_TITLES[bd], tier_spacing, false) + gap * 2.0f + text_w(font, small_size, TIER_TAGS[bd]));
+    // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
+    const float tab_gap = std::round(fs * 1.6f);
+    float tabs_w = 0.0f;
+    for (int ti = 0; ti < pragmatavr::TabCount; ++ti) {
+        tabs_w += spaced(bold, tier_size, 0, 0, 0, pragmatavr::TAB_TITLES[ti], tier_spacing, false) + (ti ? tab_gap : 0.0f);
     }
+    const float tier_w = tabs_w + 2.0f * (gap * 2.0f + text_w(bold, small_size, "LT"));
 
     float chips_w = 0.0f;
     for (const auto* list : {&NAV_CHIPS, &EDIT_CHIPS}) {
         float w = 0.0f;
         for (const auto& [button, what] : *list) {
-            w += chip(0, 0, button, what, false);
+            if (*button != 0) {
+                w += chip(0, 0, button, what, false);
+            }
         }
         chips_w = (std::max)(chips_w, w);
     }
@@ -3639,7 +3651,7 @@ void VR::on_frame() {
     const float panel_w = std::ceil(pad * 2.0f + (std::max)({content_w, title_w, tier_w, chips_w, hint_w, text_w(font, small_size, KEYBOARD_LINE)}));
 
     const float title_block = std::round(title_size * 1.25f + fs * 0.9f);
-    const float content_h = tier_block + band_h[0] + band_gap + tier_block + band_h[1];
+    const float content_h = tier_block + band_h[0]; // Build 36: one band per tab
     const float footer_h = std::round(fs * 0.8f + hint_size * 1.6f + small_size * 1.35f + small_size * 0.7f + small_size * 1.4f);
 
     // Build 12: when the rows are taller than the ImGui target, the band area scrolls (title and footer stay put) and
@@ -3654,8 +3666,8 @@ void VR::on_frame() {
     if (!scrolls) {
         s_scroll = 0.0f;
     } else if (sel >= 0 && sel < (int)rows.size()) {
-        const int sbd = std::clamp(rows[sel].band, 0, 1);
-        const float band_off = sbd == 0 ? tier_block : tier_block + band_h[0] + band_gap + tier_block;
+        const int sbd = 0; // Build 36: one band per tab
+        const float band_off = tier_block;
         const float sel_top = band_off + row_col_y[sel];
         const float margin = line_h * 1.5f;
         if (sel_top - margin < s_scroll) {
@@ -3699,7 +3711,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 35"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 35");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 36"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 36");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3715,23 +3727,29 @@ void VR::on_frame() {
     y -= std::floor(s_scroll);
     dl->PushClipRect(ImVec2{p0.x, content_top}, ImVec2{p1.x, content_top + view_h}, true);
 
-    for (int bd = 0; bd < 2; ++bd) {
-        if (bd == 1) {
-            y += band_gap;
-        }
-
-        // Tier title: white letter-spaced capitals with a full-width rule, like the menu title but smaller.
-        spaced(bold, tier_size, left, y, TEXT_BRIGHT, TIER_TITLES[bd], tier_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, TIER_TAGS[bd]), y + (tier_size - small_size) * 0.7f, TEXT_DIM, TIER_TAGS[bd]);
+    {
+        // Build 36: tab bar. Tab titles in the band-title style: the current one white with a cyan underline, the
+        // others dim; LT and RT at the ends. Same full-width rule as the band titles had.
         const float ly = std::floor(y + tier_size * 1.3f);
+        put(bold, small_size, left, y + (tier_size - small_size) * 0.7f, TEXT_DIM, "LT");
+        put(bold, small_size, right - text_w(bold, small_size, "RT"), y + (tier_size - small_size) * 0.7f, TEXT_DIM, "RT");
+        float tx = std::floor(left + (right - left - tabs_w) * 0.5f);
+        for (int ti = 0; ti < pragmatavr::TabCount; ++ti) {
+            const bool active = ti == cur_tab;
+            const float w = spaced(bold, tier_size, tx, y, active ? TEXT_BRIGHT : TEXT_DIM, pragmatavr::TAB_TITLES[ti], tier_spacing, true);
+            if (active) {
+                dl->AddLine(ImVec2{tx, ly}, ImVec2{tx + w, ly}, ACCENT, 3.0f);
+            }
+            tx += w + tab_gap;
+        }
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_DIM, 1.0f);
-        dl->AddLine(ImVec2{left, ly}, ImVec2{left + fs * 3.0f, ly}, ACCENT, 2.0f);
         y += tier_block;
 
-        band_top[bd] = y;
+        band_top[0] = y;
+        band_top[1] = y;
         const float dx = std::floor(col_x[1] - gutter * 0.5f);
-        dl->AddLine(ImVec2{dx, y + fs * 0.3f}, ImVec2{dx, y + band_h[bd]}, ACCENT_FAINT, 1.0f);
-        y += band_h[bd];
+        dl->AddLine(ImVec2{dx, y + fs * 0.3f}, ImVec2{dx, y + band_h[0]}, ACCENT_FAINT, 1.0f);
+        y += band_h[0];
     }
 
     std::array<std::array<float, 2>, 2> cy{{{band_top[0], band_top[0]}, {band_top[1], band_top[1]}}};
@@ -3747,7 +3765,7 @@ void VR::on_frame() {
         const float x1 = x0 + col_w[c];
         float& ry = cy[bd][c];
 
-        if (pragmatavr::row_hidden(t.collapsed, row)) {
+        if (row.tab != cur_tab || pragmatavr::row_hidden(t.collapsed, row)) {
             continue;
         }
 
@@ -3890,7 +3908,9 @@ void VR::on_frame() {
 
     float cx = left;
     for (const auto& [button, what] : editing ? EDIT_CHIPS : NAV_CHIPS) {
-        cx += chip(cx, y, button, what, true);
+        if (*button != 0) {
+            cx += chip(cx, y, button, what, true);
+        }
     }
     y += std::round(small_size * 1.35f + small_size * 0.7f);
 
