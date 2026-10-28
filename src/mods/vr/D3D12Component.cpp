@@ -445,6 +445,8 @@ struct PragmataHudPanel {
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, pragmata_trace::SLOT_COUNT> rb{};
     // Build 31: the last capture of each element that really held it; the panel image is built from this.
     Microsoft::WRL::ComPtr<ID3D12Resource> good{};
+    // Build 34: left-eye frames spent in Follows Head mode with the Fixed textures still allocated.
+    int idle_frames{0};
 };
 
 PragmataHudPanel g_pragmata_hud{};
@@ -480,13 +482,52 @@ bool pragmata_ensure_comp(PragmataHudPanel& p) {
     return true;
 }
 
+// Build 34: Follows Head mode frees the Fixed HUD's textures (about 490 MB; the OpenXR quad swapchain, about 150 MB more,
+// is dropped in pragmata_update_hud_quad). They are released about a second after the switch, once no command list
+// recorded before it can still copy into them, and are made again on the next switch to Fixed.
+void pragmata_release_fixed_hud(PragmataHudPanel& p) {
+    if (p.src == nullptr && p.comp == nullptr && p.good == nullptr) {
+        p.idle_frames = 0;
+        return;
+    }
+    if (++p.idle_frames < 60) {
+        return;
+    }
+    p.idle_frames = 0;
+    pragmata_trace::g_capture = nullptr;
+    pragmata_trace::set_slots({}, {});
+    p.src_cmds.wait(INFINITE);
+    for (auto& c : p.cmds) {
+        if (c != nullptr) {
+            c->wait(INFINITE);
+        }
+    }
+    p.src.Reset();
+    for (auto& m : p.more) {
+        m.Reset();
+    }
+    for (auto& m : p.rb) {
+        m.Reset();
+    }
+    p.good.Reset();
+    p.comp.Reset();
+    p.src_w = 0;
+    p.src_h = 0;
+    p.src_format = DXGI_FORMAT_UNKNOWN;
+    spdlog::info("[PragmataVR] Follows Head mode: Fixed HUD textures released");
+}
+
 // Called on left-eye frames from on_frame, while the UI buffer still holds this frame's UI.
 void pragmata_capture_ui_buffer(VR* vr) {
     auto& p = g_pragmata_hud;
     const auto tune = pragmatavr::HudTuning::get().tune();
     if (!tune->enabled || !tune->hud_panel || p.failed) {
+        if (!p.failed) {
+            pragmata_release_fixed_hud(p);
+        }
         return;
     }
+    p.idle_frames = 0;
 
     // Build 27: the in-game UI buffer's size and format as recorded by the overlay hook (vr->uiBufferTex[0] may point
     // at a texture the engine has already freed, so it is not touched here).
@@ -711,6 +752,11 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     hq.visible = false;
 
     const auto tune = hud.tune();
+    // Build 34: Follows Head mode drops the quad swapchain (made again on the next switch to Fixed).
+    if ((!tune->enabled || !tune->hud_panel) && hq.swapchain != XR_NULL_HANDLE) {
+        pragmata_drop_hud_swapchain(openxr);
+        spdlog::info("[PragmataVR] Follows Head mode: Fixed HUD quad released");
+    }
     if (p.failed || !tune->enabled || !tune->hud_panel || p.src == nullptr) {
         return;
     }

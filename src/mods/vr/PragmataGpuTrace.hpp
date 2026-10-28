@@ -438,68 +438,55 @@ inline std::optional<D3D12_CPU_DESCRIPTOR_HANDLE> scratch_rtv(const RtvInfo& inf
 }
 
 inline void report_redirects() {
+    // Build 34: one line a minute (was two or three lines every 10 s).
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::seconds(10)) {
+    if (now - last < std::chrono::seconds(60)) {
         return;
     }
     last = now;
-    const auto r = g_redirected_sets.exchange(0);
-    const auto a = g_ui_alone_sets.exchange(0);
-    const auto u = g_ui_unknown_sets.exchange(0);
-    const auto m = g_ui_mrt_sets.exchange(0);
+    g_redirected_sets = 0;
+    g_ui_alone_sets = 0;
+    g_ui_unknown_sets = 0;
+    g_ui_mrt_sets = 0;
+    g_ui_notes_window = 0;
+    g_ui_new_window = 0;
+    g_handoff_current_window = 0;
+    g_handoff_older_window = 0;
+    g_captures_window = 0;
+    g_drawn_handoffs_window = 0;
+    g_fallback_window = 0;
+    g_engine_clears_window = 0;
+    g_indirect_ui_window = 0;
+    g_bundle_ui_window = 0;
+    g_draws_ui_window = 0;
     const auto ho = g_handoffs_window.exchange(0);
-    const auto notes = g_ui_notes_window.exchange(0);
-    const auto fresh = g_ui_new_window.exchange(0);
-    const auto cur = g_handoff_current_window.exchange(0);
-    const auto older = g_handoff_older_window.exchange(0);
     const auto skipped = g_handoff_skipped_window.exchange(0);
-    const auto captures = g_captures_window.exchange(0);
-    const auto drawn = g_drawn_handoffs_window.exchange(0);
-    const auto fallback = g_fallback_window.exchange(0);
     const auto pc = g_probe_captures_window.exchange(0);
     const auto pr = g_probe_read_window.exchange(0);
     const auto pb = g_probe_blank_window.exchange(0);
     const auto pe = g_probe_evicted_window.exchange(0);
     const auto pn = g_probe_noslot_window.exchange(0);
-    std::array<uint64_t, PROBE_GROUPS> has{};
     std::array<uint64_t, PROBE_GROUPS> upd{};
     for (int g = 0; g < PROBE_GROUPS; ++g) {
-        has[g] = g_probe_has_window[g].exchange(0);
+        g_probe_has_window[g] = 0;
         upd[g] = g_panel_update_window[g].exchange(0);
     }
-    std::string extents{};
     {
         std::scoped_lock _{g_slot_mtx};
-        static constexpr const char* names[PROBE_GROUPS]{"", "health", "stamina", "weapons", "tutorial", "", "", ""};
-        for (int g = 1; g <= 4; ++g) {
-            auto& e = g_extent_window[g];
-            if (e.any) {
-                extents += fmt::format(" {} ({},{})-({},{}) in box ({},{})-({},{});", names[g], e.x0, e.y0, e.x1, e.y1,
-                    e.box.left, e.box.top, e.box.right, e.box.bottom);
-            }
+        for (auto& e : g_extent_window) {
             e = Extent{};
         }
     }
-    const auto clears = g_engine_clears_window.exchange(0);
-    const auto indirect = g_indirect_ui_window.exchange(0);
-    const auto bundles = g_bundle_ui_window.exchange(0);
-    const auto draws_ui = g_draws_ui_window.exchange(0);
+    if (!g_intercept.load() && ho == 0) {
+        return; // Follows Head mode: nothing to report
+    }
     static int reports = 0;
-    if (reports < 360) { // Build 32: one hour (was 10 minutes)
+    if (reports < 120) { // two hours
         ++reports;
-        spdlog::info("[PragmataVR] HUD hand-off: last 10 s, {} UI buffer hand-offs ({}; {} of the buffer reported last, {} of an older one, "
-            "{} not the in-game buffer, {} with draws, {} copied to the panel, {} of them by the every-pass fallback), erase {}; overlay hook reported a UI buffer {} times ({} new); UI-buffer target sets: {} with other "
-            "targets, {} alone, {} with unknown targets", ho, g_intercept.load() ? "captured" : "not captured, HUD mode 3D",
-            cur, older, skipped, drawn, captures, fallback, g_erase.load() ? "on" : "off", notes, fresh, m, a, u);
-        // Groups: 1 health, 2 stamina, 3 weapon wheel, 4 tutorial.
-        spdlog::info("[PragmataVR] HUD probes: last 10 s, {} hand-offs captured, {} checked ({} blank), {} reused before checked, {} with no slot "
-            "free; checked captures holding health {}, stamina {}, weapons {}, tutorial {}; panel updates health {}, stamina {}, weapons {}, "
-            "tutorial {}; while a UI buffer was bound: {} engine clears, {} draws, {} ExecuteIndirect, {} ExecuteBundle",
-            pc, pr, pb, pe, pn, has[1], has[2], has[3], has[4], upd[1], upd[2], upd[3], upd[4], clears, draws_ui, indirect, bundles);
-        if (!extents.empty()) {
-            spdlog::info("[PragmataVR] HUD content extents (UI buffer px, last 10 s):{}", extents);
-        }
+        spdlog::info("[PragmataVR] Fixed HUD, last 60 s: {} hand-offs ({} not the in-game buffer), {} captured, {} checked ({} blank), "
+            "{} reused before checked, {} with no slot free; panel updates health {}, stamina {}, weapons {}, tutorial {}",
+            ho, skipped, pc, pr, pb, pe, pn, upd[1], upd[2], upd[3], upd[4]);
     }
 }
 
@@ -1145,18 +1132,11 @@ inline bool install(ID3D12Device* device) {
         return true;
     };
 
-    ok = make(g_create_rtv_hook, dev_vt[20], (uintptr_t)&create_rtv, "CreateRenderTargetView");
-    ok = make(g_om_set_hook, list_vt[46], (uintptr_t)&om_set, "OMSetRenderTargets") && ok;
-    ok = make(g_draw_hook, list_vt[12], (uintptr_t)&draw, "DrawInstanced") && ok;
-    ok = make(g_draw_indexed_hook, list_vt[13], (uintptr_t)&draw_indexed, "DrawIndexedInstanced") && ok;
-    ok = make(g_copy_region_hook, list_vt[16], (uintptr_t)&copy_region, "CopyTextureRegion") && ok;
-    ok = make(g_copy_resource_hook, list_vt[17], (uintptr_t)&copy_resource, "CopyResource") && ok;
-    ok = make(g_barrier_hook, list_vt[26], (uintptr_t)&barrier, "ResourceBarrier") && ok;
-    // Build 30 diagnostics (a failure here does not stop the HUD).
-    make(g_execute_bundle_hook, list_vt[27], (uintptr_t)&execute_bundle, "ExecuteBundle");
-    make(g_clear_rtv_hook, list_vt[48], (uintptr_t)&clear_rtv, "ClearRenderTargetView");
-    make(g_execute_indirect_hook, list_vt[59], (uintptr_t)&execute_indirect, "ExecuteIndirect");
-
+    // Build 34: only the ResourceBarrier hook is needed by the Fixed HUD (capture, probes, erase). The diagnostic hooks of
+    // Builds 18-32 (CreateRenderTargetView, OMSetRenderTargets, draws, copies, clears, ExecuteIndirect, ExecuteBundle)
+    // are no longer installed; the code paths that used them fall back to the plain calls.
+    (void)dev_vt;
+    ok = make(g_barrier_hook, list_vt[26], (uintptr_t)&barrier, "ResourceBarrier");
     spdlog::info("[PragmataVR] GPU trace hooks {} (RTV descriptor size {})", ok ? "installed" : "partly failed", g_rtv_increment);
     return ok;
 }

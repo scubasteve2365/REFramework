@@ -126,10 +126,12 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
 inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
     {0.0f, 900.0f, 400.0f, 1030.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes)
-    {720.0f, 950.0f, 1200.0f, 1050.0f}, // stamina
-    {1180.0f, 500.0f, 1920.0f, 1080.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box)
-    {60.0f, 200.0f, 590.0f, 400.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; the box reached far past
-                                       // the longest text seen, and enemy health bars passing through it went to the panel)
+    {720.0f, 950.0f, 1200.0f, 1020.0f}, // stamina (Build 34: bottom 1050 -> 1020, measured)
+    {1160.0f, 500.0f, 1575.0f, 890.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box. Build 34:
+                                        // right 1920 -> 1575, bottom 1080 -> 890, left 1180 -> 1160, measured from the
+                                        // Build 31 captures; the old box was about 3x the wheel and took in other HUD)
+    {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
+                                       // 4-line tutorial reached the 400 edge; room for about 2 more lines)
 }};
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
@@ -271,7 +273,9 @@ inline bool group_locked(const HudTune& t, int g) {
 }
 
 inline const char* hud_mode_name(int m) {
-    return m == HudModeFlat ? "FLAT" : (m == HudModeAnchored ? "ANCHORED" : "3D");
+    // Build 34: shown names (Steve): FIXED = the HUD stays put in one place in front of you (internally "anchored"),
+    // FOLLOWS HEAD = the HUD moves with your headset (internally "flat").
+    return m == HudModeFlat ? "FOLLOWS HEAD" : (m == HudModeAnchored ? "FIXED" : "3D");
 }
 
 // Which element a GUI GameObject belongs to. ui2160Gui is no longer tuned: the fix pack lists it with the hacking
@@ -828,25 +832,25 @@ private:
             add(MenuRow::Kind::Value, g, FieldX, ActionNone, "Left / right", value_hint);
             add(MenuRow::Kind::Value, g, FieldY, ActionNone, "Up / down", value_hint);
             add(MenuRow::Kind::Value, g, FieldGap, ActionNone, "Eye gap",
-                "A = edit the gap between eyes. In FLAT mode, higher = closer to you (ANCHORED uses HUD distance)");
+                "A = edit the gap between eyes. In Follows Head mode, higher = closer to you (Fixed uses HUD distance)");
             add(MenuRow::Kind::Action, g, -1, ActionResetGroup, "Reset to defaults", "A = back to the starting values for this HUD mode (blocked while locked)");
         };
 
         column = 0;
         add_section(SectionView, "VIEW");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
-            "A = FLAT (follows your head) or ANCHORED (health, stamina, weapons, tutorial fixed in the room)");
+            "A = Fixed (the HUD stays put in one place in front of you) or Follows Head (the HUD moves with your headset)");
         add(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
-            "A = edit. How far away the anchored HUD sits (meters). Its size in view stays the same");
-        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Size of the anchored HUD (degrees wide)");
+            "A = edit. How far away the Fixed HUD sits (meters). Its size in view stays the same");
+        add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWidth, ActionNone, "Panel size", "A = edit. Size of the Fixed HUD (degrees wide)");
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenYaw, ActionNone, "Panel left / right", value_hint);
         add(MenuRow::Kind::Value, GROUP_SCREEN, ScreenPitch, ActionNone, "Panel up / down", value_hint);
         add_element(GroupHealth);
         add_element(GroupStamina);
         add_section(SectionDeveloper, "DEVELOPER");
         add(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
-            "A = ANCHORED: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
+            "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
         // Build 28: Glued HUD, FLAT 3D panels, Frosted glass, Ghost layer, HUD position, Companion layers, Size grows from
         // and Engine UI blend are gone (fixed in HudTune::apply_hud_mode).
 
@@ -880,7 +884,7 @@ private:
         s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
-        s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the same for FLAT mode (canvas pixels, flat_y positive = down).\n";
+        s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the values used in Fixed and Follows Head modes (canvas pixels, flat_y positive = down).\n";
         s += "# scale_about_center = 1: size grows each element around its own center (hack always uses the panel origin).\n";
         s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
         s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
@@ -904,8 +908,8 @@ private:
         s += fmt::format("scale_about_center={}\n", t.scale_about_center ? 1 : 0);
         s += "# companion_mode: 0 = companion layers drawn with their element, 1 = REFramework's floating sheet, 2 = hidden.\n";
         s += fmt::format("companion_mode={}\n", t.companion_mode);
-        s += "# hud_mode: 0 = 3D, 1 = FLAT (game HUD as on a monitor, follows the head; <element>.flat_* values),\n";
-        s += "#   2 = PANEL (health / stamina / weapons / tutorial on a room-fixed panel; screen.* = size, distance, place).\n";
+        s += "# hud_mode: 1 = Follows Head (the HUD moves with your headset), 2 = Fixed (the HUD stays put in one place in front of\n";
+        s += "#   you; screen.* = its size, distance and place). Both use the <element>.flat_* values. 0 = old 3D mode (retired).\n";
         s += fmt::format("hud_mode={}\n", t.hud_mode);
         s += "# engine_overlay: test of the engine's overlay layer draw (0 = default, 1 = skipped, 2 = drawn).\n";
         s += fmt::format("engine_overlay={}\n", t.engine_overlay);
