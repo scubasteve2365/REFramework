@@ -14,6 +14,7 @@
 
 #if defined(PRAGMATA)
 #include "../PragmataPerf.hpp"
+#include <cmath>
 #endif
 #include <openxr/openxr_platform.h>
 
@@ -440,6 +441,46 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
         this->eyes[i] = Matrix4x4f{*(glm::quat*)&pose.orientation};
         this->eyes[i][3] = Vector4f{*(Vector3f*)&pose.position, 1.0f};
     }
+
+#if defined(PRAGMATA)
+    // PragmataVR Build 37: log the runtime and each eye's field of view and offset (once, and again if they change),
+    // so HUD placement can be made headset independent. No behaviour change.
+    {
+        static float last[2][4]{};
+        static bool logged_runtime = false;
+        bool changed = false;
+        for (int i = 0; i < 2; ++i) {
+            const auto& f = this->views[i].fov;
+            const float v[4]{f.angleLeft, f.angleRight, f.angleUp, f.angleDown};
+            for (int k = 0; k < 4; ++k) {
+                if (std::fabs(v[k] - last[i][k]) > 0.0005f) {
+                    changed = true;
+                }
+                last[i][k] = v[k];
+            }
+        }
+        if (!logged_runtime && this->instance != XR_NULL_HANDLE) {
+            logged_runtime = true;
+            XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
+            if (xrGetInstanceProperties(this->instance, &props) == XR_SUCCESS) {
+                spdlog::info("[PragmataVR] Headset: OpenXR runtime {} {}.{}.{}", props.runtimeName,
+                    XR_VERSION_MAJOR(props.runtimeVersion), XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion));
+            }
+        }
+        if (changed && last[0][1] != 0.0f) {
+            constexpr float deg = 57.2957795f;
+            for (int i = 0; i < 2; ++i) {
+                const auto& v = this->views[i];
+                spdlog::info("[PragmataVR] Headset: {} eye fov left {:.2f} right {:.2f} up {:.2f} down {:.2f} deg, "
+                             "position ({:.4f}, {:.4f}, {:.4f}), orientation ({:.4f}, {:.4f}, {:.4f}, {:.4f}), projection [0][0] {:.4f} [1][1] {:.4f} [2][0] {:.4f} [2][1] {:.4f}",
+                    i == 0 ? "left" : "right", v.fov.angleLeft * deg, v.fov.angleRight * deg, v.fov.angleUp * deg, v.fov.angleDown * deg,
+                    v.pose.position.x, v.pose.position.y, v.pose.position.z,
+                    v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w,
+                    this->projections[i][0][0], this->projections[i][1][1], this->projections[i][2][0], this->projections[i][2][1]);
+            }
+        }
+    }
+#endif
 
     return VRRuntime::Error::SUCCESS;
 }
