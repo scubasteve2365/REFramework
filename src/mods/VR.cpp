@@ -66,6 +66,7 @@
 #if defined(PRAGMATA)
 #include "vr/PragmataHud.hpp"
 #include "vr/PragmataMenuFont.hpp"
+#include "vr/PragmataPerf.hpp"
 #include <limits>
 #endif
 #include <MinHook.h>
@@ -3419,6 +3420,20 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value_color = t.scale_about_center ? ACCENT : AMBER;
             v.dim = t.hud_mode != pragmatavr::HudMode3D; // FLAT always grows from the element center
             break;
+        case pragmatavr::ActionToggleRenderMode:
+            v.value = t.render_afw ? "AFW" : "NATIVE";
+            v.value_color = t.render_afw ? AMBER : ACCENT;
+            break;
+        case pragmatavr::ActionToggleSharpening:
+            v.value = t.sharpening ? "ON" : "OFF";
+            break;
+        case pragmatavr::ActionToggleDesktopMirror:
+            v.value = t.desktop_mirror ? "ON" : "OFF";
+            v.value_color = t.desktop_mirror ? AMBER : ACCENT;
+            break;
+        case pragmatavr::ActionTogglePerfLog:
+            v.value = t.perf_log ? "ON" : "OFF";
+            break;
         case pragmatavr::ActionToggleHackLock:
         default:
             {
@@ -3596,7 +3611,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 29");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 35");
 
     float tier_w = 0.0f;
     for (int bd = 0; bd < 2; ++bd) {
@@ -3684,7 +3699,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 29"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 29");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 35"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 35");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3910,9 +3925,58 @@ void VR::on_present() {
         const auto hmd_pos = get_position(0);
         pragmatavr::HudTuning::get().update_head(get_rotation(0), glm::vec3{hmd_pos.x, hmd_pos.y, hmd_pos.z});
     }
+
+    // Build 35: PERFORMANCE section of the mod menu (pragmatavr_hud.ini) drives these REFramework settings.
+    // The ini is the source of truth; re2_fw_config.txt values for them are overridden.
+    {
+        const auto pt = pragmatavr::HudTuning::get().tune();
+        const int want_technique = pt->render_afw ? ALTERNATE_FRAME_WARPING : SEQUENTIAL_FRAME;
+        bool changed = false;
+
+        if (m_rendering_technique->value() != want_technique) {
+            m_rendering_technique->value() = want_technique;
+            changed = true;
+        }
+        if (m_enable_sharpening->value() != pt->sharpening) {
+            m_enable_sharpening->value() = pt->sharpening;
+            changed = true;
+        }
+        if (m_desktop_fix->value() != pt->desktop_mirror) {
+            m_desktop_fix->value() = pt->desktop_mirror;
+            changed = true;
+        }
+        pragmatavr::perf::g_enabled.store(pt->perf_log, std::memory_order_relaxed);
+
+        static bool logged_once = false;
+        static bool last_perf_log = true;
+        if (changed || !logged_once || last_perf_log != pt->perf_log) {
+            logged_once = true;
+            last_perf_log = pt->perf_log;
+            spdlog::info("[PragmataVR] Perf settings: render mode {}, sharpening {} ({:.2f}), desktop mirror {}, eye image {} x {}, "
+                         "resolution scale {:.2f}, perf log {}",
+                is_using_sf() ? "NATIVE (Two Frame Sequential)" : "AFW (Alternate Frame Warping)",
+                m_enable_sharpening->value() ? "ON" : "OFF", m_sharpness->value(), m_desktop_fix->value() ? "ON" : "OFF",
+                get_hmd_width(), get_hmd_height(), m_resolution_scale->value(), pt->perf_log ? "ON" : "OFF");
+        }
+
+        if (pt->perf_log) {
+            pragmatavr::perf::Stats::get().maybe_report(is_using_sf() ? "NATIVE" : "AFW");
+        }
+    }
+
+    // Build 35: time spent in this function (render thread: eye submission and copies).
+    struct PragmataPresentTimer {
+        int64_t t0{pragmatavr::perf::now_ns()};
+        ~PragmataPresentTimer() {
+            if (pragmatavr::perf::g_enabled.load(std::memory_order_relaxed)) {
+                pragmatavr::perf::Stats::get().present(pragmatavr::perf::now_ns() - t0);
+            }
+        }
+    } pragmata_present_timer{};
 #endif
     
 
+#if !defined(PRAGMATA) // Build 35: PureDark's numpad hotkeys are off in PragmataVR (the mod menu has the settings)
     static bool btn1 = false;
     if (GetAsyncKeyState(VK_NUMPAD1) < 0 && btn1 == false) {
         btn1 = true;
@@ -3948,6 +4012,7 @@ void VR::on_present() {
         btn4 = false;
         m_fix_upscalers_wobbling->toggle();
     }
+#endif
 
     // case 1: sequential frames and rendered frame == right eye (every two frames)
     // case 2: AFW and no foveated rendering (each frame)
@@ -4003,6 +4068,7 @@ void VR::on_present() {
     // attempt to fix crash when reinitializing openvr
     std::scoped_lock _{m_openvr_mtx};
     m_submitted = false;
+#if !defined(PRAGMATA) // Build 35: numpad hotkeys off in PragmataVR
     static bool btn5 = false;
     if (GetAsyncKeyState(VK_NUMPAD5) < 0 && btn5 == false) {
         btn5 = true;
@@ -4070,6 +4136,7 @@ void VR::on_present() {
         btnMul = false;
         m_enable_sharpening->toggle();
     }
+#endif
 
     // only update camera data when not rendering FR frame (which has lower FOV)
     update_camera_data(m_render_frame_count);
@@ -5759,7 +5826,14 @@ void VR::on_end_rendering(void* entry) {
             }
         }
 
+#if defined(PRAGMATA)
+        // Build 35: telemetry, time spent waiting for the render thread before the right-eye re-run.
+        const auto pragmata_rerun_t0 = pragmatavr::perf::now_ns();
+#endif
         sdk::renderer::wait_rendering();
+#if defined(PRAGMATA)
+        const auto pragmata_rerun_t1 = pragmatavr::perf::now_ns();
+#endif
         sdk::renderer::begin_update_primitive();
 
         //static auto update_geometry = app->get_function("UpdateGeometry");
@@ -5803,6 +5877,13 @@ void VR::on_end_rendering(void* entry) {
 
             func->func(func->entry);
         }
+
+#if defined(PRAGMATA)
+        if (pragmatavr::perf::g_enabled.load(std::memory_order_relaxed)) {
+            const auto t2 = pragmatavr::perf::now_ns();
+            pragmatavr::perf::Stats::get().rerun(pragmata_rerun_t1 - pragmata_rerun_t0, t2 - pragmata_rerun_t1);
+        }
+#endif
 
         restore_camera();
 

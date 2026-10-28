@@ -198,6 +198,13 @@ struct HudTune {
     std::array<float, 4> screen{70.0f, 1.5f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
     std::array<bool, 4> screen_invert{};
 
+    // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
+    // values in re2_fw_config.txt for them no longer matter.
+    bool render_afw{false};     // false = NATIVE (Two Frame Sequential, both eyes from the same moment), true = AFW
+    bool sharpening{true};      // PureDark's sharpening pass (full resolution, every eye)
+    bool desktop_mirror{false}; // copy the headset image to the game window on the monitor (costs GPU time)
+    bool perf_log{true};        // performance summary in re2_framework_log.txt every 10 s
+
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
     // click volume (0..1 of full scale)
@@ -397,6 +404,7 @@ enum MenuSection : int {
     SectionView = 0,
     SectionDeveloper = 1,
     SectionElement0 = 2, // + Group
+    SectionPerformance = 7, // Build 35 (after the five element sections, bits 2 to 6)
 };
 
 inline bool section_collapsed(uint32_t collapsed, int section) {
@@ -465,6 +473,10 @@ enum MenuAction : int {
     ActionToggleGluedHud,
     ActionSnapshotSeries,
     ActionClose,
+    ActionToggleRenderMode,    // Build 35
+    ActionToggleSharpening,    // Build 35
+    ActionToggleDesktopMirror, // Build 35
+    ActionTogglePerfLog,       // Build 35
 };
 
 class HudTuning {
@@ -858,6 +870,16 @@ private:
         add_element(GroupHack);
         add_element(GroupWeapons);
         add_element(GroupTutorial);
+        // Build 35: VR rendering settings that cost or save frame time.
+        add_section(SectionPerformance, "PERFORMANCE");
+        m_rows.back().hint = "VR RENDERING";
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleRenderMode, "Render mode",
+            "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleSharpening, "Sharpening", "A = turn the sharpening pass on or off (small GPU cost)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionToggleDesktopMirror, "Desktop mirror",
+            "A = show the headset image in the game window on your monitor (costs GPU time, only for recording)");
+        add(MenuRow::Kind::Toggle, -1, -1, ActionTogglePerfLog, "Performance log",
+            "A = write frame time numbers to re2_framework_log.txt every 10 seconds");
 
         rebuild_nav(HudTune{}.collapsed);
         menu_selected = m_nav[0].empty() ? 0 : m_nav[0].front();
@@ -895,7 +917,8 @@ private:
         s += fmt::format("depth_shift={:.4f}\n", t.depth_shift);
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
-        s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial).\n";
+        s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial,\n";
+        s += "#   128 PERFORMANCE).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
@@ -915,6 +938,12 @@ private:
         s += fmt::format("engine_overlay={}\n", t.engine_overlay);
         s += "# glued_hud_removed = 1: test, the UI is kept out of the eye images (only the HUD panel shows it).\n";
         s += fmt::format("glued_hud_removed={}\n", t.glued_hud_removed ? 1 : 0);
+        s += "# PERFORMANCE (Build 35). render_mode: 0 = NATIVE (Two Frame Sequential), 1 = AFW (Alternate Frame Warping).\n";
+        s += "#   sharpening and desktop_mirror: 1 = on. perf_log = 1: frame time summary in re2_framework_log.txt every 10 s.\n";
+        s += fmt::format("render_mode={}\n", t.render_afw ? 1 : 0);
+        s += fmt::format("sharpening={}\n", t.sharpening ? 1 : 0);
+        s += fmt::format("desktop_mirror={}\n", t.desktop_mirror ? 1 : 0);
+        s += fmt::format("perf_log={}\n", t.perf_log ? 1 : 0);
         for (int i = 0; i < 4; ++i) {
             if (i == ScreenDistance) continue; // written below
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
@@ -1079,6 +1108,10 @@ private:
                 // flat_test and hud_panel lines (Builds 16-20) are ignored: flat_test stayed on unseen after its row went.
                 else if (key == "engine_overlay") t->engine_overlay = std::clamp((int)val, 0, 2);
                 else if (key == "glued_hud_removed") t->glued_hud_removed = val != 0.0f;
+                else if (key == "render_mode") t->render_afw = val != 0.0f;
+                else if (key == "sharpening") t->sharpening = val != 0.0f;
+                else if (key == "desktop_mirror") t->desktop_mirror = val != 0.0f;
+                else if (key == "perf_log") t->perf_log = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1464,6 +1497,26 @@ private:
                     t->lock_invert = !t->lock_invert;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: fixed HUD direction {}", t->lock_invert ? "flipped" : "normal");
+                    play_click(true);
+                } else if (row.action == ActionToggleRenderMode) {
+                    t->render_afw = !t->render_afw;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: render mode {}", t->render_afw ? "AFW" : "NATIVE");
+                    play_click(true);
+                } else if (row.action == ActionToggleSharpening) {
+                    t->sharpening = !t->sharpening;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: sharpening {}", t->sharpening ? "on" : "off");
+                    play_click(true);
+                } else if (row.action == ActionToggleDesktopMirror) {
+                    t->desktop_mirror = !t->desktop_mirror;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
+                    play_click(true);
+                } else if (row.action == ActionTogglePerfLog) {
+                    t->perf_log = !t->perf_log;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: performance log {}", t->perf_log ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleBoxes) {
                     t->show_boxes = !t->show_boxes;

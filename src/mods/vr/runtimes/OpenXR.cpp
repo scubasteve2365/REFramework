@@ -11,6 +11,10 @@
 #include "OpenXR.hpp"
 #include <mods/VR.hpp>
 #include <openxr/openxr.h>
+
+#if defined(PRAGMATA)
+#include "../PragmataPerf.hpp"
+#endif
 #include <openxr/openxr_platform.h>
 
 using namespace nlohmann;
@@ -36,7 +40,16 @@ VRRuntime::Error OpenXR::synchronize_frame() {
 
     XrFrameWaitInfo frame_wait_info{XR_TYPE_FRAME_WAIT_INFO};
     this->frame_state = {XR_TYPE_FRAME_STATE};
+#if defined(PRAGMATA)
+    const auto pragmata_wait_t0 = pragmatavr::perf::now_ns();
+#endif
     auto result = xrWaitFrame(this->session, &frame_wait_info, &this->frame_state);
+#if defined(PRAGMATA)
+    if (pragmatavr::perf::g_enabled.load(std::memory_order_relaxed)) {
+        pragmatavr::perf::Stats::get().xr_wait(pragmatavr::perf::now_ns() - pragmata_wait_t0,
+            result == XR_SUCCESS ? (int64_t)this->frame_state.predictedDisplayPeriod : 0);
+    }
+#endif
 
     this->end_profile("xrWaitFrame");
 

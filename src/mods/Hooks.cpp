@@ -10,6 +10,11 @@
 
 #include "Hooks.hpp"
 
+#if defined(PRAGMATA)
+#include "vr/PragmataPerf.hpp"
+extern bool inside_on_end; // VR.cpp: true while the right-eye re-run is running
+#endif
+
 Hooks* g_hook = nullptr;
 
 std::shared_ptr<Hooks>& Hooks::get() {
@@ -822,6 +827,48 @@ void* Hooks::gui_draw_hook_internal(REComponent* gui_element, void* primitive_co
 
     auto& mods = g_framework->get_mods()->get_mods();
 
+#if defined(PRAGMATA)
+    // PragmataVR Build 35: performance telemetry (pragmatavr::perf). Same order of calls as the plain path below.
+    if (pragmatavr::perf::g_enabled.load(std::memory_order_relaxed)) {
+        namespace perf = pragmatavr::perf;
+        auto& stats = perf::Stats::get();
+        bool any_false_t = false;
+
+        // Fixed-size scratch: REFramework has far fewer than 64 mods.
+        perf::ModSample samples[64]{};
+        const size_t n = (std::min<size_t>)(mods.size(), 64);
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            bool keep = true;
+            const auto ns = perf::timed([&] { keep = mods[i]->on_pre_gui_draw_element(gui_element, primitive_context); });
+            if (i < n) {
+                samples[i].name = mods[i]->get_name().data();
+                samples[i].ns += ns;
+            }
+            if (!keep) {
+                any_false_t = true;
+            }
+        }
+
+        void* ret_t = nullptr;
+        const auto draw_ns = perf::timed([&] {
+            if (!any_false_t) {
+                ret_t = original_func(gui_element, primitive_context);
+            }
+        });
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            const auto ns = perf::timed([&] { mods[i]->on_gui_draw_element(gui_element, primitive_context); });
+            if (i < n) {
+                samples[i].ns += ns;
+            }
+        }
+
+        stats.gui(draw_ns, samples, n);
+        return ret_t;
+    }
+#endif
+
     bool any_false = false;
 
     for (auto& mod : mods) {
@@ -930,6 +977,53 @@ void Hooks::global_application_entry_hook_internal(void* entry, const char* name
     }
 #endif
     }
+
+#if defined(PRAGMATA)
+    // PragmataVR Build 35: performance telemetry (pragmatavr::perf). Same order of calls as the plain path below.
+    if (!m_profiling_enabled && pragmatavr::perf::g_enabled.load(std::memory_order_relaxed)) {
+        namespace perf = pragmatavr::perf;
+        const int pass = inside_on_end ? 1 : 0;
+        auto& mods = g_framework->get_mods()->get_mods();
+        auto& stats = perf::Stats::get();
+
+        if (hash == "BeginRendering"_fnv && pass == 0) {
+            stats.frame_start();
+        }
+
+        // Per-mod samples for this call (stages can nest: the right-eye re-run runs inside EndRendering).
+        std::vector<perf::ModSample> samples(mods.size());
+        for (size_t i = 0; i < mods.size(); ++i) {
+            samples[i].name = mods[i]->get_name().data();
+        }
+
+        const auto saved_child = perf::tl_child_ns;
+        perf::tl_child_ns = 0;
+        const auto t0 = perf::now_ns();
+        int64_t mods_ns = 0;
+
+        if (hash == "BeginRendering"_fnv) {
+            mods_ns += perf::timed([&] { g_framework->run_imgui_frame(false); });
+        }
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            const auto ns = perf::timed([&] { mods[i]->on_pre_application_entry(entry, name, hash); });
+            mods_ns += ns;
+            samples[i].ns += ns;
+        }
+
+        const auto game_ns = perf::timed([&] { original(entry); });
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            const auto ns = perf::timed([&] { mods[i]->on_application_entry(entry, name, hash); });
+            mods_ns += ns;
+            samples[i].ns += ns;
+        }
+
+        perf::tl_child_ns = saved_child + (perf::now_ns() - t0);
+        stats.stage(pass, name, game_ns, mods_ns, samples.data(), samples.size());
+        return;
+    }
+#endif
 
     if (m_profiling_enabled) {
         Hooks::ApplicationEntryData profiler_entry{};
