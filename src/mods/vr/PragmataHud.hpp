@@ -963,7 +963,7 @@ private:
         column = 1;
         add_header("DEVELOPER", "TOOLS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleShiftDamage, "Damage numbers shift",
-            "A = test: move the damage numbers with their HUD tab values (off while a crash is checked)");
+            "A = test: move the damage numbers with their HUD tab values (now without touching game objects)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
             "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
