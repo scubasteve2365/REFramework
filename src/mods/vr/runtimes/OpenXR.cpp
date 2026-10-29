@@ -14,7 +14,10 @@
 
 #if defined(PRAGMATA)
 #include "../PragmataPerf.hpp"
+#include "../PragmataHud.hpp"
+#include <cctype>
 #include <cmath>
+#include <ctime>
 #endif
 #include <openxr/openxr_platform.h>
 
@@ -448,6 +451,7 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
     {
         static float last[2][4]{};
         static bool logged_runtime = false;
+        static std::string runtime_name{};
         bool changed = false;
         for (int i = 0; i < 2; ++i) {
             const auto& f = this->views[i].fov;
@@ -463,6 +467,7 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             logged_runtime = true;
             XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
             if (xrGetInstanceProperties(this->instance, &props) == XR_SUCCESS) {
+                runtime_name = props.runtimeName;
                 spdlog::info("[PragmataVR] Headset: OpenXR runtime {} {}.{}.{}", props.runtimeName,
                     XR_VERSION_MAJOR(props.runtimeVersion), XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion));
             }
@@ -477,6 +482,43 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
                     v.pose.position.x, v.pose.position.y, v.pose.position.z,
                     v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w,
                     this->projections[i][0][0], this->projections[i][1][1], this->projections[i][2][0], this->projections[i][2][1]);
+            }
+
+            // Build 38: keep a permanent record (re2_framework_log.txt is replaced at every launch), and pick the HUD
+            // settings profile for this headset: runtime name plus the left eye's total FOV in whole degrees.
+            const auto& lf = this->views[0].fov;
+            const int fov_w = (int)std::lround((lf.angleRight - lf.angleLeft) * deg);
+            const int fov_h = (int)std::lround((lf.angleUp - lf.angleDown) * deg);
+            std::string rt{};
+            for (const char ch : runtime_name) {
+                if (std::isalnum((unsigned char)ch)) rt += ch;
+            }
+            if (rt.empty()) rt = "OpenXR";
+            const auto key = fmt::format("{}_{}x{}", rt, fov_w, fov_h);
+            {
+                std::error_code ec{};
+                const auto dir = pragmatavr::HudTuning::data_dir();
+                std::filesystem::create_directories(dir, ec);
+                std::ofstream f{dir / "pragmatavr_headsets.txt", std::ios::app};
+                if (f) {
+                    const auto now = std::time(nullptr);
+                    char ts[32]{};
+                    std::strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+                    f << ts << "  " << runtime_name << "  profile " << key << "\n";
+                    for (int i = 0; i < 2; ++i) {
+                        const auto& v = this->views[i];
+                        f << fmt::format("    {} eye fov left {:.2f} right {:.2f} up {:.2f} down {:.2f} deg, position ({:.4f}, {:.4f}, {:.4f}), "
+                                         "orientation ({:.4f}, {:.4f}, {:.4f}, {:.4f})\n",
+                            i == 0 ? "left" : "right", v.fov.angleLeft * deg, v.fov.angleRight * deg, v.fov.angleUp * deg, v.fov.angleDown * deg,
+                            v.pose.position.x, v.pose.position.y, v.pose.position.z,
+                            v.pose.orientation.x, v.pose.orientation.y, v.pose.orientation.z, v.pose.orientation.w);
+                    }
+                }
+            }
+            static bool profile_set = false;
+            if (!profile_set) {
+                profile_set = true; // once per session, even if the runtime adjusts the FOV later
+                pragmatavr::HudTuning::get().set_headset_profile(key);
             }
         }
     }

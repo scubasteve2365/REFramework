@@ -450,6 +450,9 @@ struct PragmataHudPanel {
 };
 
 PragmataHudPanel g_pragmata_hud{};
+// Build 38: per element area (same order as pragmata_trace::g_rects): where it goes on the panel, relative to its place
+// in the UI buffer (the element's Left / right and Up / down). Guarded by pragmata_trace::g_rects_mtx.
+std::vector<POINT> g_pragmata_rect_offsets{};
 
 bool pragmata_ensure_comp(PragmataHudPanel& p) {
     if (p.comp != nullptr) {
@@ -805,11 +808,14 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     if (pragmata_ensure_comp(p)) {
         std::vector<D3D12_RECT> rects{};
         std::vector<int> groups{};
+        std::vector<POINT> offsets{};
         {
             std::scoped_lock _{pragmata_trace::g_rects_mtx};
             rects = pragmata_trace::g_rects;
             groups = pragmata_trace::g_rect_groups;
+            offsets = g_pragmata_rect_offsets;
         }
+        offsets.resize(rects.size(), POINT{0, 0});
         const auto copies = pragmata_trace::panel_copies(groups);
         std::scoped_lock _{cmds.mtx};
         auto cl = cmds.cmd_list.Get();
@@ -854,18 +860,34 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         D3D12_TEXTURE_COPY_LOCATION dst_loc{};
         dst_loc.pResource = p.comp.Get();
         dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        for (const auto& r : rects) {
-            D3D12_BOX box{(UINT)r.left, (UINT)r.top, 0u, (UINT)r.right, (UINT)r.bottom, 1u};
-            cl->CopyTextureRegion(&dst_loc, (UINT)r.left, (UINT)r.top, 0, &src_loc, &box);
+        // Build 38: each area is copied to its place on the panel (moved by the element's Left / right, Up / down), clipped
+        // to the image. dst_rects are what Show element boxes outlines.
+        std::vector<D3D12_RECT> dst_rects{};
+        const LONG pw = (LONG)p.src_w;
+        const LONG ph = (LONG)p.src_h;
+        for (size_t i = 0; i < rects.size(); ++i) {
+            D3D12_RECT sr = rects[i];
+            LONG dx = sr.left + offsets[i].x;
+            LONG dy = sr.top + offsets[i].y;
+            if (dx < 0) { sr.left -= dx; dx = 0; }
+            if (dy < 0) { sr.top -= dy; dy = 0; }
+            if (dx + (sr.right - sr.left) > pw) sr.right = sr.left + (pw - dx);
+            if (dy + (sr.bottom - sr.top) > ph) sr.bottom = sr.top + (ph - dy);
+            if (sr.right <= sr.left || sr.bottom <= sr.top) {
+                continue;
+            }
+            D3D12_BOX box{(UINT)sr.left, (UINT)sr.top, 0u, (UINT)sr.right, (UINT)sr.bottom, 1u};
+            cl->CopyTextureRegion(&dst_loc, (UINT)dx, (UINT)dy, 0, &src_loc, &box);
+            dst_rects.push_back(D3D12_RECT{dx, dy, dx + (sr.right - sr.left), dy + (sr.bottom - sr.top)});
         }
         tr(cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
-        if (tune->show_boxes && !rects.empty()) {
+        if (tune->show_boxes && !dst_rects.empty()) {
             tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
             const float cyan[4]{0.0f, 0.85f, 0.9f, 1.0f};
             std::vector<D3D12_RECT> lines{};
             const LONG th = 6;
-            for (const auto& r : rects) {
+            for (const auto& r : dst_rects) {
                 lines.push_back(D3D12_RECT{r.left, r.top, r.right, (std::min)(r.top + th, r.bottom)});
                 lines.push_back(D3D12_RECT{r.left, (std::max)(r.bottom - th, r.top), r.right, r.bottom});
                 lines.push_back(D3D12_RECT{r.left, r.top, (std::min)(r.left + th, r.right), r.bottom});
@@ -986,14 +1008,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 const auto boxes = pragmatavr::anchored_boxes_px(*t, (float)d.Width, (float)d.Height, vr->m_frame_count);
                 std::vector<D3D12_RECT> rects{};
                 std::vector<int> groups{};
+                std::vector<POINT> offs{};
                 for (const auto& b : boxes) {
                     rects.push_back(D3D12_RECT{(LONG)b.x0, (LONG)b.y0, (LONG)b.x1, (LONG)b.y1});
                     groups.push_back(b.group);
+                    offs.push_back(POINT{(LONG)b.ox, (LONG)b.oy});
                 }
                 static std::string last_desc{};
                 std::string desc{};
                 for (const auto& b : boxes) {
-                    desc += fmt::format(" {}({},{})-({},{})", pragmatavr::GROUP_KEYS[b.group], b.x0, b.y0, b.x1, b.y1);
+                    desc += fmt::format(" {}({},{})-({},{}) panel offset ({},{})", pragmatavr::GROUP_KEYS[b.group], b.x0, b.y0, b.x1, b.y1, b.ox, b.oy);
                 }
                 if (desc != last_desc) {
                     last_desc = desc;
@@ -1002,6 +1026,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 std::scoped_lock _{pragmata_trace::g_rects_mtx};
                 pragmata_trace::g_rects = std::move(rects);
                 pragmata_trace::g_rect_groups = std::move(groups);
+                g_pragmata_rect_offsets = std::move(offs);
             }
         }
         // Build 31: probe fence on the game's queue, every present.
@@ -1047,7 +1072,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             auto& done = left ? hud.snapshot_left_done : hud.snapshot_right_done;
             const int ei = left ? 0 : 1;
 
-            if (!done.load()) {
+            // Build 38: start with a left-eye frame so the right eye comes from the next frame (the same stereo pair in
+            // NATIVE). Before, a series could pair a right eye with the next frame's left eye (head moved in between).
+            if (!done.load() && (left || hud.snapshot_left_done.load())) {
                 done = true;
                 auto device = g_framework->get_d3d12_hook()->get_device();
                 const auto bb_desc = backbuffer->GetDesc();

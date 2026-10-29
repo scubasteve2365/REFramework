@@ -205,6 +205,14 @@ struct HudTune {
     bool desktop_mirror{false}; // copy the headset image to the game window on the monitor (costs GPU time)
     bool perf_log{true};        // performance summary in re2_framework_log.txt every 10 s
 
+    // Build 38: in Follows Head and Fixed modes the GUI views still drawn in the world (hacking circle, door hack, reticle,
+    // enemy markers) use the headset's own eye projection, like the world itself, so they land in the right place and
+    // shape on any headset. false = the game's flat (monitor) projection, as in Builds 21-37.
+    bool world_headset{true};
+    // Build 38: the hacking circle's values for the headset projection (around FLAT_PIVOTS like FLAT). Neutral start:
+    // with the right projection the game's own placement should already line up; no eye gap is needed.
+    GroupTune hack_headset{};
+
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
     // click volume (0..1 of full scale)
@@ -268,9 +276,11 @@ inline GroupTune default_flat_group(int g) {
 
 // The values the menu shows and edits for an element in the current HUD mode.
 inline GroupTune& active_group(HudTune& t, int g) {
+    if (g == GroupHack && t.flat_test && t.world_headset) return t.hack_headset; // Build 38
     return t.flat_test ? t.flat_groups[g] : t.groups[g];
 }
 inline const GroupTune& active_group(const HudTune& t, int g) {
+    if (g == GroupHack && t.flat_test && t.world_headset) return t.hack_headset; // Build 38
     return t.flat_test ? t.flat_groups[g] : t.groups[g];
 }
 
@@ -488,6 +498,7 @@ enum MenuAction : int {
     ActionToggleSharpening,    // Build 35
     ActionToggleDesktopMirror, // Build 35
     ActionTogglePerfLog,       // Build 35
+    ActionToggleWorldProj,     // Build 38
 };
 
 class HudTuning {
@@ -898,6 +909,8 @@ private:
             "A = show the headset image in the game window on your monitor (costs GPU time, only for recording)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionTogglePerfLog, "Performance log",
             "A = write frame time numbers to re2_framework_log.txt every 10 seconds");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleWorldProj, "World HUD projection",
+            "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
@@ -923,8 +936,47 @@ private:
         select_first();
     }
 
+    // Build 38: one settings file per headset. Until the headset is known (and on OpenVR) this is pragmatavr_hud.ini;
+    // set_headset_profile switches to pragmatavr_hud_<runtime>_<fov>.ini, which starts as a copy of the current values.
     static std::filesystem::path path() {
-        return data_dir() / "pragmatavr_hud.ini";
+        std::scoped_lock _{profile_mtx()};
+        return data_dir() / (profile_name().empty() ? std::string{"pragmatavr_hud.ini"} : "pragmatavr_hud_" + profile_name() + ".ini");
+    }
+
+    static std::mutex& profile_mtx() {
+        static std::mutex m{};
+        return m;
+    }
+    static std::string& profile_name() {
+        static std::string n{};
+        return n;
+    }
+
+    void set_headset_profile(const std::string& key) {
+        {
+            std::scoped_lock _{profile_mtx()};
+            if (profile_name() == key) {
+                return;
+            }
+        }
+        const auto current = copy_current();
+        {
+            std::scoped_lock _{profile_mtx()};
+            profile_name() = key;
+        }
+        std::error_code ec{};
+        const auto p = path();
+        if (!std::filesystem::exists(p, ec)) {
+            write_file(*current); // a new headset starts from the values in use now
+            spdlog::info("[PragmataVR] HUD settings: new profile {} (copied from the current values)", p.filename().string());
+        } else {
+            spdlog::info("[PragmataVR] HUD settings: using profile {}", p.filename().string());
+        }
+        {
+            std::scoped_lock _{m_mtx};
+            m_loaded_once = false; // load the profile on the next check
+            m_last_check = {};
+        }
     }
 
     static std::string trim(const std::string& s) {
@@ -982,6 +1034,13 @@ private:
         s += fmt::format("sharpening={}\n", t.sharpening ? 1 : 0);
         s += fmt::format("desktop_mirror={}\n", t.desktop_mirror ? 1 : 0);
         s += fmt::format("perf_log={}\n", t.perf_log ? 1 : 0);
+        s += "# world_hud_projection (Build 38): 1 = hacking circle, reticle and enemy markers use the headset's own projection\n";
+        s += "#   (right place and shape on any headset; hack.headset_* values), 0 = the game's flat projection (hack.flat_*).\n";
+        s += fmt::format("world_hud_projection={}\n", t.world_headset ? 1 : 0);
+        s += fmt::format("hack.headset_size={:.4f}\n", t.hack_headset.size);
+        s += fmt::format("hack.headset_x={:.2f}\n", t.hack_headset.x);
+        s += fmt::format("hack.headset_y={:.2f}\n", t.hack_headset.y);
+        s += fmt::format("hack.headset_gap={:.2f}\n", t.hack_headset.gap);
         for (int i = 0; i < 4; ++i) {
             if (i == ScreenDistance) continue; // written below
             s += fmt::format("screen.{}={:.2f}\n", SCREEN_KEYS[i], t.screen[i]);
@@ -1150,6 +1209,7 @@ private:
                 else if (key == "sharpening") t->sharpening = val != 0.0f;
                 else if (key == "desktop_mirror") t->desktop_mirror = val != 0.0f;
                 else if (key == "perf_log") t->perf_log = val != 0.0f;
+                else if (key == "world_hud_projection") t->world_headset = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1179,6 +1239,16 @@ private:
                         else t->screen[i] = std::clamp(val, SCREEN_MIN[i], SCREEN_MAX[i]);
                     }
                 }
+                continue;
+            }
+
+            // Build 38: hacking circle values for the headset projection.
+            if (group_key == "hack" && !is_invert && rest.size() > 8 && rest.substr(0, 8) == "headset_") {
+                const auto f = rest.substr(8);
+                if (f == "size") t->hack_headset.size = std::clamp(val, 0.05f, 8.0f);
+                else if (f == "x") t->hack_headset.x = std::clamp(val, -4000.0f, 4000.0f);
+                else if (f == "y") t->hack_headset.y = std::clamp(val, -4000.0f, 4000.0f);
+                else if (f == "gap") t->hack_headset.gap = std::clamp(val, -4000.0f, 4000.0f);
                 continue;
             }
 
@@ -1577,6 +1647,12 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
                     play_click(true);
+                } else if (row.action == ActionToggleWorldProj) {
+                    t->world_headset = !t->world_headset;
+                    commit(t);
+                    companion_generation++;
+                    spdlog::info("[PragmataVR] Menu: world HUD projection {}", t->world_headset ? "HEADSET" : "FLAT");
+                    play_click(true);
                 } else if (row.action == ActionTogglePerfLog) {
                     t->perf_log = !t->perf_log;
                     commit(t);
@@ -1666,7 +1742,11 @@ private:
                         play_click(false);
                         return;
                     }
-                    if (t->flat_test) {
+                    if (row.group == GroupHack && t->flat_test && t->world_headset) {
+                        const auto inverts = t->hack_headset.invert;
+                        t->hack_headset = GroupTune{};
+                        t->hack_headset.invert = inverts;
+                    } else if (t->flat_test) {
                         t->flat_groups[row.group] = default_flat_group(row.group);
                     } else {
                         const auto inverts = t->groups[row.group].invert;
@@ -1923,7 +2003,8 @@ inline MenuQuadPlacement hud_panel_placement(const HudTune& t, const HudTuning::
 // (around FLAT_PIVOTS) and position; the eye gap is not used in ANCHORED.
 struct AnchoredBox {
     int group{0};
-    long x0{0}, y0{0}, x1{0}, y1{0};
+    long x0{0}, y0{0}, x1{0}, y1{0}; // area in the UI buffer (captured and erased from the eyes)
+    long ox{0}, oy{0};               // Build 38: where the area goes on the panel, relative to x0 / y0 (Left / right, Up / down)
 };
 
 // Build 28: the frame (VR frame count) each element last drew in FLAT / ANCHORED. Its box is only used while it draws,
@@ -1946,12 +2027,17 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
         const auto& gt = t.flat_groups[g];
         const float px = FLAT_PIVOTS[g][0];
         const float py = FLAT_PIVOTS[g][1];
-        const float cx0 = px + gt.size * (b[0] - px) + gt.x;
-        const float cy0 = py + gt.size * (b[1] - py) + gt.y;
-        const float cx1 = px + gt.size * (b[2] - px) + gt.x;
-        const float cy1 = py + gt.size * (b[3] - py) + gt.y;
+        // Build 38: in Fixed mode the element is drawn at its own place in the game layout (only its size changes), so
+        // its area sits at the screen edge where the game put it, away from the reticle and the hacking circle in the
+        // middle of the view. Left / right and Up / down move it on the panel instead (ox / oy), same final layout.
+        const float cx0 = px + gt.size * (b[0] - px);
+        const float cy0 = py + gt.size * (b[1] - py);
+        const float cx1 = px + gt.size * (b[2] - px);
+        const float cy1 = py + gt.size * (b[3] - py);
         AnchoredBox a{};
         a.group = g;
+        a.ox = (long)std::lround(s * gt.x);
+        a.oy = (long)std::lround(s * gt.y);
         a.x0 = (long)std::clamp(ox + s * (std::min)(cx0, cx1), 0.0f, w);
         a.y0 = (long)std::clamp(oy + s * (std::min)(cy0, cy1), 0.0f, h);
         a.x1 = (long)std::clamp(ox + s * (std::max)(cx0, cx1), 0.0f, w);
