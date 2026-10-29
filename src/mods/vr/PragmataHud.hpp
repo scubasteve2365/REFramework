@@ -226,7 +226,7 @@ struct HudTune {
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
     // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).
-    bool shift_damage{false};
+    bool shift_damage{true}; // Build 45: on again, now through the projection (no game object writes)
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),

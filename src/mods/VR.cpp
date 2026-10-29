@@ -343,20 +343,25 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
 #else
                 *result = vr->get_current_projection_matrix(true);
 #endif
-                // Build 44: damage numbers shift without touching the game's objects: move them on screen by offsetting
-                // the projection while they draw (canvas pixels -> NDC; the canvas is fitted to the eye image width).
-                if (tune->shift_damage && pragmatavr::g_current_gui_hash == "ui3201Gui"_fnv) {
+                // Build 44/45: enemy health bars, boss bars and damage numbers shift without touching the game's objects:
+                // move them on screen by offsetting the projection while they draw (canvas pixels -> NDC; the canvas is
+                // fitted to the eye image width).
+                const auto gh = pragmatavr::g_current_gui_hash;
+                const bool is_bar = gh == "ui3200Gui"_fnv || gh == "ui3210Gui"_fnv;
+                const bool is_damage = gh == "ui3201Gui"_fnv && tune->shift_damage;
+                if (is_bar || is_damage) {
+                    const int f = is_damage ? pragmatavr::DamageX : pragmatavr::EnemyX;
                     const float w = (float)vr->get_hmd_width();
                     const float h = (float)vr->get_hmd_height();
                     if (w > 0.0f && h > 0.0f) {
                         const float s = (std::min)(w / 1920.0f, h / 1080.0f);
-                        const float nx = tune->enemy_bar[pragmatavr::DamageX] * 2.0f * s / w;
-                        const float ny = -tune->enemy_bar[pragmatavr::DamageY] * 2.0f * s / h;
+                        const float nx = tune->enemy_bar[f] * 2.0f * s / w;
+                        const float ny = -tune->enemy_bar[f + 1] * 2.0f * s / h;
                         pragmatavr::adjust_projection(*result, 1.0f, nx, ny);
-                        static bool logged = false;
-                        if (!logged) {
-                            logged = true;
-                            spdlog::info("[PragmataVR] Damage numbers: projection shifted by NDC ({:.4f}, {:.4f})", nx, ny);
+                        static std::atomic<int> logged_mask{0};
+                        const int bit = is_damage ? 1 : 2;
+                        if ((logged_mask.fetch_or(bit) & bit) == 0) {
+                            spdlog::info("[PragmataVR] {}: projection shifted by NDC ({:.4f}, {:.4f})", is_damage ? "Damage numbers" : "Enemy bars", nx, ny);
                         }
                     }
                 }
@@ -3671,7 +3676,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 44");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 45");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3764,7 +3769,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 44"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 44");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 45"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 45");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4699,42 +4704,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
 
-        // Build 40: enemy health bars (ui3200Gui, boss ui3210Gui) with the headset projection land left of and above the
-        // enemy; shift their pieces by enemy_bar (canvas pixels, y positive = down). Restored after the draw.
-        // Build 44: damage numbers (ui3201Gui) are no longer moved here: writing to their pieces crashed the game (Builds
-        // 41 to 43, the game spawns and removes them all the time). They are shifted in the GUI camera projection instead.
-        if (name_hash == "ui3200Gui"_fnv || name_hash == "ui3210Gui"_fnv) {
-            const auto et = pragmatavr::HudTuning::get().tune();
-            const int eb = name_hash == "ui3201Gui"_fnv ? pragmatavr::DamageX : pragmatavr::EnemyX; // Build 41: damage numbers
-            const float ex = et->enemy_bar[eb];
-            const float ey = et->enemy_bar[eb + 1];
-            if (et->enabled && et->flat_test && et->world_headset && (ex != 0.0f || ey != 0.0f)) {
-                auto ev = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
-                if (ev != nullptr) {
-                    PragmataPanelRestore restore{};
-                    restore.view = ev;
-                    restore.position = sdk::call_object_func_easy<Vector4f>(ev, "get_Position");
-                    auto c = sdk::call_object_func<REManagedObject*>(ev, "get_Child", context, ev);
-                    for (int n = 0; c != nullptr && n < 64; ++n) {
-                        PragmataChildRestore cr{};
-                        cr.obj = c;
-                        cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
-                        cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
-                        cr.restore_position = true;
-                        Vector3f p{cr.position.x + ex, cr.position.y + ey, cr.position.z};
-                        sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
-                        restore.children.push_back(cr);
-                        c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
-                    }
-                    g_pragmata_panel_restore.push_back(std::move(restore));
-                    static std::atomic<int> logged_mask{0};
-                    const int bit = name_hash == "ui3201Gui"_fnv ? 1 : (name_hash == "ui3210Gui"_fnv ? 2 : 4);
-                    if ((logged_mask.fetch_or(bit) & bit) == 0) {
-                        spdlog::info("[PragmataVR] Enemy marker {}: shifted x {:.0f} y {:.0f}", name, ex, ey);
-                    }
-                }
-            }
-        }
+        // Build 40-44 shifted enemy health bars and damage numbers by writing their pieces' positions here. The game
+        // spawns and removes those pieces constantly and the writes crashed it (Builds 41-44, Quest 3). Build 45: they
+        // are shifted in the GUI camera projection hook instead (no game object is touched).
 
         // PragmataVR Build 17: HUD panel mode. Health, stamina, weapon wheel and tutorial (their 3D panels and their
         // Screen-mode companions) are drawn flat in Screen mode, exactly as on a monitor, into the engine's UI buffer.
