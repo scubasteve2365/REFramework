@@ -224,6 +224,9 @@ struct HudTune {
     // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
     bool hide_hack_backdrop{true};
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
+    // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
+    // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).
+    bool shift_damage{false};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
@@ -535,6 +538,7 @@ enum MenuAction : int {
     ActionResetEnemy,           // Build 40
     ActionToggleHackBackdrop,   // Build 41
     ActionToggleEnemyLock,      // Build 42
+    ActionToggleShiftDamage,    // Build 43
 };
 
 class HudTuning {
@@ -958,6 +962,8 @@ private:
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleShiftDamage, "Damage numbers shift",
+            "A = test: move the damage numbers with their HUD tab values (off while a crash is checked)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
             "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
@@ -1096,6 +1102,8 @@ private:
         s += "# enemy_bar.x / .y (Build 40): enemy health bar shift in canvas pixels (y positive = down), headset projection only.\n";
         s += fmt::format("hide_hack_backdrop={}\n", t.hide_hack_backdrop ? 1 : 0);
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
+        s += "# shift_damage (Build 43): 1 = move the damage numbers by enemy_bar.damage_x / damage_y (off while a crash is tested).\n";
+        s += fmt::format("shift_damage={}\n", t.shift_damage ? 1 : 0);
         for (int i = 0; i < EnemyFieldCount; ++i) {
             s += fmt::format("enemy_bar.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
             s += fmt::format("enemy_bar.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
@@ -1275,6 +1283,7 @@ private:
                 else if (key == "world_hud_projection") t->world_headset = val != 0.0f;
                 else if (key == "fixed_capture_corners") t->fixed_capture_corners = val != 0.0f;
                 else if (key == "hide_hack_backdrop") t->hide_hack_backdrop = val != 0.0f;
+                else if (key == "shift_damage") t->shift_damage = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1737,6 +1746,11 @@ private:
                     t->desktop_mirror = !t->desktop_mirror;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
+                    play_click(true);
+                } else if (row.action == ActionToggleShiftDamage) {
+                    t->shift_damage = !t->shift_damage;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: damage numbers shift {}", t->shift_damage ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleEnemyLock) {
                     t->enemy_locked = !t->enemy_locked;

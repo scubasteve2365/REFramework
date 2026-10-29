@@ -32,7 +32,7 @@ jobs:
           $ok = $false
           foreach ($g in $gens) {
             if (Test-Path build) { Remove-Item -Recurse -Force build }
-            cmake -S . -B build -G "$g" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" *>&1 | Tee-Object -FilePath configure.log
+            cmake -S . -B build -G "$g" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" "-DCMAKE_CXX_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Zi" "-DCMAKE_C_FLAGS_RELEASE=/O2 /Ob2 /DNDEBUG /Zi" "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=/DEBUG /OPT:REF /OPT:ICF" *>&1 | Tee-Object -FilePath configure.log
             if ($LASTEXITCODE -eq 0) { $ok = $true; Write-Output "::notice::Configured with $g"; break }
             Write-Output "::warning::Configure failed with generator $g"
             Get-Content configure.log | Select-String -Pattern 'Error|error|not find|Could not|failed' | Select-Object -First 15 | ForEach-Object { Write-Output "::warning::$($_.Line)" }
@@ -53,6 +53,14 @@ jobs:
           name: PRAGMATA-dinput8
           path: build/bin/PRAGMATA/dinput8.dll
           if-no-files-found: error
+
+      - name: Upload debug symbols
+        # Build 43: the PDB lets crash dumps (reframework_crash.dmp) be mapped to functions. Artifact only (too big for git).
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: PRAGMATA-dinput8-pdb
+          path: build/bin/PRAGMATA/*.pdb
+          if-no-files-found: warn
 
       - name: Publish dinput8.dll to the pragmatavr-builds branch
         run: |
