@@ -223,6 +223,7 @@ struct HudTune {
     std::array<bool, 4> enemy_bar_invert{};
     // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
     bool hide_hack_backdrop{true};
+    bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
@@ -440,6 +441,7 @@ enum MenuSection : int {
     SectionDeveloper = 1,
     SectionElement0 = 2, // + Group
     SectionPerformance = 7, // Build 35 (after the five element sections, bits 2 to 6)
+    SectionEnemy = 8,       // Build 42: ENEMY BARS AND DAMAGE
 };
 
 inline bool section_collapsed(uint32_t collapsed, int section) {
@@ -532,6 +534,7 @@ enum MenuAction : int {
     ActionRecenterView,         // Build 40
     ActionResetEnemy,           // Build 40
     ActionToggleHackBackdrop,   // Build 41
+    ActionToggleEnemyLock,      // Build 42
 };
 
 class HudTuning {
@@ -915,9 +918,8 @@ private:
             "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
             "A = Fixed (the HUD stays put in one place in front of you) or Follows Head (the HUD moves with your headset)");
-        add_row(MenuRow::Kind::Action, -1, -1, ActionRecenterView, "Recenter view",
-            "A = reset forward and position to where you are now (like recentering in SteamVR or the Quest), HUD and menu too");
-        add_row(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
+        add_row(MenuRow::Kind::Action, -1, -1, ActionRecenterView, "Recenter",
+            "A = recenter everything where you are now: the game view (like SteamVR or Quest recenter), the HUD and this menu");
         column = 1;
         add_header("FIXED HUD", "FIXED MODE");
         add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenDistance, ActionNone, "HUD distance",
@@ -931,7 +933,8 @@ private:
         column = 0;
         add_element(GroupHealth);
         add_element(GroupStamina);
-        add_header("ENEMY BARS AND DAMAGE", "HEADSET PROJECTION");
+        add_section(SectionEnemy, "ENEMY BARS AND DAMAGE");
+        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock these values (locked = they cannot change)");
         add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Health bar left / right", "A = edit. Moves enemy health bars to sit over the enemy");
         add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Health bar up / down", "A = edit. Moves enemy health bars to sit over the enemy");
         add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageX, ActionNone, "Damage left / right", "A = edit. Moves the damage numbers to sit over the enemy");
@@ -1092,6 +1095,7 @@ private:
         s += fmt::format("fixed_capture_corners={}\n", t.fixed_capture_corners ? 1 : 0);
         s += "# enemy_bar.x / .y (Build 40): enemy health bar shift in canvas pixels (y positive = down), headset projection only.\n";
         s += fmt::format("hide_hack_backdrop={}\n", t.hide_hack_backdrop ? 1 : 0);
+        s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
         for (int i = 0; i < EnemyFieldCount; ++i) {
             s += fmt::format("enemy_bar.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
             s += fmt::format("enemy_bar.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
@@ -1294,6 +1298,10 @@ private:
                 continue;
             }
 
+            if (group_key == "enemy_bar" && rest == "locked" && !is_invert) {
+                t->enemy_locked = val != 0.0f;
+                continue;
+            }
             if (group_key == "enemy_bar") {
                 for (int i = 0; i < EnemyFieldCount; ++i) {
                     if (rest == ENEMY_KEYS[i]) {
@@ -1635,7 +1643,7 @@ private:
         }
 
         if (vk == VK_RETURN && row.kind == MenuRow::Kind::Value && !menu_on_invert.load()) {
-            if (row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) {
+            if ((row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) || (row.group == GROUP_ENEMY && t->enemy_locked)) {
                 play_click(false);
                 return;
             }
@@ -1668,6 +1676,10 @@ private:
                     return;
                 }
                 if (row.group == GROUP_ENEMY) {
+                    if (t->enemy_locked) {
+                        play_click(false);
+                        return;
+                    }
                     auto& einv = t->enemy_bar_invert[row.field];
                     einv = !einv;
                     commit(t);
@@ -1725,6 +1737,11 @@ private:
                     t->desktop_mirror = !t->desktop_mirror;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
+                    play_click(true);
+                } else if (row.action == ActionToggleEnemyLock) {
+                    t->enemy_locked = !t->enemy_locked;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: enemy bars and damage {}", t->enemy_locked ? "locked" : "unlocked");
                     play_click(true);
                 } else if (row.action == ActionToggleHackBackdrop) {
                     t->hide_hack_backdrop = !t->hide_hack_backdrop;
@@ -1827,6 +1844,10 @@ private:
                     spdlog::info("[PragmataVR] Menu: reset HUD screen");
                     play_click(true);
                 } else if (row.action == ActionResetEnemy) {
+                    if (t->enemy_locked) {
+                        play_click(false);
+                        return;
+                    }
                     t->enemy_bar = HudTune{}.enemy_bar;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset enemy health bar");
@@ -1834,6 +1855,7 @@ private:
                 } else if (row.action == ActionRecenterView) {
                     view_recenter_requested = true;
                     recenter_requested = true;
+                    menu_place_requested = true; // Build 42: one Recenter for the view, the HUD and the menu
                     spdlog::info("[PragmataVR] Menu: recenter view");
                     play_click(true);
                 } else if (row.action == ActionResetGroup) {
@@ -1907,6 +1929,10 @@ private:
         }
 
         if (row.group == GROUP_ENEMY) {
+            if (t->enemy_locked) {
+                play_click(false);
+                return;
+            }
             int edir = vk == VK_RIGHT ? 1 : -1;
             if (t->enemy_bar_invert[row.field]) {
                 edir = -edir;
