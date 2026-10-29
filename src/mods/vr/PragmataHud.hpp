@@ -952,6 +952,8 @@ private:
         return n;
     }
 
+public:
+    // Build 38: called by the OpenXR runtime once the headset is known.
     void set_headset_profile(const std::string& key) {
         {
             std::scoped_lock _{profile_mtx()};
@@ -978,6 +980,8 @@ private:
             m_last_check = {};
         }
     }
+
+private:
 
     static std::string trim(const std::string& s) {
         const auto b = s.find_first_not_of(" \t\r\n");
