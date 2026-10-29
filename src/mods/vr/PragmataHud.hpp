@@ -187,7 +187,7 @@ struct HudTune {
     // image, so the UI reaches only the UI buffer (and the HUD panel). Off = the engine's normal drawing.
     bool glued_hud_removed{true}; // Build 20: the element areas are cleared from the UI buffer after the HUD panel copy
     // Build 21: HUD mode (HudMode). flat_test and hud_panel are derived from it (apply_hud_mode), never stored.
-    int hud_mode{HudModeFlat};
+    int hud_mode{HudModeAnchored}; // Build 39: Fixed (room-fixed) by default, Steve's standing preference
     bool flat_test{true}; // FLAT mode: the game's own flat projection, companions left flat, flat_groups tuning
     int companion_mode{0}; // Build 15: companion layers. 0 = with element (CompanionWithElement), 1 = REFramework, 2 = hidden
 
@@ -195,7 +195,7 @@ struct HudTune {
     // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
     // always uses 0 (the ini value is ignored; the game-screen code is kept for reference).
     int layout_mode{0};
-    std::array<float, 4> screen{70.0f, 1.5f, 0.0f, -8.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg)
+    std::array<float, 4> screen{106.0f, 2.5f, 0.0f, 0.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg). Build 39: Quest 3 tuning
     std::array<bool, 4> screen_invert{};
 
     // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
@@ -212,11 +212,15 @@ struct HudTune {
     // Build 38: the hacking circle's values for the headset projection (around FLAT_PIVOTS like FLAT). Neutral start:
     // with the right projection the game's own placement should already line up; no eye gap is needed.
     GroupTune hack_headset{};
+    // Build 39: Fixed mode draws the four panel elements in the corners of the UI buffer (outside the lens view of
+    // both eyes) and cuts them out there, so nothing the game draws in the world (reticle, enemy health bars, hacking
+    // circle) can be caught in their areas. false = cut them out at their own place in the game layout (Build 38).
+    bool fixed_capture_corners{true};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
     // click volume (0..1 of full scale)
-    std::array<float, 4> menu{2.5f, 1.0f, -5.0f, 0.5f};
+    std::array<float, 4> menu{2.5f, 1.3f, -5.0f, 0.10f}; // Build 39: Steve's values as the default for new installs
     std::array<bool, 4> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
     // Build 21: FLAT mode values, kept apart from the 3D values (the hacking circle lock applies to 3D only).
@@ -253,15 +257,17 @@ struct HudTune {
             flat_groups[g].x = x;
             flat_groups[g].y = y;
         };
-        // Build 22: Steve's Build 21 tuning (moved to the fixed centers, y positive = down).
-        set_flat(GroupHack, 0.385f, -420.0f, 80.0f);
-        set_flat(GroupHealth, 0.60f, 570.0f, -200.0f);
-        set_flat(GroupStamina, 1.0f, 0.0f, -100.0f);
-        set_flat(GroupWeapons, 0.82f, -250.0f, 60.0f);
-        set_flat(GroupTutorial, 0.73f, 390.0f, 160.0f);
-        for (auto& f : flat_groups) {
-            f.gap = 50.0f;
-        }
+        // Build 39: Steve's Quest 3 (Virtual Desktop) tuning is the default for new installs, the most common headset.
+        set_flat(GroupHack, 0.4005f, -400.0f, 100.0f);
+        set_flat(GroupHealth, 0.7592f, 450.0f, -100.0f);
+        set_flat(GroupStamina, 0.999f, 0.0f, -100.0f);
+        set_flat(GroupWeapons, 0.7896f, -100.0f, 200.0f);
+        set_flat(GroupTutorial, 0.7299f, 360.0f, 70.0f);
+        flat_groups[GroupHack].gap = 80.0f;
+        flat_groups[GroupHealth].gap = 240.0f;
+        flat_groups[GroupStamina].gap = 240.0f;
+        flat_groups[GroupWeapons].gap = 200.0f;
+        flat_groups[GroupTutorial].gap = 250.0f;
         apply_hud_mode();
     }
 };
@@ -499,6 +505,7 @@ enum MenuAction : int {
     ActionToggleDesktopMirror, // Build 35
     ActionTogglePerfLog,       // Build 35
     ActionToggleWorldProj,     // Build 38
+    ActionToggleCaptureCorners, // Build 39
 };
 
 class HudTuning {
@@ -913,6 +920,8 @@ private:
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
+            "A = Corners (elements cut out where nothing visible is drawn) or Home (at their place in the game layout)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
             "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
         add_row(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
@@ -1041,6 +1050,9 @@ private:
         s += "# world_hud_projection (Build 38): 1 = hacking circle, reticle and enemy markers use the headset's own projection\n";
         s += "#   (right place and shape on any headset; hack.headset_* values), 0 = the game's flat projection (hack.flat_*).\n";
         s += fmt::format("world_hud_projection={}\n", t.world_headset ? 1 : 0);
+        s += "# fixed_capture_corners (Build 39): 1 = Fixed mode cuts the panel elements out in the corners of the eye images\n";
+        s += "#   (outside the lens view), 0 = at their own place in the game layout.\n";
+        s += fmt::format("fixed_capture_corners={}\n", t.fixed_capture_corners ? 1 : 0);
         s += fmt::format("hack.headset_size={:.4f}\n", t.hack_headset.size);
         s += fmt::format("hack.headset_x={:.2f}\n", t.hack_headset.x);
         s += fmt::format("hack.headset_y={:.2f}\n", t.hack_headset.y);
@@ -1214,6 +1226,7 @@ private:
                 else if (key == "desktop_mirror") t->desktop_mirror = val != 0.0f;
                 else if (key == "perf_log") t->perf_log = val != 0.0f;
                 else if (key == "world_hud_projection") t->world_headset = val != 0.0f;
+                else if (key == "fixed_capture_corners") t->fixed_capture_corners = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1651,6 +1664,11 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
                     play_click(true);
+                } else if (row.action == ActionToggleCaptureCorners) {
+                    t->fixed_capture_corners = !t->fixed_capture_corners;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: Fixed HUD capture {}", t->fixed_capture_corners ? "CORNERS" : "HOME");
+                    play_click(true);
                 } else if (row.action == ActionToggleWorldProj) {
                     t->world_headset = !t->world_headset;
                     commit(t);
@@ -2015,6 +2033,34 @@ struct AnchoredBox {
 // so menus and windows that hide the HUD are not cut.
 inline std::array<std::atomic<int>, GroupCount> g_group_drawn_frame{};
 
+// Build 39: where Fixed mode draws an element in the UI buffer, as a shift in canvas pixels from its own place (after
+// its size). With fixed_capture_corners each element goes to a corner of the buffer: tutorial top left, weapon wheel top
+// right, health bottom left, stamina bottom right. The corners of each eye's image are outside the lens view on any
+// headset, so world HUD (reticle, enemy bars, hacking circle) drawn there is never visible anyway, and anything cut
+// together with an element is invisible. The panel puts each element back at its tuned place (AnchoredBox ox / oy).
+inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) {
+    if (!t.fixed_capture_corners || g <= GroupHack || g >= GroupCount || w <= 0.0f || h <= 0.0f) {
+        return glm::vec2{0.0f};
+    }
+    const float s = (std::min)(w / 1920.0f, h / 1080.0f);
+    const float ox = (w - 1920.0f * s) * 0.5f;
+    const float oy = (h - 1080.0f * s) * 0.5f;
+    const auto& b = FLAT_BOXES[g];
+    const auto& gt = t.flat_groups[g];
+    const float px = FLAT_PIVOTS[g][0];
+    const float py = FLAT_PIVOTS[g][1];
+    const float cx0 = (std::min)(px + gt.size * (b[0] - px), px + gt.size * (b[2] - px));
+    const float cx1 = (std::max)(px + gt.size * (b[0] - px), px + gt.size * (b[2] - px));
+    const float cy0 = (std::min)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
+    const float cy1 = (std::max)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
+    constexpr float M = 4.0f; // buffer pixels from the edge
+    const bool right = g == GroupWeapons || g == GroupStamina;
+    const bool bottom = g == GroupHealth || g == GroupStamina;
+    const float tx = right ? ((w - M) - (ox + s * cx1)) / s : (M - (ox + s * cx0)) / s;
+    const float ty = bottom ? ((h - M) - (oy + s * cy1)) / s : (M - (oy + s * cy0)) / s;
+    return glm::vec2{tx, ty};
+}
+
 inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h, int frame = -1) {
     std::vector<AnchoredBox> out{};
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
@@ -2034,14 +2080,15 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
         // Build 38: in Fixed mode the element is drawn at its own place in the game layout (only its size changes), so
         // its area sits at the screen edge where the game put it, away from the reticle and the hacking circle in the
         // middle of the view. Left / right and Up / down move it on the panel instead (ox / oy), same final layout.
-        const float cx0 = px + gt.size * (b[0] - px);
-        const float cy0 = py + gt.size * (b[1] - py);
-        const float cx1 = px + gt.size * (b[2] - px);
-        const float cy1 = py + gt.size * (b[3] - py);
+        const auto sh = fixed_capture_shift(t, g, w, h); // Build 39: corner placement (zero = own place)
+        const float cx0 = px + gt.size * (b[0] - px) + sh.x;
+        const float cy0 = py + gt.size * (b[1] - py) + sh.y;
+        const float cx1 = px + gt.size * (b[2] - px) + sh.x;
+        const float cy1 = py + gt.size * (b[3] - py) + sh.y;
         AnchoredBox a{};
         a.group = g;
-        a.ox = (long)std::lround(s * gt.x);
-        a.oy = (long)std::lround(s * gt.y);
+        a.ox = (long)std::lround(s * (gt.x - sh.x));
+        a.oy = (long)std::lround(s * (gt.y - sh.y));
         a.x0 = (long)std::clamp(ox + s * (std::min)(cx0, cx1), 0.0f, w);
         a.y0 = (long)std::clamp(oy + s * (std::min)(cy0, cy1), 0.0f, h);
         a.x1 = (long)std::clamp(ox + s * (std::max)(cx0, cx1), 0.0f, w);

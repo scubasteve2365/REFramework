@@ -3445,6 +3445,11 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionTogglePerfLog:
             v.value = t.perf_log ? "ON" : "OFF";
             break;
+        case pragmatavr::ActionToggleCaptureCorners:
+            v.value = t.fixed_capture_corners ? "CORNERS" : "HOME";
+            v.value_color = t.fixed_capture_corners ? ACCENT : AMBER;
+            v.dim = !t.hud_panel; // Fixed mode only
+            break;
         case pragmatavr::ActionToggleWorldProj:
             v.value = t.world_headset ? "HEADSET" : "FLAT";
             v.value_color = t.world_headset ? ACCENT : AMBER;
@@ -3633,7 +3638,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 38");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 39");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3726,7 +3731,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 38"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 38");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 39"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 39");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4718,8 +4723,11 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                     const float eye_shift = anchored ? 0.0f : (is_left_eye() ? gt.gap : -gt.gap);
                     // Build 38: Fixed mode draws the element at its own place (size only); the panel applies Left / right and
                     // Up / down (AnchoredBox ox / oy), so the cut-out area stays at the screen edge.
-                    const float dx = anchored ? 0.0f : gt.x + eye_shift;
-                    const float dy = anchored ? 0.0f : gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
+                    // Build 39: with Fixed HUD capture = CORNERS the element is drawn in a corner of the eye image instead.
+                    const auto cshift = anchored ? pragmatavr::fixed_capture_shift(*ftune, fgroup, (float)get_hmd_width(), (float)get_hmd_height())
+                                                 : glm::vec2{0.0f};
+                    const float dx = anchored ? cshift.x : gt.x + eye_shift;
+                    const float dy = anchored ? cshift.y : gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
                     const float k = gt.size;
                     const bool hide_blur = ftune->hide_blur;
                     // Build 24: the 3D panel (not the hacking circle) drawn as a Screen view, like its companion.
