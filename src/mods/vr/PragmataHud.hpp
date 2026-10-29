@@ -91,7 +91,8 @@ inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCL
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
-inline constexpr int INI_VERSION = 14;
+inline constexpr int INI_VERSION = 15;
+inline constexpr int INI_VERSION_CLICK_SCALE = 15; // Build 40: click volume x5 (100% = the old 20%)
 // Build 22: FLAT Up / down became positive = down. Files written as v13 have their flat_y values negated on load.
 inline constexpr int INI_VERSION_FLAT_Y_DOWN = 14;
 // hud_mode (Build 21) replaces the flat_test and hud_panel lines; those are ignored from any file.
@@ -216,11 +217,14 @@ struct HudTune {
     // both eyes) and cuts them out there, so nothing the game draws in the world (reticle, enemy health bars, hacking
     // circle) can be caught in their areas. false = cut them out at their own place in the game layout (Build 38).
     bool fixed_capture_corners{true};
+    // Build 40: enemy health bar shift (GROUP_ENEMY), Quest 3 starting values measured from the Build 39 snapshots.
+    std::array<float, 2> enemy_bar{175.0f, 150.0f};
+    std::array<bool, 2> enemy_bar_invert{};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
     // click volume (0..1 of full scale)
-    std::array<float, 4> menu{2.5f, 1.3f, -5.0f, 0.10f}; // Build 39: Steve's values as the default for new installs
+    std::array<float, 4> menu{2.5f, 1.3f, -5.0f, 0.50f}; // Build 39: Steve's values as the default. Build 40: click 50% (new scale)
     std::array<bool, 4> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
     // Build 21: FLAT mode values, kept apart from the 3D values (the hacking circle lock applies to 3D only).
@@ -392,7 +396,8 @@ inline const std::vector<uint8_t>& click_wav(bool ok, int volume_pct) {
 }
 
 inline void play_click(bool ok) {
-    const int vol = std::clamp(g_click_volume_pct.load(), 0, 100);
+    // Build 40: the old 20% level is now 100% (Steve: far too loud). Old settings are rescaled on load (INI_VERSION 15).
+    const int vol = std::clamp((int)std::lround(g_click_volume_pct.load() * 0.2f), 0, 100);
     if (vol == 0) {
         return;
     }
@@ -457,6 +462,18 @@ inline constexpr std::array<float, 4> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f};
 inline constexpr std::array<float, 4> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f};
 inline constexpr std::array<float, 4> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f};
 
+// Build 40: enemy health bars (ui3200Gui, boss ui3210Gui). With the headset projection they land a fixed amount left of
+// and above the enemy (Quest 3 test); these move them back, in canvas pixels (y positive = down). Headset projection only.
+inline constexpr int GROUP_ENEMY = 102;
+enum EnemyField : int {
+    EnemyX = 0,
+    EnemyY = 1,
+};
+inline constexpr std::array<const char*, 2> ENEMY_KEYS{"x", "y"};
+inline constexpr float ENEMY_MAX = 1500.0f;
+inline constexpr float ENEMY_STEP = 5.0f;
+inline constexpr float ENEMY_STEP_BIG = 50.0f;
+
 inline constexpr int GROUP_MENU = 101;
 enum MenuField : int {
     MenuDistance = 0,
@@ -506,6 +523,8 @@ enum MenuAction : int {
     ActionTogglePerfLog,       // Build 35
     ActionToggleWorldProj,     // Build 38
     ActionToggleCaptureCorners, // Build 39
+    ActionRecenterView,         // Build 40
+    ActionResetEnemy,           // Build 40
 };
 
 class HudTuning {
@@ -653,6 +672,7 @@ public:
     // The game-screen HUD and the mod menu are real planes in tracking space (anchor pose + offsets), seen from each
     // eye's actual pose, so they stay put when the head turns, tilts or moves.
     std::atomic<bool> recenter_requested{false};
+    std::atomic<bool> view_recenter_requested{false}; // Build 40: VR::on_present recenters the view (rotation and standing origin)
     std::atomic<int> companion_generation{0}; // bumped when the companion mode changes (re-logs their setup)
     std::atomic<bool> recenter_if_far{false};
     std::atomic<bool> menu_place_requested{false};
@@ -888,6 +908,8 @@ private:
             "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
             "A = Fixed (the HUD stays put in one place in front of you) or Follows Head (the HUD moves with your headset)");
+        add_row(MenuRow::Kind::Action, -1, -1, ActionRecenterView, "Recenter view",
+            "A = reset forward and position to where you are now (like recentering in SteamVR or the Quest), HUD and menu too");
         add_row(MenuRow::Kind::Action, -1, -1, ActionRecenter, "Recenter HUD and menu", "A = move the HUD and this menu in front of where you are looking");
         column = 1;
         add_header("FIXED HUD", "FIXED MODE");
@@ -902,6 +924,10 @@ private:
         column = 0;
         add_element(GroupHealth);
         add_element(GroupStamina);
+        add_header("ENEMY HEALTH BAR", "HEADSET PROJECTION");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Left / right", "A = edit. Moves enemy health bars to sit over the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Up / down", "A = edit. Moves enemy health bars to sit over the enemy");
+        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to the starting values (Quest 3)");
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
@@ -1053,6 +1079,11 @@ private:
         s += "# fixed_capture_corners (Build 39): 1 = Fixed mode cuts the panel elements out in the corners of the eye images\n";
         s += "#   (outside the lens view), 0 = at their own place in the game layout.\n";
         s += fmt::format("fixed_capture_corners={}\n", t.fixed_capture_corners ? 1 : 0);
+        s += "# enemy_bar.x / .y (Build 40): enemy health bar shift in canvas pixels (y positive = down), headset projection only.\n";
+        for (int i = 0; i < 2; ++i) {
+            s += fmt::format("enemy_bar.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
+            s += fmt::format("enemy_bar.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
+        }
         s += fmt::format("hack.headset_size={:.4f}\n", t.hack_headset.size);
         s += fmt::format("hack.headset_x={:.2f}\n", t.hack_headset.x);
         s += fmt::format("hack.headset_y={:.2f}\n", t.hack_headset.y);
@@ -1243,7 +1274,18 @@ private:
                 for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
                     if (rest == MENU_KEYS[i]) {
                         if (is_invert) t->menu_invert[i] = val != 0.0f;
+                        else if (i == MenuClickVolume && file_version < INI_VERSION_CLICK_SCALE) t->menu[i] = std::clamp(val * 5.0f, MENU_MIN[i], MENU_MAX[i]);
                         else t->menu[i] = std::clamp(val, MENU_MIN[i], MENU_MAX[i]);
+                    }
+                }
+                continue;
+            }
+
+            if (group_key == "enemy_bar") {
+                for (int i = 0; i < 2; ++i) {
+                    if (rest == ENEMY_KEYS[i]) {
+                        if (is_invert) t->enemy_bar_invert[i] = val != 0.0f;
+                        else t->enemy_bar[i] = std::clamp(val, -ENEMY_MAX, ENEMY_MAX);
                     }
                 }
                 continue;
@@ -1612,6 +1654,13 @@ private:
                     play_click(true);
                     return;
                 }
+                if (row.group == GROUP_ENEMY) {
+                    auto& einv = t->enemy_bar_invert[row.field];
+                    einv = !einv;
+                    commit(t);
+                    play_click(true);
+                    return;
+                }
                 if (row.group == GROUP_SCREEN) {
                     auto& inv = t->screen_invert[row.field];
                     inv = !inv;
@@ -1759,6 +1808,16 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset HUD screen");
                     play_click(true);
+                } else if (row.action == ActionResetEnemy) {
+                    t->enemy_bar = HudTune{}.enemy_bar;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: reset enemy health bar");
+                    play_click(true);
+                } else if (row.action == ActionRecenterView) {
+                    view_recenter_requested = true;
+                    recenter_requested = true;
+                    spdlog::info("[PragmataVR] Menu: recenter view");
+                    play_click(true);
                 } else if (row.action == ActionResetGroup) {
                     if (group_locked(*t, row.group)) {
                         play_click(false);
@@ -1826,6 +1885,23 @@ private:
                 commit(t);
             }
             play_click(mok);
+            return;
+        }
+
+        if (row.group == GROUP_ENEMY) {
+            int edir = vk == VK_RIGHT ? 1 : -1;
+            if (t->enemy_bar_invert[row.field]) {
+                edir = -edir;
+            }
+            auto& v = t->enemy_bar[row.field];
+            const float nv = std::clamp(v + edir * (shift ? ENEMY_STEP_BIG : ENEMY_STEP), -ENEMY_MAX, ENEMY_MAX);
+            const bool eok = nv != v;
+            v = nv;
+            if (eok) {
+                commit(t);
+            }
+            spdlog::info("[PragmataVR] Menu: enemy health bar x={:.0f} y={:.0f}", t->enemy_bar[0], t->enemy_bar[1]);
+            play_click(eok);
             return;
         }
 

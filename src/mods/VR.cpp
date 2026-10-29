@@ -3365,6 +3365,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
             v.dim = !t.hud_panel && (t.flat_test || !t.hud_fixed); // ANCHORED panel, or the room-fixed 3D HUD
+        } else if (row.group == pragmatavr::GROUP_ENEMY) {
+            v.value = fmt::format("{:+.0f}", t.enemy_bar[row.field]);
+            v.invert_on = t.enemy_bar_invert[row.field];
+            v.dim = !(t.flat_test && t.world_headset); // Build 40: headset projection only
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
@@ -3638,7 +3642,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 39");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 40");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3731,7 +3735,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 39"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 39");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 40"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 40");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -3961,6 +3965,13 @@ void VR::on_present() {
     pragmata_report_xinput_use();
     pragmatavr::HudTuning::get().poll_keys();
     pragmatavr::HudTuning::get().poll_pad();
+    // Build 40: Recenter view (mod menu, GENERAL tab): forward and position reset to where the player is now, the same
+    // as REFramework's own recenter and standing origin keys, so Quest players do not need a controller to recenter.
+    if (pragmatavr::HudTuning::get().view_recenter_requested.exchange(false) && is_hmd_active()) {
+        recenter_view();
+        set_standing_origin(get_position(0));
+        spdlog::info("[PragmataVR] View recentered");
+    }
     if (is_hmd_active()) {
         const auto hmd_pos = get_position(0);
         pragmatavr::HudTuning::get().update_head(get_rotation(0), glm::vec3{hmd_pos.x, hmd_pos.y, hmd_pos.z});
@@ -4658,6 +4669,38 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 #if defined(PRAGMATA)
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
+
+        // Build 40: enemy health bars (ui3200Gui, boss ui3210Gui) with the headset projection land left of and above the
+        // enemy; shift their pieces by enemy_bar (canvas pixels, y positive = down). Restored after the draw.
+        if (name_hash == "ui3200Gui"_fnv || name_hash == "ui3210Gui"_fnv) {
+            const auto et = pragmatavr::HudTuning::get().tune();
+            if (et->enabled && et->flat_test && et->world_headset && (et->enemy_bar[0] != 0.0f || et->enemy_bar[1] != 0.0f)) {
+                auto ev = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
+                if (ev != nullptr) {
+                    PragmataPanelRestore restore{};
+                    restore.view = ev;
+                    restore.position = sdk::call_object_func_easy<Vector4f>(ev, "get_Position");
+                    auto c = sdk::call_object_func<REManagedObject*>(ev, "get_Child", context, ev);
+                    for (int n = 0; c != nullptr && n < 64; ++n) {
+                        PragmataChildRestore cr{};
+                        cr.obj = c;
+                        cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+                        cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+                        cr.restore_position = true;
+                        Vector3f p{cr.position.x + et->enemy_bar[0], cr.position.y + et->enemy_bar[1], cr.position.z};
+                        sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
+                        restore.children.push_back(cr);
+                        c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
+                    }
+                    g_pragmata_panel_restore.push_back(std::move(restore));
+                    static bool logged = false;
+                    if (!logged) {
+                        logged = true;
+                        spdlog::info("[PragmataVR] Enemy health bar {}: shifted x {:.0f} y {:.0f}", name, et->enemy_bar[0], et->enemy_bar[1]);
+                    }
+                }
+            }
+        }
 
         // PragmataVR Build 17: HUD panel mode. Health, stamina, weapon wheel and tutorial (their 3D panels and their
         // Screen-mode companions) are drawn flat in Screen mode, exactly as on a monitor, into the engine's UI buffer.
