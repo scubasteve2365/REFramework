@@ -3449,6 +3449,9 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionTogglePerfLog:
             v.value = t.perf_log ? "ON" : "OFF";
             break;
+        case pragmatavr::ActionToggleHackBackdrop:
+            v.value = t.hide_hack_backdrop ? "HIDDEN" : "SHOWN";
+            break;
         case pragmatavr::ActionToggleCaptureCorners:
             v.value = t.fixed_capture_corners ? "CORNERS" : "HOME";
             v.value_color = t.fixed_capture_corners ? ACCENT : AMBER;
@@ -3642,7 +3645,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 40");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 41");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3735,7 +3738,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 40"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 40");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 41"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 41");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4672,9 +4675,12 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
 
         // Build 40: enemy health bars (ui3200Gui, boss ui3210Gui) with the headset projection land left of and above the
         // enemy; shift their pieces by enemy_bar (canvas pixels, y positive = down). Restored after the draw.
-        if (name_hash == "ui3200Gui"_fnv || name_hash == "ui3210Gui"_fnv) {
+        if (name_hash == "ui3200Gui"_fnv || name_hash == "ui3210Gui"_fnv || name_hash == "ui3201Gui"_fnv) {
             const auto et = pragmatavr::HudTuning::get().tune();
-            if (et->enabled && et->flat_test && et->world_headset && (et->enemy_bar[0] != 0.0f || et->enemy_bar[1] != 0.0f)) {
+            const int eb = name_hash == "ui3201Gui"_fnv ? pragmatavr::DamageX : pragmatavr::EnemyX; // Build 41: damage numbers
+            const float ex = et->enemy_bar[eb];
+            const float ey = et->enemy_bar[eb + 1];
+            if (et->enabled && et->flat_test && et->world_headset && (ex != 0.0f || ey != 0.0f)) {
                 auto ev = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
                 if (ev != nullptr) {
                     PragmataPanelRestore restore{};
@@ -4687,16 +4693,16 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
                         cr.scale = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
                         cr.restore_position = true;
-                        Vector3f p{cr.position.x + et->enemy_bar[0], cr.position.y + et->enemy_bar[1], cr.position.z};
+                        Vector3f p{cr.position.x + ex, cr.position.y + ey, cr.position.z};
                         sdk::call_object_func<void*>(c, "set_Position", context, c, &p);
                         restore.children.push_back(cr);
                         c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
                     }
                     g_pragmata_panel_restore.push_back(std::move(restore));
-                    static bool logged = false;
-                    if (!logged) {
-                        logged = true;
-                        spdlog::info("[PragmataVR] Enemy health bar {}: shifted x {:.0f} y {:.0f}", name, et->enemy_bar[0], et->enemy_bar[1]);
+                    static std::atomic<int> logged_mask{0};
+                    const int bit = name_hash == "ui3201Gui"_fnv ? 1 : (name_hash == "ui3210Gui"_fnv ? 2 : 4);
+                    if ((logged_mask.fetch_or(bit) & bit) == 0) {
+                        spdlog::info("[PragmataVR] Enemy marker {}: shifted x {:.0f} y {:.0f}", name, ex, ey);
                     }
                 }
             }

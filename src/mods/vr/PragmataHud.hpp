@@ -217,9 +217,12 @@ struct HudTune {
     // both eyes) and cuts them out there, so nothing the game draws in the world (reticle, enemy health bars, hacking
     // circle) can be caught in their areas. false = cut them out at their own place in the game layout (Build 38).
     bool fixed_capture_corners{true};
-    // Build 40: enemy health bar shift (GROUP_ENEMY), Quest 3 starting values measured from the Build 39 snapshots.
-    std::array<float, 2> enemy_bar{175.0f, 150.0f};
-    std::array<bool, 2> enemy_bar_invert{};
+    // Build 40: enemy health bar shift (GROUP_ENEMY). Build 41: Steve's Quest 3 values (x 200, y 170), and the damage
+    // numbers (ui3201Gui) get their own pair, starting at the same values.
+    std::array<float, 4> enemy_bar{200.0f, 170.0f, 200.0f, 170.0f};
+    std::array<bool, 4> enemy_bar_invert{};
+    // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
+    bool hide_hack_backdrop{true};
 
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
@@ -468,8 +471,11 @@ inline constexpr int GROUP_ENEMY = 102;
 enum EnemyField : int {
     EnemyX = 0,
     EnemyY = 1,
+    DamageX = 2, // Build 41: damage numbers (ui3201Gui)
+    DamageY = 3,
+    EnemyFieldCount = 4,
 };
-inline constexpr std::array<const char*, 2> ENEMY_KEYS{"x", "y"};
+inline constexpr std::array<const char*, 4> ENEMY_KEYS{"x", "y", "damage_x", "damage_y"};
 inline constexpr float ENEMY_MAX = 1500.0f;
 inline constexpr float ENEMY_STEP = 5.0f;
 inline constexpr float ENEMY_STEP_BIG = 50.0f;
@@ -525,6 +531,7 @@ enum MenuAction : int {
     ActionToggleCaptureCorners, // Build 39
     ActionRecenterView,         // Build 40
     ActionResetEnemy,           // Build 40
+    ActionToggleHackBackdrop,   // Build 41
 };
 
 class HudTuning {
@@ -924,9 +931,11 @@ private:
         column = 0;
         add_element(GroupHealth);
         add_element(GroupStamina);
-        add_header("ENEMY HEALTH BAR", "HEADSET PROJECTION");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Left / right", "A = edit. Moves enemy health bars to sit over the enemy");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Up / down", "A = edit. Moves enemy health bars to sit over the enemy");
+        add_header("ENEMY BARS AND DAMAGE", "HEADSET PROJECTION");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Health bar left / right", "A = edit. Moves enemy health bars to sit over the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Health bar up / down", "A = edit. Moves enemy health bars to sit over the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageX, ActionNone, "Damage left / right", "A = edit. Moves the damage numbers to sit over the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageY, ActionNone, "Damage up / down", "A = edit. Moves the damage numbers to sit over the enemy");
         add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to the starting values (Quest 3)");
         column = 1;
         add_element(GroupHack);
@@ -946,6 +955,8 @@ private:
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
+            "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
             "A = Corners (elements cut out where nothing visible is drawn) or Home (at their place in the game layout)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
@@ -1080,7 +1091,8 @@ private:
         s += "#   (outside the lens view), 0 = at their own place in the game layout.\n";
         s += fmt::format("fixed_capture_corners={}\n", t.fixed_capture_corners ? 1 : 0);
         s += "# enemy_bar.x / .y (Build 40): enemy health bar shift in canvas pixels (y positive = down), headset projection only.\n";
-        for (int i = 0; i < 2; ++i) {
+        s += fmt::format("hide_hack_backdrop={}\n", t.hide_hack_backdrop ? 1 : 0);
+        for (int i = 0; i < EnemyFieldCount; ++i) {
             s += fmt::format("enemy_bar.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
             s += fmt::format("enemy_bar.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
         }
@@ -1258,6 +1270,7 @@ private:
                 else if (key == "perf_log") t->perf_log = val != 0.0f;
                 else if (key == "world_hud_projection") t->world_headset = val != 0.0f;
                 else if (key == "fixed_capture_corners") t->fixed_capture_corners = val != 0.0f;
+                else if (key == "hide_hack_backdrop") t->hide_hack_backdrop = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
                 continue;
@@ -1282,7 +1295,7 @@ private:
             }
 
             if (group_key == "enemy_bar") {
-                for (int i = 0; i < 2; ++i) {
+                for (int i = 0; i < EnemyFieldCount; ++i) {
                     if (rest == ENEMY_KEYS[i]) {
                         if (is_invert) t->enemy_bar_invert[i] = val != 0.0f;
                         else t->enemy_bar[i] = std::clamp(val, -ENEMY_MAX, ENEMY_MAX);
@@ -1713,6 +1726,11 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: desktop mirror {}", t->desktop_mirror ? "on" : "off");
                     play_click(true);
+                } else if (row.action == ActionToggleHackBackdrop) {
+                    t->hide_hack_backdrop = !t->hide_hack_backdrop;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: door hack backdrop {}", t->hide_hack_backdrop ? "hidden" : "shown");
+                    play_click(true);
                 } else if (row.action == ActionToggleCaptureCorners) {
                     t->fixed_capture_corners = !t->fixed_capture_corners;
                     commit(t);
@@ -1900,7 +1918,8 @@ private:
             if (eok) {
                 commit(t);
             }
-            spdlog::info("[PragmataVR] Menu: enemy health bar x={:.0f} y={:.0f}", t->enemy_bar[0], t->enemy_bar[1]);
+            spdlog::info("[PragmataVR] Menu: enemy health bar x={:.0f} y={:.0f}, damage numbers x={:.0f} y={:.0f}", t->enemy_bar[0], t->enemy_bar[1],
+                t->enemy_bar[2], t->enemy_bar[3]);
             play_click(eok);
             return;
         }

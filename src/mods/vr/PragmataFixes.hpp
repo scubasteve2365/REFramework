@@ -26,6 +26,11 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <functional>
+#include <mutex>
 
 #include <spdlog/spdlog.h>
 
@@ -72,6 +77,7 @@ public:
         case "ui3500Gui"_fnv:
         case "ui3510Gui"_fnv:
             hide_effects(gui_element, name, {L"main/layout/VFXtex/effecttexture00", L"main/layout/VFXtex/effecttexture01"});
+            backdrop(gui_element, name, h); // Build 41
             return true;
 
         case "ui2130Gui"_fnv:
@@ -123,11 +129,14 @@ private:
 
     // Per element, restored in on_gui_draw_element. Pre and post of one element run on the same thread.
     static inline thread_local std::unordered_map<REComponent*, Pending> s_pending{};
-    static inline thread_local std::unordered_map<size_t, bool> s_logged{};
+    // Build 41: shared by all threads (GUI draws on several render threads; the per-thread set logged each line many times).
+    static inline std::mutex s_logged_mtx{};
+    static inline std::unordered_map<size_t, bool> s_logged{};
     // Ghost layer per GUI name: whether we hid it (so turning hide_ghost off shows it again).
     static inline thread_local std::unordered_map<size_t, bool> s_ghost_hidden{};
 
     static void log_once(size_t key, const std::string& msg) {
+        std::scoped_lock _{s_logged_mtx};
         if (s_logged.emplace(key, true).second) {
             spdlog::info("[PragmataVR] Fixes: {}", msg);
         }
@@ -215,6 +224,76 @@ private:
                 sdk::call_object_func<void*>(node, "set_Visible", ctx, node, false);
             }
             log_once(key, fmt::format("{}: effect texture {} hidden while drawing", name, utility::narrow(p)));
+        }
+    }
+
+    // Build 41: the door / lock hacking HUD draws a dark gradient backdrop (made for darkening a monitor behind the
+    // panel); in VR it reads as a shadowed plane. Walk the GUI tree, log it once (type, name, visibility) so the exact
+    // piece is known, and hide visible pieces whose name says backdrop (bg, back, shadow, dark, dim, black, fade,
+    // vignette, cover) and that are plain shapes or images. Restored after the draw.
+    static void backdrop(REComponent* element, const std::string& name, size_t h) {
+        auto ctx = sdk::get_thread_context();
+        auto view = sdk::call_object_func<REManagedObject*>((REManagedObject*)element, "get_View", ctx, (REManagedObject*)element);
+        if (view == nullptr) {
+            return;
+        }
+        const bool hide = pragmatavr::HudTuning::get().tune()->hide_hack_backdrop;
+
+        static const std::array<const char*, 9> words{"bg", "back", "shadow", "dark", "dim", "black", "fade", "vignette", "cover"};
+        static const std::array<const char*, 6> kinds{"via.gui.Rect", "via.gui.Texture", "via.gui.Material", "via.gui.Scale9Grid", "via.gui.Polygon",
+            "via.gui.TextureSet"};
+
+        std::string dump{};
+        const bool want_dump = [&] {
+            std::scoped_lock _{s_logged_mtx};
+            return s_logged.find(h ^ 0x5bd1e995ull) == s_logged.end();
+        }();
+        std::vector<std::string> hidden{};
+        auto& pending = s_pending[element];
+        int nodes = 0;
+
+        const std::function<void(REManagedObject*, const std::string&, int)> walk = [&](REManagedObject* obj, const std::string& path, int depth) {
+            if (depth > 8) {
+                return;
+            }
+            auto c = sdk::call_object_func<REManagedObject*>(obj, "get_Child", ctx, obj);
+            for (int n = 0; c != nullptr && n < 128 && nodes < 600; ++n, ++nodes) {
+                auto cname_s = sdk::call_object_func<SystemString*>(c, "get_Name", ctx, c);
+                const auto cname = cname_s != nullptr ? utility::re_string::get_string(cname_s) : std::string{"?"};
+                const auto tname = type_name(c);
+                const bool vis = sdk::call_object_func<bool>(c, "get_Visible", ctx, c);
+                const auto cpath = path.empty() ? cname : path + "/" + cname;
+                if (want_dump && dump.size() < 7000) {
+                    dump += fmt::format("\n    {:>{}}{} [{}] vis={}", "", depth * 2, cname, tname, vis ? 1 : 0);
+                }
+
+                std::string lower = cname;
+                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+                const bool word = std::any_of(words.begin(), words.end(), [&](const char* w) { return lower.find(w) != std::string::npos; });
+                const bool kind = std::any_of(kinds.begin(), kinds.end(), [&](const char* k) { return tname == k; });
+                if (hide && vis && word && kind) {
+                    pending.visible.push_back({c, true});
+                    sdk::call_object_func<void*>(c, "set_Visible", ctx, c, false);
+                    hidden.push_back(cpath);
+                } else {
+                    walk(c, cpath, depth + 1);
+                }
+                c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+            }
+        };
+        walk(view, std::string{}, 0);
+
+        if (want_dump) {
+            log_once(h ^ 0x5bd1e995ull, fmt::format("{}: GUI tree{}", name, dump));
+        }
+        if (!hidden.empty()) {
+            std::string list{};
+            for (const auto& p : hidden) {
+                list += (list.empty() ? "" : ", ") + p;
+            }
+            log_once(h ^ 0x27d4eb2full, fmt::format("{}: backdrop pieces hidden while drawing: {}", name, list));
+        } else if (hide) {
+            log_once(h ^ 0x165667b1ull, fmt::format("{}: no backdrop piece matched (see the GUI tree line)", name));
         }
     }
 
