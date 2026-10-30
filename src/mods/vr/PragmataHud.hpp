@@ -134,12 +134,15 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 900.0f, 400.0f, 1080.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes. Build 54:
                                        // bottom 1030 -> 1080, the status icons under the bar were cut off)
     {720.0f, 950.0f, 1200.0f, 1020.0f}, // stamina (Build 34: bottom 1050 -> 1020, measured)
-    {1160.0f, 500.0f, 1575.0f, 890.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box. Build 34:
+    {1400.0f, 640.0f, 1850.0f, 1080.0f}, // weapon wheel (Build 57: the full-size wheel is around its pivot 1612, 877, about
+                                         // 340 x 340 with its label; was 1160,500-1575,890, measured on the shrunk wheel)
+                                        // Old notes: (Build 28: the wheel reaches well above its companion's box. Build 34:
                                         // right 1920 -> 1575, bottom 1080 -> 890, left 1180 -> 1160, measured from the
                                         // Build 31 captures; the old box was about 3x the wheel and took in other HUD)
     {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
-    {1000.0f, 0.0f, 1940.0f, 600.0f},  // Build 47: item pickups. Build 54: 1300 -> 1000 left, 420 -> 600 bottom, 1920 -> 1940
+    {1100.0f, 0.0f, 1940.0f, 600.0f},  // Build 47: item pickups. Build 57: left 1000 -> 1100 (the replicator panel starts at
+                                       // about 1104), so the area fits between the tutorial box and the weapon wheel. Build 54: 1300 -> 1000 left, 420 -> 600 bottom, 1920 -> 1940
                                        // right: the hub panel ("Y" stations) and the resource counter, measured in snapshots
     {480.0f, 0.0f, 1440.0f, 360.0f},   // Build 53: objective banner (icon, objective line). Build 56: bottom 260 -> 360 for the
                                        // second and third objective lines (secondaryObjective +102, tertiaryObjective +148)
@@ -150,6 +153,10 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
 inline constexpr std::array<float, 4> ITEMS_BOX_FIELD{1150.0f, 0.0f, 1940.0f, 380.0f};
 // Build 56: set on the main thread (PragmataFixes) while the item pickups' replicator panel is shown.
 inline std::atomic<bool> g_items_hub{true};
+
+// Build 57: while a snapshot is taken, the GUI draw callbacks collect the names of every GUI drawn (steady clock ms;
+// PragmataFixes logs them), to identify effects such as the low health screen edges.
+inline std::atomic<int64_t> g_gui_list_until_ms{0};
 
 inline std::array<float, 4> box_for(int g) {
     if (g == GroupItems && !g_items_hub.load(std::memory_order_relaxed)) {
@@ -191,6 +198,8 @@ struct HudTune {
     // Build 55: draw in NATIVE while a full-screen menu (ui51xx: Firmware Updater, Stamp Club, Bot Database, outfits,
     // terminals) is open, where AFW leaves trails; back to AFW when it closes. Only applies when render mode is AFW.
     bool menu_native{true};
+    // Build 57: hide the red low health effect at the screen edges (ui2030Gui), made for a flat monitor.
+    bool hide_low_health{true};
     bool hud_fixed{true};    // HUD fixed in the room (Build 12, Steve's standing preference). Off = follows the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
@@ -607,6 +616,7 @@ enum MenuAction : int {
     ActionResetDamage,          // Build 51
     ActionToggleShiftDamage,    // Build 43
     ActionToggleMenuNative,     // Build 55
+    ActionToggleLowHealth,      // Build 57
 };
 
 class HudTuning {
@@ -1035,6 +1045,8 @@ private:
             "A = write frame time numbers to re2_framework_log.txt every 10 seconds");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleWorldProj, "World HUD projection",
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleLowHealth, "Low health edges",
+            "A = hide or show the red effect at the screen edges when health is low (made for a flat monitor)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleMenuNative, "Native in menus",
             "A = On: full-screen menus (Firmware Updater, terminals...) draw in NATIVE while open, no AFW trails. Off: keep AFW");
         column = 1;
@@ -1202,7 +1214,9 @@ private:
         s += "#   2048 OBJECTIVE).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
-        s += "# menu_native: 1 = NATIVE while a full-screen menu is open (Build 55).\n";
+        s += "# menu_native: 1 = NATIVE while a full-screen menu is open (Build 55). hide_low_health: 1 = no red screen\n";
+        s += "#   edges at low health (Build 57).\n";
+        s += fmt::format("hide_low_health={}\n", t.hide_low_health ? 1 : 0);
         s += fmt::format("menu_native={}\n", t.menu_native ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
@@ -1413,6 +1427,7 @@ private:
                 else if (key == "collapsed") t->collapsed = (uint32_t)std::max(0.0f, val);
                 else if (key == "show_boxes") t->show_boxes = val != 0.0f;
                 else if (key == "menu_native") t->menu_native = val != 0.0f;
+                else if (key == "hide_low_health") t->hide_low_health = val != 0.0f;
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
@@ -1708,6 +1723,8 @@ private:
         }
 
         snapshot_frames_left = 8;
+        g_gui_list_until_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() + 400, std::memory_order_relaxed); // Build 57
         spdlog::info("[PragmataVR] Snapshot requested ({})", snapshot_stem);
         play_click(true);
     }
@@ -1912,6 +1929,11 @@ private:
                     t->enemy_locked = !t->enemy_locked;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: enemy health bars {}", t->enemy_locked ? "locked" : "unlocked");
+                    play_click(true);
+                } else if (row.action == ActionToggleLowHealth) {
+                    t->hide_low_health = !t->hide_low_health;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: low health edges {}", t->hide_low_health ? "hidden" : "shown");
                     play_click(true);
                 } else if (row.action == ActionToggleMenuNative) {
                     t->menu_native = !t->menu_native;

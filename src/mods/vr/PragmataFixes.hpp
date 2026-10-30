@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <set>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -89,6 +90,20 @@ public:
             pragmata_screen_probe::g_damage_seen_ms.store(now_ms(), std::memory_order_relaxed);
         }
 
+        // Build 57: names of every GUI drawn while a snapshot is taken (logged on the main thread).
+        if (now_ms() < pragmatavr::g_gui_list_until_ms.load(std::memory_order_relaxed)) {
+            std::scoped_lock _{s_gui_list_mtx};
+            if (s_gui_list.size() < 128) {
+                s_gui_list.emplace(name);
+            }
+        }
+
+        // Build 57: the red low health effect at the screen edges.
+        if (h == "ui2030Gui"_fnv && pragmatavr::HudTuning::get().tune()->hide_low_health) {
+            log_once(h, "ui2030Gui: low health screen edges not drawn");
+            return false;
+        }
+
         if (h == "ui3203Gui"_fnv || h == "ui2160Gui"_fnv) {
             if (pragmatavr::HudTuning::get().tune()->fix_brackets) {
                 log_once(h, fmt::format("{}: hacking target brackets / decoration not drawn", name));
@@ -116,6 +131,7 @@ public:
             spdlog::info("[PragmataVR] Fixes: HUD fixes run on the main thread before PrerenderGUI (Build 46)");
         }
         apply();
+        report_gui_list();
         pragmata_marker_fix::install(); // Build 50, once
         if (pragmatavr::HudTuning::get().tune()->screen_probe) {
             pragmata_screen_probe::install(); // Build 48, once
@@ -159,6 +175,28 @@ private:
     // Main thread only.
     static inline std::unordered_map<size_t, bool> s_hidden_by_us{};
     static inline std::unordered_map<std::wstring, SystemString*> s_strings{};
+
+    // Build 57: GUIs drawn during a snapshot.
+    static inline std::mutex s_gui_list_mtx{};
+    static inline std::set<std::string> s_gui_list{};
+
+    static void report_gui_list() {
+        if (now_ms() < pragmatavr::g_gui_list_until_ms.load(std::memory_order_relaxed)) {
+            return;
+        }
+        std::string names{};
+        {
+            std::scoped_lock _{s_gui_list_mtx};
+            if (s_gui_list.empty()) {
+                return;
+            }
+            for (const auto& n : s_gui_list) {
+                names += " " + n;
+            }
+            s_gui_list.clear();
+        }
+        spdlog::info("[PragmataVR] Snapshot GUIs drawn:{}", names);
+    }
 
     static inline std::mutex s_logged_mtx{};
     static inline std::unordered_map<size_t, bool> s_logged{};
