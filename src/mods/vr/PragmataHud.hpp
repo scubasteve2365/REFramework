@@ -223,6 +223,11 @@ struct HudTune {
     std::array<bool, 4> enemy_bar_invert{};
     // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
     bool hide_hack_backdrop{true};
+    // Build 46: switches for the HUD fixes (PragmataFixes.hpp), now applied on the main thread. ini only.
+    bool fix_brackets{true};  // ui3203Gui / ui2160Gui hacking target brackets not drawn
+    bool fix_label{true};     // ui3010Gui location label brightness
+    bool fix_door_vfx{true};  // ui3500Gui / ui3510Gui VFXtex effect textures hidden
+    bool fix_gauge_vfx{true}; // ui2130Gui hackingGauge_VFX effect texture hidden
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
     // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).
@@ -1101,6 +1106,12 @@ private:
         s += fmt::format("fixed_capture_corners={}\n", t.fixed_capture_corners ? 1 : 0);
         s += "# enemy_bar.x / .y (Build 40): enemy health bar shift in canvas pixels (y positive = down), headset projection only.\n";
         s += fmt::format("hide_hack_backdrop={}\n", t.hide_hack_backdrop ? 1 : 0);
+        s += "# HUD fixes (Build 46, applied on the main thread): 1 = on. fix_brackets = no hacking target brackets,\n";
+        s += "#   fix_label = location label at full brightness, fix_door_vfx / fix_gauge_vfx = door hack / hacking gauge effects hidden.\n";
+        s += fmt::format("fix_brackets={}\n", t.fix_brackets ? 1 : 0);
+        s += fmt::format("fix_label={}\n", t.fix_label ? 1 : 0);
+        s += fmt::format("fix_door_vfx={}\n", t.fix_door_vfx ? 1 : 0);
+        s += fmt::format("fix_gauge_vfx={}\n", t.fix_gauge_vfx ? 1 : 0);
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
         s += "# shift_damage (Build 43): 1 = move the damage numbers by enemy_bar.damage_x / damage_y (off while a crash is tested).\n";
         s += fmt::format("shift_damage={}\n", t.shift_damage ? 1 : 0);
@@ -1283,6 +1294,10 @@ private:
                 else if (key == "world_hud_projection") t->world_headset = val != 0.0f;
                 else if (key == "fixed_capture_corners") t->fixed_capture_corners = val != 0.0f;
                 else if (key == "hide_hack_backdrop") t->hide_hack_backdrop = val != 0.0f;
+                else if (key == "fix_brackets") t->fix_brackets = val != 0.0f;
+                else if (key == "fix_label") t->fix_label = val != 0.0f;
+                else if (key == "fix_door_vfx") t->fix_door_vfx = val != 0.0f;
+                else if (key == "fix_gauge_vfx") t->fix_gauge_vfx = val != 0.0f;
                 else if (key == "shift_damage") t->shift_damage = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.

@@ -1,36 +1,49 @@
 #pragma once
 
 // PragmataVR Build 36: the community fix pack's Lua HUD fixes (and our ghost layer script), ported to C++.
+// Build 46: rewritten after the crash hunt of 2026-10-30.
 //
-// Build 35 telemetry showed the five Lua scripts in reframework/autorun cost 5 to 9 ms per frame in native stereo:
-// every script asked the engine for the element's GameObject and name on every GUI element draw, in both eyes,
-// behind the Lua lock. Here the name is read once per draw and compared by hash; only the few matching elements
-// make further engine calls. Behaviour matches the scripts:
+// Builds 36 to 45 made these changes from the GUI draw callbacks, on the render threads, on every frame: hide a HUD
+// piece before the element drew and show it again right after, look pieces up by name (a new managed string each
+// time) and change the location label's colour. Steve's flat tests with VR off pinned the random worker-thread
+// crashes (animation, collision, navigation, hacking jobs, all through corrupted pointers) on this code: PureDark's
+// original DLL and Build 35 (no port) ran the hacking loop clean; Builds 36 to 40 crashed within a couple of hacks,
+// even with the HUD code off. The hacking gauge and door hack effects it toggled are animated by the game's own
+// workers during a hack, which is where the crashes clustered.
 //
+// Now:
+//   - All changes happen on the main thread, in the application entry just before PrerenderGUI (after the game's
+//     own update and behaviour code for the frame, before the GUI is prepared for drawing). Nothing is written from
+//     the render threads.
+//   - Each change is made once and left in place (hide only if visible, never hide and restore around a draw).
+//     Turning a fix off shows again what this fix hid.
+//   - Name lookups use managed strings created once and kept alive (add_ref), not new strings per lookup.
+//   - The draw callback only notes which HUD elements are being drawn (no engine calls besides reading the name it
+//     already read) and skips the target brackets, which changes nothing in the game.
+//   - Every fix has its own switch in pragmatavr_hud.ini (fix_brackets, hide_ghost, fix_label, fix_door_vfx,
+//     fix_gauge_vfx, hide_hack_backdrop).
+//
+// The fixes (behaviour of the original scripts):
 //   zz_pragmata_transform_probe.lua        ui3203Gui, ui2160Gui (hacking target brackets, decoration): not drawn
 //   zz_pragmatavr_hide_ghost.lua           offset "aberration" layer hidden on ui2100/2110/2120/2130/2140/2150/2201
-//                                          (follows hide_ghost in pragmatavr_hud.ini)
 //   zzzzz_pragmata_label_probe.lua         ui3010Gui (location label): Overlay off, title panel alpha 1 when the title
-//                                          text is the only visible child, colour restored after the draw
-//   zzzzzz_pragmata_door_hack_inspect.lua  ui3500Gui, ui3510Gui: VFXtex effect textures hidden for the draw
-//   zzzzzzzz_pragmata_hud_orange_test.lua  ui2130Gui: hackingGauge_VFX effect texture hidden for the draw
-//
-// It is its own Mod, registered right after ScriptRunner, so it runs at the same point the Lua scripts did.
-// The .lua files must be moved out of autorun (they would do the same work again).
+//                                          text is the only visible child
+//   zzzzzz_pragmata_door_hack_inspect.lua  ui3500Gui, ui3510Gui: VFXtex effect textures hidden
+//   zzzzzzzz_pragmata_hud_orange_test.lua  ui2130Gui: hackingGauge_VFX effect texture hidden
+//   Build 42                               ui3500Gui, ui3510Gui: dimming overlays PNL_1, PNL_, rect_1, rect_ hidden
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-#include <algorithm>
-#include <array>
-#include <cctype>
-#include <functional>
-#include <mutex>
 
 #include <spdlog/spdlog.h>
 
@@ -41,6 +54,7 @@
 #include "sdk/REManagedObject.hpp"
 #include "sdk/REString.hpp"
 #include "sdk/RETypeDB.hpp"
+#include "sdk/SceneManager.hpp"
 #include "sdk/Math.hpp"
 #include "utility/String.hpp"
 
@@ -55,6 +69,7 @@ public:
 
     std::string_view get_name() const override { return "PragmataFixes"; }
 
+    // Render threads: read the name (as before), note the element as drawn, skip the brackets. No writes.
     bool on_pre_gui_draw_element(REComponent* gui_element, void* primitive_context) override {
         auto go = utility::re_component::get_game_object(gui_element);
         if (go == nullptr) {
@@ -64,76 +79,78 @@ public:
         const auto name = utility::re_game_object::get_name(go);
         const auto h = utility::hash(name);
 
-        switch (h) {
-        case "ui3203Gui"_fnv:
-        case "ui2160Gui"_fnv:
-            log_once(h, fmt::format("{}: hacking target brackets / decoration hidden", name));
-            return false; // not drawn, any eye, any view mode
-
-        case "ui3010Gui"_fnv:
-            label(gui_element, name);
-            return true;
-
-        case "ui3500Gui"_fnv:
-        case "ui3510Gui"_fnv:
-            hide_effects(gui_element, name, {L"main/layout/VFXtex/effecttexture00", L"main/layout/VFXtex/effecttexture01"});
-            backdrop(gui_element, name, h); // Build 41
-            return true;
-
-        case "ui2130Gui"_fnv:
-            ghost(gui_element, name, h);
-            hide_effects(gui_element, name, {L"main/layout/offset/over/hackingGauge_VFX/effecttexture_"});
-            return true;
-
-        case "ui2100Gui"_fnv:
-        case "ui2110Gui"_fnv:
-        case "ui2120Gui"_fnv:
-        case "ui2140Gui"_fnv:
-        case "ui2150Gui"_fnv:
-        case "ui2201Gui"_fnv:
-            ghost(gui_element, name, h);
-            return true;
-
-        default:
+        if (h == "ui3203Gui"_fnv || h == "ui2160Gui"_fnv) {
+            if (pragmatavr::HudTuning::get().tune()->fix_brackets) {
+                log_once(h, fmt::format("{}: hacking target brackets / decoration not drawn", name));
+                return false;
+            }
             return true;
         }
+
+        for (size_t i = 0; i < TARGETS.size(); ++i) {
+            if (TARGETS[i].hash == h) {
+                s_seen_ms[i].store(now_ms(), std::memory_order_relaxed);
+                break;
+            }
+        }
+        return true;
     }
 
-    void on_gui_draw_element(REComponent* gui_element, void* primitive_context) override {
-        auto it = s_pending.find(gui_element);
-        if (it == s_pending.end()) {
+    // Main thread, once per frame, before the GUI is prepared for drawing.
+    void on_pre_application_entry(void* entry, const char* name, size_t hash) override {
+        if (hash != "PrerenderGUI"_fnv) {
             return;
         }
-
-        auto ctx = sdk::get_thread_context();
-        for (auto& v : it->second.visible) {
-            sdk::call_object_func<void*>(v.node, "set_Visible", ctx, v.node, v.visible);
+        if (!s_announced) {
+            s_announced = true;
+            spdlog::info("[PragmataVR] Fixes: HUD fixes run on the main thread before PrerenderGUI (Build 46)");
         }
-        if (it->second.color_panel != nullptr) {
-            sdk::call_object_func<void*>(it->second.color_panel, "set_ColorScale", ctx, it->second.color_panel, &it->second.color);
-        }
-        s_pending.erase(it);
+        apply();
     }
 
 private:
-    struct SavedVisible {
-        REManagedObject* node{nullptr};
-        bool visible{true};
+    enum Kind : uint32_t {
+        KindGhost = 1u << 0,
+        KindGauge = 1u << 1,
+        KindDoor = 1u << 2,
+        KindLabel = 1u << 3,
     };
 
-    struct Pending {
-        std::vector<SavedVisible> visible{};
-        REManagedObject* color_panel{nullptr};
-        Vector4f color{};
+    struct Target {
+        const char* name;
+        size_t hash;
+        uint32_t kinds;
     };
 
-    // Per element, restored in on_gui_draw_element. Pre and post of one element run on the same thread.
-    static inline thread_local std::unordered_map<REComponent*, Pending> s_pending{};
-    // Build 41: shared by all threads (GUI draws on several render threads; the per-thread set logged each line many times).
+    static inline const std::array<Target, 10> TARGETS{{
+        {"ui2100Gui", "ui2100Gui"_fnv, KindGhost},
+        {"ui2110Gui", "ui2110Gui"_fnv, KindGhost},
+        {"ui2120Gui", "ui2120Gui"_fnv, KindGhost},
+        {"ui2130Gui", "ui2130Gui"_fnv, KindGhost | KindGauge},
+        {"ui2140Gui", "ui2140Gui"_fnv, KindGhost},
+        {"ui2150Gui", "ui2150Gui"_fnv, KindGhost},
+        {"ui2201Gui", "ui2201Gui"_fnv, KindGhost},
+        {"ui3500Gui", "ui3500Gui"_fnv, KindDoor},
+        {"ui3510Gui", "ui3510Gui"_fnv, KindDoor},
+        {"ui3010Gui", "ui3010Gui"_fnv, KindLabel},
+    }};
+
+    // Only elements drawn within this window are looked up (absent HUD screens cost nothing).
+    static constexpr int64_t SEEN_WINDOW_MS = 2000;
+
+    static inline std::array<std::atomic<int64_t>, 10> s_seen_ms{};
+    static inline bool s_announced{false};
+
+    // Main thread only.
+    static inline std::unordered_map<size_t, bool> s_hidden_by_us{};
+    static inline std::unordered_map<std::wstring, SystemString*> s_strings{};
+
     static inline std::mutex s_logged_mtx{};
     static inline std::unordered_map<size_t, bool> s_logged{};
-    // Ghost layer per GUI name: whether we hid it (so turning hide_ghost off shows it again).
-    static inline thread_local std::unordered_map<size_t, bool> s_ghost_hidden{};
+
+    static int64_t now_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     static void log_once(size_t key, const std::string& msg) {
         std::scoped_lock _{s_logged_mtx};
@@ -147,127 +164,161 @@ private:
         return td != nullptr ? std::string{td->get_full_name()} : std::string{};
     }
 
+    // A managed string created once and kept alive, so lookups do not allocate every frame.
+    static SystemString* managed(std::wstring_view s) {
+        auto it = s_strings.find(std::wstring{s});
+        if (it != s_strings.end()) {
+            return it->second;
+        }
+        auto str = sdk::VM::create_managed_string(s);
+        if (str != nullptr) {
+            utility::re_managed_object::add_ref((REManagedObject*)str);
+        }
+        s_strings.emplace(std::wstring{s}, str);
+        return str;
+    }
+
     // view:call('getObject', path) / element:call('getObject', path), as the Lua scripts did.
     static REManagedObject* get_object(REManagedObject* owner, std::wstring_view path, sdk::VMContext* ctx) {
-        auto str = sdk::VM::create_managed_string(path);
+        auto str = managed(path);
         if (str == nullptr) {
             return nullptr;
         }
         return sdk::call_object_func<REManagedObject*>(owner, "getObject", ctx, owner, str);
     }
 
-    // zz_pragmatavr_hide_ghost.lua
-    static void ghost(REComponent* element, const std::string& name, size_t h) {
-        static const std::unordered_map<size_t, std::vector<std::wstring>> paths{
-            {"ui2100Gui"_fnv, {L"main/layout/offset/under", L"main/layout/under", L"main/under"}},
-            {"ui2110Gui"_fnv, {L"main/layout/offset/under"}},
-            {"ui2120Gui"_fnv, {L"main/layout/offset/under"}},
-            {"ui2130Gui"_fnv, {L"main/layout/offset/under"}},
-            {"ui2140Gui"_fnv, {L"main/layout/offset/under"}},
-            {"ui2150Gui"_fnv, {L"main/layout/offset/under"}},
-            {"ui2201Gui"_fnv, {L"main/layout/offset/under", L"main/layout/under", L"main/under"}},
-        };
+    static REGameObject* find_game_object(REManagedObject* scene, const char* name, sdk::VMContext* ctx) {
+        static auto scene_t = sdk::find_type_definition("via.Scene");
+        static auto find_method = scene_t != nullptr ? scene_t->get_method("findGameObject(System.String)") : nullptr;
+        if (find_method == nullptr) {
+            log_once("no findGameObject"_fnv, "via.Scene.findGameObject not found, HUD fixes inactive");
+            return nullptr;
+        }
+        auto str = managed(utility::widen(name));
+        if (str == nullptr) {
+            return nullptr;
+        }
+        return find_method->call<REGameObject*>(ctx, scene, str);
+    }
 
-        const auto pit = paths.find(h);
-        if (pit == paths.end()) {
+    static void apply() {
+        const auto tune = pragmatavr::HudTuning::get().tune();
+        const auto now = now_ms();
+
+        auto scene = sdk::get_current_scene();
+        if (scene == nullptr) {
+            return;
+        }
+        auto ctx = sdk::get_thread_context();
+
+        for (size_t i = 0; i < TARGETS.size(); ++i) {
+            const auto& tg = TARGETS[i];
+            const auto seen = s_seen_ms[i].load(std::memory_order_relaxed);
+            if (seen == 0 || now - seen > SEEN_WINDOW_MS) {
+                continue;
+            }
+
+            auto go = find_game_object(scene, tg.name, ctx);
+            if (go == nullptr || go->transform == nullptr) {
+                log_once(tg.hash ^ 0x51ed270b27f3ull, fmt::format("{}: drawn but not found in the scene, skipped", tg.name));
+                continue;
+            }
+            auto gui = utility::re_component::find<::REComponent>((::REComponent*)go->transform, "via.gui.GUI");
+            if (gui == nullptr) {
+                continue;
+            }
+            auto view = sdk::call_object_func<REManagedObject*>((REManagedObject*)gui, "get_View", ctx, (REManagedObject*)gui);
+
+            if (tg.kinds & KindGhost) {
+                ghost((REManagedObject*)gui, tg, tune->hide_ghost, ctx);
+            }
+            if (view == nullptr) {
+                continue;
+            }
+            if (tg.kinds & KindGauge) {
+                set_hidden(view, tg, L"main/layout/offset/over/hackingGauge_VFX/effecttexture_", "via.gui.EffectTexture", tune->fix_gauge_vfx, ctx);
+            }
+            if (tg.kinds & KindDoor) {
+                set_hidden(view, tg, L"main/layout/VFXtex/effecttexture00", "via.gui.EffectTexture", tune->fix_door_vfx, ctx);
+                set_hidden(view, tg, L"main/layout/VFXtex/effecttexture01", "via.gui.EffectTexture", tune->fix_door_vfx, ctx);
+                static const std::array<const wchar_t*, 4> backdrop{L"main/layout/PNL_1", L"main/layout/PNL_", L"main/layout/rect_1", L"main/layout/rect_"};
+                for (const auto* p : backdrop) {
+                    set_hidden(view, tg, p, nullptr, tune->hide_hack_backdrop, ctx);
+                }
+            }
+            if ((tg.kinds & KindLabel) && tune->fix_label) {
+                label(view, tg, ctx);
+            }
+        }
+    }
+
+    // Hide one piece while `hide` is on (only if it is visible); show it again once `hide` is off, if this fix hid it.
+    static void set_hidden(REManagedObject* owner, const Target& tg, std::wstring_view path, const char* want_type, bool hide,
+                           sdk::VMContext* ctx) {
+        const auto key = tg.hash ^ utility::hash(utility::narrow(path));
+        auto& ours = s_hidden_by_us[key];
+        if (!hide && !ours) {
             return;
         }
 
-        // Looked up on every draw, like the script (the element and its layers can be recreated).
-        auto ctx = sdk::get_thread_context();
+        auto node = get_object(owner, path, ctx);
+        if (node == nullptr || (want_type != nullptr && type_name(node) != want_type)) {
+            log_once(key, fmt::format("{}: {} not found, skipped", tg.name, utility::narrow(path)));
+            return;
+        }
+
+        if (hide) {
+            if (sdk::call_object_func<bool>(node, "get_Visible", ctx, node)) {
+                sdk::call_object_func<void*>(node, "set_Visible", ctx, node, false);
+                ours = true;
+                log_once(key ^ 0x9e3779b97f4a7c15ull, fmt::format("{}: {} hidden", tg.name, utility::narrow(path)));
+            }
+        } else {
+            sdk::call_object_func<void*>(node, "set_Visible", ctx, node, true);
+            ours = false;
+        }
+    }
+
+    // zz_pragmatavr_hide_ghost.lua: the offset "aberration" layer, at the first path that exists.
+    static void ghost(REManagedObject* gui, const Target& tg, bool hide, sdk::VMContext* ctx) {
+        static const std::array<const wchar_t*, 3> paths{L"main/layout/offset/under", L"main/layout/under", L"main/under"};
+        const auto key = tg.hash ^ 0x6a09e667f3bcc909ull;
+        auto& ours = s_hidden_by_us[key];
+        if (!hide && !ours) {
+            return;
+        }
+
         REManagedObject* layer = nullptr;
-        std::wstring_view used{};
-        for (const auto& p : pit->second) {
-            layer = get_object((REManagedObject*)element, p, ctx);
+        const wchar_t* used = nullptr;
+        for (const auto* p : paths) {
+            layer = get_object(gui, p, ctx);
             if (layer != nullptr) {
                 used = p;
                 break;
             }
         }
-        log_once(h ^ 0x9e3779b97f4a7c15ull, layer != nullptr ? fmt::format("{}: ghost layer found at {}", name, utility::narrow(used))
-                                                              : fmt::format("{}: no ghost layer at the known paths", name));
+        log_once(key, layer != nullptr ? fmt::format("{}: ghost layer at {}", tg.name, utility::narrow(used))
+                                       : fmt::format("{}: no ghost layer at the known paths", tg.name));
         if (layer == nullptr) {
             return;
         }
 
-        auto& hidden_by_us = s_ghost_hidden[h];
-        const bool hide = pragmatavr::HudTuning::get().tune()->hide_ghost;
         if (hide) {
             if (sdk::call_object_func<bool>(layer, "get_Visible", ctx, layer)) {
                 sdk::call_object_func<void*>(layer, "set_Visible", ctx, layer, false);
             }
-            hidden_by_us = true;
-        } else if (hidden_by_us) {
+            ours = true;
+        } else {
             sdk::call_object_func<void*>(layer, "set_Visible", ctx, layer, true);
-            hidden_by_us = false;
+            ours = false;
         }
     }
 
-    // zzzzzz_pragmata_door_hack_inspect.lua and zzzzzzzz_pragmata_hud_orange_test.lua
-    static void hide_effects(REComponent* element, const std::string& name, std::initializer_list<std::wstring_view> paths) {
-        auto ctx = sdk::get_thread_context();
-        auto view = sdk::call_object_func<REManagedObject*>((REManagedObject*)element, "get_View", ctx, (REManagedObject*)element);
-        if (view == nullptr) {
-            return;
+    // zzzzz_pragmata_label_probe.lua (V13): Overlay off; title panel alpha 1 when the title text is its only visible child.
+    static void label(REManagedObject* view, const Target& tg, sdk::VMContext* ctx) {
+        if (sdk::call_object_func<bool>(view, "get_Overlay", ctx, view)) {
+            sdk::call_object_func<void*>(view, "set_Overlay", ctx, view, false);
         }
-
-        auto& pending = s_pending[element];
-        for (const auto p : paths) {
-            auto node = get_object(view, p, ctx);
-            const auto key = utility::hash(name) ^ utility::hash(utility::narrow(p));
-            if (node == nullptr || type_name(node) != "via.gui.EffectTexture") {
-                log_once(key, fmt::format("{}: expected EffectTexture missing at {}, skipped", name, utility::narrow(p)));
-                continue;
-            }
-            if (sdk::call_object_func<bool>(node, "get_Visible", ctx, node)) {
-                pending.visible.push_back({node, true});
-                sdk::call_object_func<void*>(node, "set_Visible", ctx, node, false);
-            }
-            log_once(key, fmt::format("{}: effect texture {} hidden while drawing", name, utility::narrow(p)));
-        }
-    }
-
-    // Build 41/42: the door / lock hacking HUD draws dark dimming overlays at the top of its layout (made to darken a
-    // monitor behind the panel); in VR they read as a shadowed plane. Build 41 found them by walking the whole GUI tree
-    // on every draw, which reads hundreds of names from the render threads and most likely caused the crashes in
-    // Steve's test. Build 42 hides the exact pieces from that tree log instead (two lookups each, like the fix pack).
-    static void backdrop(REComponent* element, const std::string& name, size_t h) {
-        if (!pragmatavr::HudTuning::get().tune()->hide_hack_backdrop) {
-            return;
-        }
-        auto ctx = sdk::get_thread_context();
-        auto view = sdk::call_object_func<REManagedObject*>((REManagedObject*)element, "get_View", ctx, (REManagedObject*)element);
-        if (view == nullptr) {
-            return;
-        }
-        static const std::array<const wchar_t*, 4> paths{L"main/layout/PNL_1", L"main/layout/PNL_", L"main/layout/rect_1", L"main/layout/rect_"};
-        auto& pending = s_pending[element];
-        std::string list{};
-        for (const auto* p : paths) {
-            auto node = get_object(view, p, ctx);
-            if (node == nullptr) {
-                continue;
-            }
-            if (sdk::call_object_func<bool>(node, "get_Visible", ctx, node)) {
-                pending.visible.push_back({node, true});
-                sdk::call_object_func<void*>(node, "set_Visible", ctx, node, false);
-                list += (list.empty() ? "" : ", ") + utility::narrow(p);
-            }
-        }
-        if (!list.empty()) {
-            log_once(h ^ 0x27d4eb2full, fmt::format("{}: dimming overlays hidden while drawing: {}", name, list));
-        }
-    }
-
-    // zzzzz_pragmata_label_probe.lua (V13)
-    static void label(REComponent* element, const std::string& name) {
-        auto ctx = sdk::get_thread_context();
-        auto view = sdk::call_object_func<REManagedObject*>((REManagedObject*)element, "get_View", ctx, (REManagedObject*)element);
-        if (view == nullptr) {
-            return;
-        }
-
-        sdk::call_object_func<void*>(view, "set_Overlay", ctx, view, false);
 
         auto panel = get_object(view, L"main/layout/type/item", ctx);
         if (panel == nullptr || type_name(panel) != "via.gui.Panel") {
@@ -275,7 +326,6 @@ private:
             return;
         }
 
-        // Only when the title text 'name' is the sole visible direct child (protects other content).
         bool found = false;
         auto child = sdk::call_object_func<REManagedObject*>(panel, "get_Child", ctx, panel);
         for (int count = 0; child != nullptr; ++count) {
@@ -296,20 +346,12 @@ private:
             return;
         }
 
-        const auto original = sdk::call_object_func_easy<Vector4f>(panel, "get_ColorScale");
-        if (!std::isfinite(original.x) || !std::isfinite(original.y) || !std::isfinite(original.z) || !std::isfinite(original.w)) {
+        const auto c = sdk::call_object_func_easy<Vector4f>(panel, "get_ColorScale");
+        if (!std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z) || !std::isfinite(c.w) || c.w >= 1.0f) {
             return;
         }
-
-        auto& pending = s_pending[element];
-        if (pending.color_panel != nullptr) {
-            return; // already applied for this draw
-        }
-        pending.color_panel = panel;
-        pending.color = original;
-
-        Vector4f brighter{original.x, original.y, original.z, 1.0f};
+        Vector4f brighter{c.x, c.y, c.z, 1.0f};
         sdk::call_object_func<void*>(panel, "set_ColorScale", ctx, panel, &brighter);
-        log_once("ui3010 applied"_fnv, fmt::format("{}: title alpha set to 1 while drawing (colour restored after)", name));
+        log_once("ui3010 applied"_fnv, fmt::format("{}: title alpha set to 1", tg.name));
     }
 };
