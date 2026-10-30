@@ -25,6 +25,10 @@
 #include "sdk/RETypeDB.hpp"
 #include "sdk/SceneManager.hpp"
 #include "sdk/Math.hpp"
+#include "sdk/REComponent.hpp"
+#include "sdk/REGameObject.hpp"
+#include "sdk/REManagedObject.hpp"
+#include "utility/String.hpp"
 
 #include "PragmataHud.hpp"
 
@@ -35,6 +39,12 @@ inline std::mutex g_caller_mtx{};
 inline std::unordered_map<uintptr_t, bool> g_caller_ok{}; // return address -> called from GuiBehaviorV2.applyPostureData
 
 inline thread_local bool tl_apply{false};
+// Build 51: which GUI the current applyPostureData call is placing (its GuiBehaviorV2's GameObject name, hashed), so
+// health bars and damage numbers get their own fine-tune. 0 = unknown.
+inline thread_local size_t tl_owner_hash{0};
+inline thread_local int tl_owner_depth{0};
+inline std::mutex g_owner_log_mtx{};
+inline std::unordered_map<size_t, bool> g_owner_logged{};
 inline thread_local uintptr_t tl_size{0};
 
 inline bool caller_ok(uintptr_t ret_addr) {
@@ -78,6 +88,35 @@ inline void install() {
         return;
     }
 
+    // Build 51: note the owner of each applyPostureData call (args[0] = thread context, args[1] = this).
+    if (auto bt = sdk::find_type_definition("app.GuiBehaviorV2"); bt != nullptr) {
+        if (auto am = bt->get_method("applyPostureData"); am != nullptr && am->get_function() != nullptr) {
+            g_hookman.add(am,
+                [](std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
+                    ++tl_owner_depth;
+                    tl_owner_hash = 0;
+                    if (args.size() >= 2 && args[1] != 0 && utility::re_managed_object::is_managed_object((void*)args[1])) {
+                        auto go = utility::re_component::get_game_object((REComponent*)args[1]);
+                        if (go != nullptr) {
+                            const auto name = utility::re_game_object::get_name(go);
+                            tl_owner_hash = utility::hash(name);
+                            std::scoped_lock _{g_owner_log_mtx};
+                            if (g_owner_logged.size() < 64 && g_owner_logged.emplace(tl_owner_hash, true).second) {
+                                spdlog::info("[PragmataVR] Marker fix: applyPostureData for {}", name);
+                            }
+                        }
+                    }
+                    return HookManager::PreHookResult::CALL_ORIGINAL;
+                },
+                [](uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr) {
+                    if (--tl_owner_depth <= 0) {
+                        tl_owner_depth = 0;
+                        tl_owner_hash = 0;
+                    }
+                });
+        }
+    }
+
     g_hookman.add(m,
         [](std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
             tl_apply = false;
@@ -117,13 +156,22 @@ inline void install() {
             // Vertical: Steve's Build 41 Quest tuning (170 px) matches [2][1] * h/2 scaled by the canvas fit (1.6 on the
             // Quest 3: the 1920 x 1080 canvas fills the eye image width).
             const float dy = -proj[2][1] * h * 0.5f * tune->marker_vscale;
-            r[0] += dx + tune->enemy_bar[pragmatavr::EnemyX];
-            r[1] += dy + tune->enemy_bar[pragmatavr::EnemyY];
+            // Build 51: each marker type's own fine-tune (Left / right, Up / down in the HUD tab).
+            float tx = 0.0f, ty = 0.0f;
+            if (tl_owner_hash == "ui3201Gui"_fnv) {
+                tx = tune->enemy_bar[pragmatavr::DamageX];
+                ty = tune->enemy_bar[pragmatavr::DamageY];
+            } else if (tl_owner_hash == "ui3200Gui"_fnv || tl_owner_hash == "ui3210Gui"_fnv) {
+                tx = tune->enemy_bar[pragmatavr::EnemyX];
+                ty = tune->enemy_bar[pragmatavr::EnemyY];
+            }
+            r[0] += dx + tx;
+            r[1] += dy + ty;
 
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 3) {
-                spdlog::info("[PragmataVR] Marker fix: [2][0] {:.4f} [2][1] {:.4f} size {:.0f} x {:.0f} -> shift ({:.1f}, {:.1f}) + trim ({:.0f}, {:.0f})",
-                    proj[2][0], proj[2][1], w, h, dx, dy, tune->enemy_bar[pragmatavr::EnemyX], tune->enemy_bar[pragmatavr::EnemyY]);
+                spdlog::info("[PragmataVR] Marker fix: [2][0] {:.4f} [2][1] {:.4f} size {:.0f} x {:.0f} -> shift ({:.1f}, {:.1f}) + fine-tune ({:.0f}, {:.0f})",
+                    proj[2][0], proj[2][1], w, h, dx, dy, tx, ty);
             }
         });
     spdlog::info("[PragmataVR] Marker fix: hooked app.GuiUtil.transformWorldToScreen (applyPostureData callers only)");

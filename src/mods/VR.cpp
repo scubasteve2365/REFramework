@@ -3423,7 +3423,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         } else if (row.group == pragmatavr::GROUP_ENEMY) {
             v.value = fmt::format("{:+.0f}", t.enemy_bar[row.field]);
             v.invert_on = t.enemy_bar_invert[row.field];
-            v.dim = t.enemy_locked; // Build 50: fine-tune on top of the automatic marker placement
+            v.dim = pragmatavr::enemy_field_locked(t, row.field); // Build 51: per section lock
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
@@ -3511,6 +3511,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         case pragmatavr::ActionToggleEnemyLock:
             v.value = t.enemy_locked ? "LOCKED" : "UNLOCKED";
             v.value_color = t.enemy_locked ? AMBER : ACCENT;
+            break;
+        case pragmatavr::ActionToggleDamageLock:
+            v.value = t.damage_locked ? "LOCKED" : "UNLOCKED";
+            v.value_color = t.damage_locked ? AMBER : ACCENT;
             break;
         case pragmatavr::ActionToggleHackBackdrop:
             v.value = t.hide_hack_backdrop ? "HIDDEN" : "SHOWN";
@@ -3708,7 +3712,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B50");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B51");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3801,7 +3805,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B50"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B50");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B51"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B51");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);

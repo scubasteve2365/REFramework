@@ -237,7 +237,8 @@ struct HudTune {
     bool marker_fix{true};      // Build 50: correct enemy bars / damage numbers / world markers for the headset projection
     float marker_vscale{1.6f};  // Build 50: vertical factor of that correction (1.6 matched the Quest 3 by eye)
     bool screen_probe{false}; // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers (ini only)
-    bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
+    bool enemy_locked{true}; // Build 42: lock for the ENEMY HEALTH BARS fine-tune (fields EnemyX / EnemyY)
+    bool damage_locked{true}; // Build 51: lock for the DAMAGE NUMBERS fine-tune (fields DamageX / DamageY)
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
     // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).
     bool shift_damage{true}; // Build 45: on again, now through the projection (no game object writes)
@@ -464,6 +465,7 @@ enum MenuSection : int {
     SectionPerformance = 7, // Build 35 (after the five element sections, bits 2 to 6)
     SectionEnemy = 8,       // Build 42: ENEMY BARS AND DAMAGE
     SectionItems = 9,       // Build 47: ITEM PICKUPS (bit 7 was already taken by PERFORMANCE)
+    SectionDamage = 10,     // Build 51: DAMAGE NUMBERS (bit 8 is now ENEMY HEALTH BARS)
 };
 
 inline int section_for_group(int g) {
@@ -504,6 +506,11 @@ enum EnemyField : int {
     EnemyFieldCount = 4,
 };
 inline constexpr std::array<const char*, 4> ENEMY_KEYS{"x", "y", "damage_x", "damage_y"};
+
+inline bool enemy_field_locked(const HudTune& t, int field) {
+    return field >= DamageX ? t.damage_locked : t.enemy_locked;
+}
+
 inline constexpr float ENEMY_MAX = 1500.0f;
 inline constexpr float ENEMY_STEP = 5.0f;
 inline constexpr float ENEMY_STEP_BIG = 50.0f;
@@ -561,6 +568,8 @@ enum MenuAction : int {
     ActionResetEnemy,           // Build 40
     ActionToggleHackBackdrop,   // Build 41
     ActionToggleEnemyLock,      // Build 42
+    ActionToggleDamageLock,     // Build 51
+    ActionResetDamage,          // Build 51
     ActionToggleShiftDamage,    // Build 43
 };
 
@@ -961,14 +970,18 @@ private:
         add_element(GroupHealth);
         add_element(GroupStamina);
         add_element(GroupItems); // Build 47
-        // Build 50: ENEMY MARKERS. Placement is automatic (PragmataMarkerFix.hpp); these rows are a fine-tune only.
-        add_section(SectionEnemy, "ENEMY MARKERS");
-        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock these values (locked = they cannot change)");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Fine-tune left / right",
-            "A = edit. Only if enemy health bars and damage numbers still sit beside the enemy on your headset");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Fine-tune up / down",
-            "A = edit. Only if enemy health bars and damage numbers still sit above or below the enemy on your headset");
-        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to no fine-tune (automatic placement only)");
+        // Build 50: placement over the enemy is automatic (PragmataMarkerFix.hpp). Build 51: health bars and damage numbers
+        // each get their own section to move them relative to that.
+        add_section(SectionEnemy, "ENEMY HEALTH BARS");
+        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Left / right", "A = edit. Moves enemy health bars relative to the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Up / down", "A = edit. Moves enemy health bars relative to the enemy");
+        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to the starting values (blocked while locked)");
+        add_section(SectionDamage, "DAMAGE NUMBERS");
+        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleDamageLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageX, ActionNone, "Left / right", "A = edit. Moves the damage numbers relative to the enemy");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageY, ActionNone, "Up / down", "A = edit. Moves the damage numbers relative to the enemy");
+        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetDamage, "Reset to defaults", "A = back to the starting values (blocked while locked)");
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
@@ -1146,7 +1159,7 @@ private:
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial,\n";
-        s += "#   128 PERFORMANCE, 256 ENEMY BARS AND DAMAGE, 512 ITEM PICKUPS).\n";
+        s += "#   128 PERFORMANCE, 256 ENEMY HEALTH BARS, 512 ITEM PICKUPS, 1024 DAMAGE NUMBERS).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
@@ -1189,6 +1202,7 @@ private:
         s += "# screen_probe (Build 48, diagnostic): 1 = log which game functions turn world positions into screen positions.\n";
         s += fmt::format("screen_probe={}\n", t.screen_probe ? 1 : 0);
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
+        s += fmt::format("damage_locked={}\n", t.damage_locked ? 1 : 0);
         s += "# shift_damage (Build 43): 1 = move the damage numbers by enemy_bar.damage_x / damage_y (off while a crash is tested).\n";
         s += fmt::format("shift_damage={}\n", t.shift_damage ? 1 : 0);
         s += "# marker_fix (Build 50): 1 = enemy bars, damage numbers and world markers corrected for the headset's projection.\n";
@@ -1380,6 +1394,7 @@ private:
                 else if (key == "fix_gauge_vfx") t->fix_gauge_vfx = val != 0.0f;
                 else if (key == "screen_probe") t->screen_probe = val != 0.0f;
                 else if (key == "marker_fix") t->marker_fix = val != 0.0f;
+                else if (key == "damage_locked") t->damage_locked = val != 0.0f;
                 else if (key == "marker_vscale") t->marker_vscale = std::clamp(val, 0.0f, 4.0f);
                 else if (key == "shift_damage") t->shift_damage = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
@@ -1750,7 +1765,7 @@ private:
         }
 
         if (vk == VK_RETURN && row.kind == MenuRow::Kind::Value && !menu_on_invert.load()) {
-            if ((row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) || (row.group == GROUP_ENEMY && t->enemy_locked)) {
+            if ((row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) || (row.group == GROUP_ENEMY && enemy_field_locked(*t, row.field))) {
                 play_click(false);
                 return;
             }
@@ -1783,7 +1798,7 @@ private:
                     return;
                 }
                 if (row.group == GROUP_ENEMY) {
-                    if (t->enemy_locked) {
+                    if (enemy_field_locked(*t, row.field)) {
                         play_click(false);
                         return;
                     }
@@ -1955,14 +1970,23 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset HUD screen");
                     play_click(true);
-                } else if (row.action == ActionResetEnemy) {
-                    if (t->enemy_locked) {
+                } else if (row.action == ActionResetEnemy || row.action == ActionResetDamage) {
+                    const bool dmg = row.action == ActionResetDamage;
+                    if (dmg ? t->damage_locked : t->enemy_locked) {
                         play_click(false);
                         return;
                     }
-                    t->enemy_bar = HudTune{}.enemy_bar;
+                    const auto d = HudTune{}.enemy_bar;
+                    const int f0 = dmg ? DamageX : EnemyX;
+                    t->enemy_bar[f0] = d[f0];
+                    t->enemy_bar[f0 + 1] = d[f0 + 1];
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: reset enemy health bar");
+                    spdlog::info("[PragmataVR] Menu: reset {}", dmg ? "damage numbers" : "enemy health bars");
+                    play_click(true);
+                } else if (row.action == ActionToggleDamageLock) {
+                    t->damage_locked = !t->damage_locked;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: damage numbers {}", t->damage_locked ? "locked" : "unlocked");
                     play_click(true);
                 } else if (row.action == ActionRecenterView) {
                     view_recenter_requested = true;
@@ -2041,7 +2065,7 @@ private:
         }
 
         if (row.group == GROUP_ENEMY) {
-            if (t->enemy_locked) {
+            if (enemy_field_locked(*t, row.field)) {
                 play_click(false);
                 return;
             }
