@@ -29,6 +29,8 @@
 #include "HookManager.hpp"
 #include "mods/MethodDatabase.hpp"
 #include "sdk/RETypeDB.hpp"
+#include "sdk/SceneManager.hpp"
+#include "sdk/REManagedObject.hpp"
 
 namespace pragmata_screen_probe {
 
@@ -50,6 +52,23 @@ inline std::chrono::steady_clock::time_point g_last_report{};
 // Set from the draw callback (render threads) when these elements draw.
 inline std::atomic<int64_t> g_enemy_bar_seen_ms{0};
 inline std::atomic<int64_t> g_damage_seen_ms{0};
+
+// Build 49: detailed samples of app.GuiUtil.transformWorldToScreen (the function Build 48 found behind the enemy bars
+// and damage numbers: app.GuiBehaviorV2.applyPostureData calls it), to work out its units and the correction.
+inline std::atomic<int64_t> g_detail_last_ms{0};
+inline thread_local bool tl_detail_sample = false;
+inline thread_local std::array<uintptr_t, 6> tl_detail_args{};
+
+inline std::string floats_at(uintptr_t p, int n) {
+    if (p < 0x10000 || p > 0x7FFFFFFFFFFFull || IsBadReadPtr((const void*)p, n * sizeof(float))) {
+        return "-";
+    }
+    std::string out{};
+    for (int i = 0; i < n; ++i) {
+        out += fmt::format("{}{:.4f}", i ? "," : "", ((const float*)p)[i]);
+    }
+    return out;
+}
 
 inline int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -133,9 +152,44 @@ inline void install() {
         }
         const size_t idx = g_probe_count;
         g_probes[idx].name = c.full;
+        const bool detail = c.full.rfind("app.GuiUtil.transformWorldToScreen", 0) == 0;
+        if (detail) {
+            std::string pt{};
+            for (auto t : c.m->get_param_types()) {
+                pt += (pt.empty() ? "" : ", ") + (t != nullptr ? t->get_full_name() : std::string{"?"});
+            }
+            auto rt = c.m->get_return_type();
+            spdlog::info("[PragmataVR] Screen probe detail: {} static={} params=({}) returns {}", c.full, c.m->is_static(), pt,
+                         rt != nullptr ? rt->get_full_name() : std::string{"?"});
+        }
         try {
             g_hookman.add(c.m,
-                [idx](std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
+                [idx, detail](std::vector<uintptr_t>& args, std::vector<sdk::RETypeDefinition*>& arg_tys, uintptr_t ret_addr) {
+                    if (detail) {
+                        const auto t = now_ms();
+                        auto last = g_detail_last_ms.load();
+                        tl_detail_sample = t - last >= 2000 && g_detail_last_ms.compare_exchange_strong(last, t);
+                        if (tl_detail_sample) {
+                            for (size_t i = 0; i < tl_detail_args.size(); ++i) {
+                                tl_detail_args[i] = i < args.size() ? args[i] : 0;
+                            }
+                            std::string a{};
+                            for (size_t i = 0; i < args.size() && i < 6; ++i) {
+                                a += fmt::format(" a{}={:x}[{}]", i, args[i], floats_at(args[i], 4));
+                            }
+                            std::string at{};
+                            for (auto ty : arg_tys) {
+                                at += (at.empty() ? "" : ",") + (ty != nullptr ? ty->get_full_name() : std::string{"?"});
+                            }
+                            float fov = -1.0f, aspect = -1.0f;
+                            if (auto cam = sdk::get_primary_camera(); cam != nullptr) {
+                                fov = sdk::call_object_func_easy<float>((REManagedObject*)cam, "get_FOV");
+                                aspect = sdk::call_object_func_easy<float>((REManagedObject*)cam, "get_AspectRatio");
+                            }
+                            spdlog::info("[PragmataVR] Screen probe sample in: n={} types=({}){} caller {} | camera fov {:.3f} aspect {:.4f}",
+                                         args.size(), at, a, MethodDatabase::get()->find_method(ret_addr), fov, aspect);
+                        }
+                    }
                     auto& p = g_probes[idx];
                     const auto k = p.calls.fetch_add(1, std::memory_order_relaxed);
                     if (k % CALLER_SAMPLE_EVERY == 0) {
@@ -146,7 +200,17 @@ inline void install() {
                     }
                     return HookManager::PreHookResult::CALL_ORIGINAL;
                 },
-                [](uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr) {});
+                [detail](uintptr_t& ret_val, sdk::RETypeDefinition* ret_ty, uintptr_t ret_addr) {
+                    if (detail && tl_detail_sample) {
+                        tl_detail_sample = false;
+                        std::string a{};
+                        for (size_t i = 0; i < tl_detail_args.size(); ++i) {
+                            a += fmt::format(" a{}[{}]", i, floats_at(tl_detail_args[i], 4));
+                        }
+                        spdlog::info("[PragmataVR] Screen probe sample out: ret={:x}[{}] ret type {} | args after:{}", ret_val,
+                                     floats_at(ret_val, 4), ret_ty != nullptr ? ret_ty->get_full_name() : std::string{"?"}, a);
+                    }
+                });
             ++g_probe_count;
             spdlog::info("[PragmataVR] Screen probe: hooked {}", c.full);
         } catch (...) {

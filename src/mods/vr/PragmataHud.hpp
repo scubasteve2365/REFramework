@@ -205,7 +205,7 @@ struct HudTune {
 
     // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
     // values in re2_fw_config.txt for them no longer matter.
-    bool render_afw{false};     // false = NATIVE (Two Frame Sequential, both eyes from the same moment), true = AFW
+    bool render_afw{true};      // v0.9.0: AFW is the default for new installs (holds the refresh rate on a Quest 3); NATIVE one toggle away
     bool sharpening{true};      // PureDark's sharpening pass (full resolution, every eye)
     bool desktop_mirror{false}; // copy the headset image to the game window on the monitor (costs GPU time)
     bool perf_log{true};        // performance summary in re2_framework_log.txt every 10 s
