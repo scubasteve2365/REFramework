@@ -266,7 +266,7 @@ private:
             }
             // Build 54: one-time layout dumps of the objective banner and the item pickups element, to find the piece
             // that clips them when Size is below 1.
-            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv) {
+            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv) { // Build 55: tutorial too
                 maybe_dump(view, tg, now, ctx);
             }
         }

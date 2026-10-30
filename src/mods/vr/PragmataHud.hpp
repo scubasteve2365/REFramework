@@ -174,6 +174,14 @@ struct HudTune {
     uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
     bool show_boxes{false};
+    // Build 55: the objective, item pickups and tutorial elements show their content through a fixed window (a
+    // via.gui.Material in main/layout/offset/over) that cut them when Size is below 1. window_layers picks what Size and
+    // position move in those elements: 0 = everything (Builds 21-54), 1 = only the display window (over / under),
+    // 2 = only the content (blur). A test of which one keeps them whole when shrunk.
+    int window_layers{0};
+    // Build 55: draw in NATIVE while a full-screen menu (ui51xx: Firmware Updater, Stamp Club, Bot Database, outfits,
+    // terminals) is open, where AFW leaves trails; back to AFW when it closes. Only applies when render mode is AFW.
+    bool menu_native{true};
     bool hud_fixed{true};    // HUD fixed in the room (Build 12, Steve's standing preference). Off = follows the head
     bool lock_invert{false}; // flips the fixed-HUD correction if it turns out mirrored on some runtime
     bool hide_ghost{true};   // hide Pragmata's offset "aberration" layers (zz_pragmatavr_hide_ghost.lua reads this)
@@ -585,6 +593,8 @@ enum MenuAction : int {
     ActionToggleDamageLock,     // Build 51
     ActionResetDamage,          // Build 51
     ActionToggleShiftDamage,    // Build 43
+    ActionCycleWindowLayers,    // Build 55
+    ActionToggleMenuNative,     // Build 55
 };
 
 class HudTuning {
@@ -1013,12 +1023,16 @@ private:
             "A = write frame time numbers to re2_framework_log.txt every 10 seconds");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleWorldProj, "World HUD projection",
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleMenuNative, "Native in menus",
+            "A = On: full-screen menus (Firmware Updater, terminals...) draw in NATIVE while open, no AFW trails. Off: keep AFW");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
             "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
             "A = Corners (elements cut out where nothing visible is drawn) or Home (at their place in the game layout)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionCycleWindowLayers, "Size moves (test)",
+            "A = cycle what Size and position move in objective, item pickups and tutorial: ALL, WINDOW or CONTENT");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
             "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
         add_row(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
@@ -1178,6 +1192,10 @@ private:
         s += "#   2048 OBJECTIVE).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
+        s += "# window_layers (Build 55 test): 0 = Size / position move all of objective, item pickups and tutorial, 1 = only\n";
+        s += "#   their display window, 2 = only their content. menu_native: 1 = NATIVE while a full-screen menu is open.\n";
+        s += fmt::format("window_layers={}\n", t.window_layers);
+        s += fmt::format("menu_native={}\n", t.menu_native ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
         s += fmt::format("hide_ghost={}\n", t.hide_ghost ? 1 : 0);
@@ -1386,6 +1404,8 @@ private:
                 else if (key == "hack_locked") { t->hack_locked = val != 0.0f; t->locked[GroupHack] = t->hack_locked; } // old files
                 else if (key == "collapsed") t->collapsed = (uint32_t)std::max(0.0f, val);
                 else if (key == "show_boxes") t->show_boxes = val != 0.0f;
+                else if (key == "window_layers") t->window_layers = std::clamp((int)val, 0, 2);
+                else if (key == "menu_native") t->menu_native = val != 0.0f;
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
                 else if (key == "hide_ghost") t->hide_ghost = val != 0.0f;
@@ -1886,6 +1906,16 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: enemy health bars {}", t->enemy_locked ? "locked" : "unlocked");
                     play_click(true);
+                } else if (row.action == ActionCycleWindowLayers) {
+                    t->window_layers = (t->window_layers + 1) % 3;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: Size moves {}", t->window_layers == 0 ? "ALL" : (t->window_layers == 1 ? "WINDOW" : "CONTENT"));
+                    play_click(true);
+                } else if (row.action == ActionToggleMenuNative) {
+                    t->menu_native = !t->menu_native;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: native in menus {}", t->menu_native ? "on" : "off");
+                    play_click(true);
                 } else if (row.action == ActionToggleDamageLock) {
                     // Build 52: the Lock row is a Toggle row; Build 51 handled it in the Action branch, so A did nothing.
                     t->damage_locked = !t->damage_locked;
@@ -2306,6 +2336,14 @@ struct AnchoredBox {
 // Build 28: the frame (VR frame count) each element last drew in FLAT / ANCHORED. Its box is only used while it draws,
 // so menus and windows that hide the HUD are not cut.
 inline std::array<std::atomic<int>, GroupCount> g_group_drawn_frame{};
+
+// Build 55: last time (steady clock ms) a full-screen menu GUI (ui51xx) was drawn; render threads write, the frame reads.
+inline std::atomic<int64_t> g_menu_drawn_ms{0};
+
+// Build 55: a full-screen menu GUI: ui5100Gui to ui5199Gui.
+inline bool is_fullscreen_menu(std::string_view name) {
+    return name.size() == 9 && name.compare(0, 4, "ui51") == 0 && name.compare(6, 3, "Gui") == 0;
+}
 
 // Build 39: where Fixed mode draws an element in the UI buffer, as a shift in canvas pixels from its own place (after
 // its size). With fixed_capture_corners each element goes to a corner of the buffer: tutorial top left, weapon wheel top

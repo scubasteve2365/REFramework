@@ -3457,6 +3457,15 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value_color = t.show_boxes ? AMBER : ACCENT;
             v.dim = !t.hud_panel; // ANCHORED only
             break;
+        case pragmatavr::ActionCycleWindowLayers:
+            v.value = t.window_layers == 0 ? "ALL" : (t.window_layers == 1 ? "WINDOW" : "CONTENT");
+            v.value_color = t.window_layers == 0 ? ACCENT : AMBER;
+            break;
+        case pragmatavr::ActionToggleMenuNative:
+            v.value = t.menu_native ? "ON" : "OFF";
+            v.value_color = t.menu_native ? ACCENT : AMBER;
+            v.dim = !t.render_afw; // only matters in AFW
+            break;
         case pragmatavr::ActionToggleFlatScreen:
             v.value = t.flat_screen || t.hud_panel ? "SCREEN" : "WORLD";
             v.value_color = t.flat_screen || t.hud_panel ? ACCENT : AMBER;
@@ -3712,7 +3721,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B54");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B55");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3805,7 +3814,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B54"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B54");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B55"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B55");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4051,7 +4060,15 @@ void VR::on_present() {
     // The ini is the source of truth; re2_fw_config.txt values for them are overridden.
     {
         const auto pt = pragmatavr::HudTuning::get().tune();
-        const int want_technique = pt->render_afw ? ALTERNATE_FRAME_WARPING : SEQUENTIAL_FRAME;
+        // Build 55: NATIVE while a full-screen menu is open (drawn in the last second), if menu_native is on.
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const bool in_menu = pt->menu_native && now_ms - pragmatavr::g_menu_drawn_ms.load(std::memory_order_relaxed) < 1000;
+        static bool last_in_menu = false;
+        if (pt->render_afw && in_menu != last_in_menu) {
+            spdlog::info("[PragmataVR] Full-screen menu {}: render {}", in_menu ? "open" : "closed", in_menu ? "NATIVE" : "AFW");
+        }
+        last_in_menu = in_menu;
+        const int want_technique = pt->render_afw && !in_menu ? ALTERNATE_FRAME_WARPING : SEQUENTIAL_FRAME;
         bool changed = false;
 
         if (m_rendering_technique->value() != want_technique) {
@@ -4740,6 +4757,18 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
         pragmatavr::g_current_gui_hash = name_hash;
         pragmatavr::g_current_gui_name = name;
 
+        // Build 55: note full-screen menus (NATIVE while they are open, see VR::on_frame).
+        if (pragmatavr::is_fullscreen_menu(name)) {
+            pragmatavr::g_menu_drawn_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+            static std::mutex menu_log_mtx{};
+            static std::unordered_map<size_t, bool> menu_logged{};
+            std::scoped_lock _{menu_log_mtx};
+            if (menu_logged.emplace(name_hash, true).second) {
+                spdlog::info("[PragmataVR] Full-screen menu drawn: {}", name);
+            }
+        }
+
         // Build 40-44 shifted enemy health bars and damage numbers by writing their pieces' positions here. The game
         // spawns and removes those pieces constantly and the writes crashed it (Builds 41-44, Quest 3). Build 45: they
         // are shifted in the GUI camera projection hook instead (no game object is touched).
@@ -4857,7 +4886,50 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         }
 
                         auto c = sdk::call_object_func<REManagedObject*>(fview, "get_Child", context, fview);
+                        // Build 55: objective, item pickups and tutorial: optionally move only main/layout/offset's display
+                        // window (over / under) or only its content (blur), see HudTune::window_layers.
+                        int layer_mode = 0;
+                        if (ftune->window_layers != 0 && (fgroup == pragmatavr::GroupObjective || fgroup == pragmatavr::GroupItems ||
+                                                          fgroup == pragmatavr::GroupTutorial)) {
+                            const auto child_named = [&](REManagedObject* parent, std::string_view want) -> REManagedObject* {
+                                auto ch = sdk::call_object_func<REManagedObject*>(parent, "get_Child", context, parent);
+                                for (int i = 0; ch != nullptr && i < 32; ++i) {
+                                    auto nm = sdk::call_object_func<SystemString*>(ch, "get_Name", context, ch);
+                                    if (nm != nullptr && utility::re_string::get_string(nm) == want) {
+                                        return ch;
+                                    }
+                                    ch = sdk::call_object_func<REManagedObject*>(ch, "get_Next", context, ch);
+                                }
+                                return nullptr;
+                            };
+                            auto m = child_named(fview, "main");
+                            auto l = m != nullptr ? child_named(m, "layout") : nullptr;
+                            auto o = l != nullptr ? child_named(l, "offset") : nullptr;
+                            if (o != nullptr) {
+                                c = sdk::call_object_func<REManagedObject*>(o, "get_Child", context, o);
+                                layer_mode = ftune->window_layers;
+                            }
+                            static std::mutex layer_log_mtx{};
+                            static std::unordered_map<size_t, int> layer_logged{};
+                            std::scoped_lock _{layer_log_mtx};
+                            auto& ll = layer_logged[name_hash];
+                            if (ll != ftune->window_layers + 1) {
+                                ll = ftune->window_layers + 1;
+                                spdlog::info("[PragmataVR] Size moves {} in {}{}", ftune->window_layers == 1 ? "WINDOW" : "CONTENT", name,
+                                             o != nullptr ? "" : " (no main/layout/offset, all moved)");
+                            }
+                        }
                         for (int n = 0; c != nullptr && n < 64; ++n) {
+                            if (layer_mode != 0) {
+                                auto nm = sdk::call_object_func<SystemString*>(c, "get_Name", context, c);
+                                const auto cn = nm != nullptr ? utility::re_string::get_string(nm) : std::string{};
+                                const bool display = cn == "over" || cn == "under";
+                                const bool content = cn == "blur";
+                                if ((layer_mode == 1 && !display) || (layer_mode == 2 && !content)) {
+                                    c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
+                                    continue;
+                                }
+                            }
                             PragmataChildRestore cr{};
                             cr.obj = c;
                             cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
