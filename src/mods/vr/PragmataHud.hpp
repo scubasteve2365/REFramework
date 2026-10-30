@@ -1868,7 +1868,13 @@ private:
                 } else if (row.action == ActionToggleEnemyLock) {
                     t->enemy_locked = !t->enemy_locked;
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: enemy bars and damage {}", t->enemy_locked ? "locked" : "unlocked");
+                    spdlog::info("[PragmataVR] Menu: enemy health bars {}", t->enemy_locked ? "locked" : "unlocked");
+                    play_click(true);
+                } else if (row.action == ActionToggleDamageLock) {
+                    // Build 52: the Lock row is a Toggle row; Build 51 handled it in the Action branch, so A did nothing.
+                    t->damage_locked = !t->damage_locked;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: damage numbers {}", t->damage_locked ? "locked" : "unlocked");
                     play_click(true);
                 } else if (row.action == ActionToggleHackBackdrop) {
                     t->hide_hack_backdrop = !t->hide_hack_backdrop;
@@ -1982,11 +1988,6 @@ private:
                     t->enemy_bar[f0 + 1] = d[f0 + 1];
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset {}", dmg ? "damage numbers" : "enemy health bars");
-                    play_click(true);
-                } else if (row.action == ActionToggleDamageLock) {
-                    t->damage_locked = !t->damage_locked;
-                    commit(t);
-                    spdlog::info("[PragmataVR] Menu: damage numbers {}", t->damage_locked ? "locked" : "unlocked");
                     play_click(true);
                 } else if (row.action == ActionRecenterView) {
                     view_recenter_requested = true;
