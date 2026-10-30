@@ -32,7 +32,12 @@ public:
 
 private:
     ModKey::Ptr m_menu_key{ ModKey::create(generate_name("MenuKey_V2"), VK_INSERT) };
+#if defined(PRAGMATA)
+    // PragmataVR v0.9.0: REFramework's own menu is not visible in the headset; keep it closed at launch.
+    ModToggle::Ptr m_menu_open{ ModToggle::create(generate_name("MenuOpen"), false) };
+#else
     ModToggle::Ptr m_menu_open{ ModToggle::create(generate_name("MenuOpen"), true) };
+#endif
     ModToggle::Ptr m_remember_menu_state{ ModToggle::create(generate_name("RememberMenuState"), false) };
 #ifdef RE8
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("DrawCursorWithMenuOpen"), true) };

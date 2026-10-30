@@ -222,6 +222,14 @@ void Graphics::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
     }
+#if defined(PRAGMATA)
+    // PragmataVR v0.9.0: the fix fits the game's view and UI to the render size, which in VR is the headset's eye image
+    // (not the monitor), so it is needed on every system. Without it the Fixed HUD panel stays empty. Always on.
+    if (!m_ultrawide_fix->value()) {
+        spdlog::info("[PragmataVR] Ultrawide/FOV fix was off in re2_fw_config.txt; turned on (Pragmata VR needs it)");
+    }
+    m_ultrawide_fix->value() = true;
+#endif
 }
 
 void Graphics::on_config_save(utility::Config& cfg) {

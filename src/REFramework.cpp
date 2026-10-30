@@ -250,9 +250,31 @@ try {
     spdlog::error("ldr_notification_callback: Unknown exception occurred");
 }
 
+#if defined(PRAGMATA)
+// PragmataVR v0.9.0: keep the previous launch's log (and a crash dump next to it) so a player who relaunched after a
+// crash can still send it. re2_framework_log.txt -> re2_framework_log_prev.txt before the new log is created.
+static std::string pragmatavr_rotate_log() {
+    const auto log = REFramework::get_persistent_dir("re2_framework_log.txt");
+    try {
+        std::error_code ec{};
+        if (std::filesystem::exists(log, ec)) {
+            const auto prev = REFramework::get_persistent_dir("re2_framework_log_prev.txt");
+            std::filesystem::remove(prev, ec);
+            std::filesystem::rename(log, prev, ec);
+        }
+    } catch (...) {
+    }
+    return log.string();
+}
+#endif
+
 REFramework::REFramework(HMODULE reframework_module)
     : m_game_module{GetModuleHandle(0)}
+#if defined(PRAGMATA)
+    , m_logger{spdlog::basic_logger_mt("REFramework", pragmatavr_rotate_log(), true)}
+#else
     , m_logger{spdlog::basic_logger_mt("REFramework", (get_persistent_dir("re2_framework_log.txt")).string(), true)}
+#endif
     {
 
     s_reframework_module = reframework_module;

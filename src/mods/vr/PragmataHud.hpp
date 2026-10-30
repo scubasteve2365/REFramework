@@ -232,7 +232,7 @@ struct HudTune {
     bool fix_label{true};     // ui3010Gui location label brightness
     bool fix_door_vfx{true};  // ui3500Gui / ui3510Gui VFXtex effect textures hidden
     bool fix_gauge_vfx{true}; // ui2130Gui hackingGauge_VFX effect texture hidden
-    bool screen_probe{true};  // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers
+    bool screen_probe{false}; // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers (ini only)
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
     // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).

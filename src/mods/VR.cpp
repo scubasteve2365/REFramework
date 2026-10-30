@@ -1308,6 +1308,38 @@ std::optional<std::string> VR::on_initialize_d3d_thread() try {
     // #############################
     // #Frame Warp Module Start
     // #############################
+#if defined(PRAGMATA)
+    // PragmataVR v0.9.0: PureDark's AFW plugin is delay-loaded and InitDevice below needs it even in Native mode. A missing
+    // file would crash the game at startup; say what is wrong instead and run without VR. Also note the files that differ
+    // from the tested versions (a game patch or a different plugin build may need an update of the mod).
+    {
+        wchar_t exe_path[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        const auto game_dir = std::filesystem::path{exe_path}.parent_path();
+        const auto plugin = game_dir / L"PDAFWPlugin.dll";
+        std::error_code ec{};
+        if (!std::filesystem::exists(plugin, ec) || LoadLibraryW(plugin.c_str()) == nullptr) {
+            spdlog::error("[PragmataVR] PDAFWPlugin.dll is missing or cannot be loaded from {}. VR is off for this launch.", game_dir.string());
+            MessageBoxW(nullptr,
+                L"PDAFWPlugin.dll is missing from the PRAGMATA game folder, or Windows blocked it.\n\n"
+                L"Extract the whole Pragmata VR zip into the game folder again (next to PRAGMATA.exe).\n"
+                L"The game will start without VR this time.",
+                L"Pragmata VR", MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND);
+            return "PDAFWPlugin.dll missing (see the Pragmata VR README)";
+        }
+        const auto plugin_size = std::filesystem::file_size(plugin, ec);
+        if (!ec && plugin_size != 534528) {
+            spdlog::warn("[PragmataVR] PDAFWPlugin.dll is {} bytes; Pragmata VR was tested with RE9 AFW beta.6 (534528 bytes)", plugin_size);
+        }
+        const auto exe_size = std::filesystem::file_size(std::filesystem::path{exe_path}, ec);
+        if (!ec && exe_size != 378448800) {
+            spdlog::warn("[PragmataVR] PRAGMATA.exe is {} bytes; Pragmata VR v0.9.0 was tested with game version 1.3.0.0 "
+                         "(378448800 bytes). A game update may need a mod update.", exe_size);
+        } else if (!ec) {
+            spdlog::info("[PragmataVR] PRAGMATA.exe matches the tested game version 1.3.0.0");
+        }
+    }
+#endif
     auto& hook = g_framework->get_d3d12_hook();
     hook->get_command_queue();
     pd::DeviceParams params{};
@@ -3676,7 +3708,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 48");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B49");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3769,7 +3801,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 48"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 48");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B49"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B49");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
