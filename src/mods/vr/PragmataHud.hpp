@@ -228,7 +228,9 @@ struct HudTune {
     // numbers (ui3201Gui) get their own pair, starting at the same values.
     // Build 50: the markers are now placed by the world-to-screen correction (PragmataMarkerFix.hpp); these are only a
     // fine-tune on top, in canvas px (ini marker_trim.*; the old enemy_bar.* lines are ignored).
-    std::array<float, 4> enemy_bar{0.0f, 0.0f, 0.0f, 0.0f};
+    // Build 53: Steve's Quest 3 (Virtual Desktop) tuning is the default for new installs: health bars x 0, y -85; damage
+    // numbers x 25, y -100 (beside and above the bar).
+    std::array<float, 4> enemy_bar{0.0f, -85.0f, 25.0f, -100.0f};
     std::array<bool, 4> enemy_bar_invert{};
     // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
     bool hide_hack_backdrop{true};
