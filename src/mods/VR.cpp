@@ -3415,7 +3415,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
 
     switch (row.kind) {
     case Kind::Value:
-        v.show_invert = true;
+        v.show_invert = false; // v0.9.0: INV boxes removed (directions fixed in code)
         if (row.group == pragmatavr::GROUP_SCREEN) {
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
@@ -3666,8 +3666,9 @@ void VR::on_frame() {
         value_w = (std::max)(value_w, text_w(bold, fs, s));
     }
 
-    const float invert_w = box + std::round(fs * 0.3f) + text_w(bold, small_size, "INV");
-    const float invert_gap = std::round(gap * 0.7f);
+    // v0.9.0: no INV boxes, so no room is kept for them.
+    const float invert_w = 0.0f;
+    const float invert_gap = 0.0f;
 
     std::array<float, 2> col_w{};
     std::array<std::array<float, 2>, 2> col_h{};                 // [band][column]

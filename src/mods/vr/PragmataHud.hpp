@@ -1201,12 +1201,12 @@ private:
         s += "# PragmataVR 3D HUD tuning. Saved changes apply within about a second, no restart needed.\n";
         s += "# The VR mod menu (both thumbsticks or F1) rewrites this file whenever a value changes.\n";
         s += "# Menu: both thumbsticks or F1 open/close. D-pad / arrows navigate, A / Enter edits the highlighted value\n";
-        s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), flips a highlighted INV box, or runs an action.\n";
+        s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
         s += "# <element>.flat_size / .flat_x / .flat_y / .flat_gap: the values used in Fixed and Follows Head modes (canvas pixels, flat_y positive = down).\n";
         s += "# scale_about_center = 1: size grows each element around its own center (hack always uses the panel origin).\n";
-        s += "# <group>.<field>.invert = 1 flips the direction Left/Right changes that value in the menu.\n";
+        s += "# <group>.<field>.invert lines are ignored since v0.9.0 (the INV boxes are gone; directions are fixed in code).\n";
         s += "# hack_locked = 1 stops the menu changing the hacking circle.\n";
         s += fmt::format("ini_version={}\n", INI_VERSION);
         s += fmt::format("enabled={}\n", t.enabled ? 1 : 0);
@@ -1476,7 +1476,7 @@ private:
             if (group_key == "menu") {
                 for (int i = 0; i < (int)MENU_KEYS.size(); ++i) {
                     if (rest == MENU_KEYS[i]) {
-                        if (is_invert) t->menu_invert[i] = val != 0.0f;
+                        if (is_invert) t->menu_invert[i] = false; // v0.9.0: INV boxes removed (directions fixed in code)
                         else if (i == MenuClickVolume && file_version < INI_VERSION_CLICK_SCALE) t->menu[i] = std::clamp(val * 5.0f, MENU_MIN[i], MENU_MAX[i]);
                         else t->menu[i] = std::clamp(val, MENU_MIN[i], MENU_MAX[i]);
                     }
@@ -1491,7 +1491,7 @@ private:
             if (group_key == "marker_trim") { // Build 50 (old enemy_bar.* values were for the removed manual shift)
                 for (int i = 0; i < EnemyFieldCount; ++i) {
                     if (rest == ENEMY_KEYS[i]) {
-                        if (is_invert) t->enemy_bar_invert[i] = val != 0.0f;
+                        if (is_invert) t->enemy_bar_invert[i] = false; // v0.9.0: INV boxes removed
                         else t->enemy_bar[i] = std::clamp(val, -ENEMY_MAX, ENEMY_MAX);
                     }
                 }
@@ -1501,7 +1501,7 @@ private:
             if (group_key == "screen") {
                 for (int i = 0; i < 4; ++i) {
                     if (rest == SCREEN_KEYS[i]) {
-                        if (is_invert) t->screen_invert[i] = val != 0.0f;
+                        if (is_invert) t->screen_invert[i] = false; // v0.9.0: INV boxes removed
                         else t->screen[i] = std::clamp(val, SCREEN_MIN[i], SCREEN_MAX[i]);
                     }
                 }
@@ -1545,7 +1545,7 @@ private:
                     }
 
                     if (is_invert) {
-                        gt.invert[fi] = val != 0.0f;
+                        gt.invert[fi] = false; // v0.9.0: INV boxes removed (directions fixed in code)
                         continue;
                     }
 
@@ -1641,14 +1641,10 @@ private:
         const bool is_value = row.kind == MenuRow::Kind::Value;
         const bool on_inv = menu_on_invert.load() && is_value;
 
-        if (dir > 0 && is_value && !on_inv) {
-            menu_on_invert = true;
-            return true;
-        }
-        if (dir < 0 && on_inv) {
-            menu_on_invert = false;
-            return true;
-        }
+        // v0.9.0: the INV boxes are gone; Left / Right goes straight to the other column.
+        menu_on_invert = false;
+        (void)is_value;
+        (void)on_inv;
 
         const int target_col = row.column + dir;
         if (target_col < 0 || target_col > 1) {
@@ -1672,8 +1668,7 @@ private:
         }
 
         menu_selected = best;
-        // Coming in from the right, land on the INV box (the nearest thing on that side).
-        menu_on_invert = dir < 0 && m_rows[best].kind == MenuRow::Kind::Value;
+        menu_on_invert = false;
         return true;
     }
 
