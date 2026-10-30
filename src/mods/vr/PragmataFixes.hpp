@@ -60,6 +60,7 @@
 
 #include "PragmataHud.hpp"
 #include "PragmataScreenProbe.hpp"
+#include "PragmataMarkerFix.hpp"
 
 class PragmataFixes : public Mod {
 public:
@@ -114,6 +115,7 @@ public:
             spdlog::info("[PragmataVR] Fixes: HUD fixes run on the main thread before PrerenderGUI (Build 46)");
         }
         apply();
+        pragmata_marker_fix::install(); // Build 50, once
         if (pragmatavr::HudTuning::get().tune()->screen_probe) {
             pragmata_screen_probe::install(); // Build 48, once
             pragmata_screen_probe::report();

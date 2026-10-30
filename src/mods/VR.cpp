@@ -347,8 +347,9 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
                 // move them on screen by offsetting the projection while they draw (canvas pixels -> NDC; the canvas is
                 // fitted to the eye image width).
                 const auto gh = pragmatavr::g_current_gui_hash;
-                const bool is_bar = gh == "ui3200Gui"_fnv || gh == "ui3210Gui"_fnv;
-                const bool is_damage = gh == "ui3201Gui"_fnv && tune->shift_damage;
+                // Build 50: retired (never fired; markers are corrected in PragmataMarkerFix.hpp, marker_trim applies there).
+                const bool is_bar = false && (gh == "ui3200Gui"_fnv || gh == "ui3210Gui"_fnv);
+                const bool is_damage = false && gh == "ui3201Gui"_fnv && tune->shift_damage;
                 if (is_bar || is_damage) {
                     const int f = is_damage ? pragmatavr::DamageX : pragmatavr::EnemyX;
                     const float w = (float)vr->get_hmd_width();
@@ -3422,8 +3423,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
         } else if (row.group == pragmatavr::GROUP_ENEMY) {
             v.value = fmt::format("{:+.0f}", t.enemy_bar[row.field]);
             v.invert_on = t.enemy_bar_invert[row.field];
-            v.dim = !(t.flat_test && t.world_headset) || t.enemy_locked || // Build 40: headset projection only. Build 42: lock
-                    (row.field >= pragmatavr::DamageX && !t.shift_damage);   // Build 43: damage shift off
+            v.dim = t.enemy_locked; // Build 50: fine-tune on top of the automatic marker placement
         } else if (row.group == pragmatavr::GROUP_MENU) {
             v.value = pragmatavr::HudTuning::format_menu(t, row.field);
             v.invert_on = t.menu_invert[row.field];
@@ -3708,7 +3708,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B49");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B50");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3801,7 +3801,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B49"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B49");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B50"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B50");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);

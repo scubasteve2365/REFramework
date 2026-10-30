@@ -223,7 +223,9 @@ struct HudTune {
     bool fixed_capture_corners{true};
     // Build 40: enemy health bar shift (GROUP_ENEMY). Build 41: Steve's Quest 3 values (x 200, y 170), and the damage
     // numbers (ui3201Gui) get their own pair, starting at the same values.
-    std::array<float, 4> enemy_bar{200.0f, 170.0f, 200.0f, 170.0f};
+    // Build 50: the markers are now placed by the world-to-screen correction (PragmataMarkerFix.hpp); these are only a
+    // fine-tune on top, in canvas px (ini marker_trim.*; the old enemy_bar.* lines are ignored).
+    std::array<float, 4> enemy_bar{0.0f, 0.0f, 0.0f, 0.0f};
     std::array<bool, 4> enemy_bar_invert{};
     // Build 41: hide the dark backdrop pieces of the door / lock hacking HUD (ui3500Gui, ui3510Gui) while it draws.
     bool hide_hack_backdrop{true};
@@ -232,6 +234,8 @@ struct HudTune {
     bool fix_label{true};     // ui3010Gui location label brightness
     bool fix_door_vfx{true};  // ui3500Gui / ui3510Gui VFXtex effect textures hidden
     bool fix_gauge_vfx{true}; // ui2130Gui hackingGauge_VFX effect texture hidden
+    bool marker_fix{true};      // Build 50: correct enemy bars / damage numbers / world markers for the headset projection
+    float marker_vscale{1.6f};  // Build 50: vertical factor of that correction (1.6 matched the Quest 3 by eye)
     bool screen_probe{false}; // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers (ini only)
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
@@ -957,9 +961,14 @@ private:
         add_element(GroupHealth);
         add_element(GroupStamina);
         add_element(GroupItems); // Build 47
-        // Build 48: ENEMY BARS AND DAMAGE hidden for the pre-release. Its shift never took effect (Build 45: the GUI camera
-        // projection is not requested per element) and moving the markers' pieces crashed the game (Builds 41-44). The
-        // proper fix hooks the game's world-to-screen function (see PragmataScreenProbe.hpp).
+        // Build 50: ENEMY MARKERS. Placement is automatic (PragmataMarkerFix.hpp); these rows are a fine-tune only.
+        add_section(SectionEnemy, "ENEMY MARKERS");
+        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock these values (locked = they cannot change)");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Fine-tune left / right",
+            "A = edit. Only if enemy health bars and damage numbers still sit beside the enemy on your headset");
+        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Fine-tune up / down",
+            "A = edit. Only if enemy health bars and damage numbers still sit above or below the enemy on your headset");
+        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to no fine-tune (automatic placement only)");
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
@@ -1182,9 +1191,13 @@ private:
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
         s += "# shift_damage (Build 43): 1 = move the damage numbers by enemy_bar.damage_x / damage_y (off while a crash is tested).\n";
         s += fmt::format("shift_damage={}\n", t.shift_damage ? 1 : 0);
+        s += "# marker_fix (Build 50): 1 = enemy bars, damage numbers and world markers corrected for the headset's projection.\n";
+        s += "#   marker_vscale = vertical factor of that correction. marker_trim.x / .y = fine-tune in canvas px (y positive = down).\n";
+        s += fmt::format("marker_fix={}\n", t.marker_fix ? 1 : 0);
+        s += fmt::format("marker_vscale={:.3f}\n", t.marker_vscale);
         for (int i = 0; i < EnemyFieldCount; ++i) {
-            s += fmt::format("enemy_bar.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
-            s += fmt::format("enemy_bar.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
+            s += fmt::format("marker_trim.{}={:.2f}\n", ENEMY_KEYS[i], t.enemy_bar[i]);
+            s += fmt::format("marker_trim.{}.invert={}\n", ENEMY_KEYS[i], t.enemy_bar_invert[i] ? 1 : 0);
         }
         s += fmt::format("hack.headset_size={:.4f}\n", t.hack_headset.size);
         s += fmt::format("hack.headset_x={:.2f}\n", t.hack_headset.x);
@@ -1366,6 +1379,8 @@ private:
                 else if (key == "fix_door_vfx") t->fix_door_vfx = val != 0.0f;
                 else if (key == "fix_gauge_vfx") t->fix_gauge_vfx = val != 0.0f;
                 else if (key == "screen_probe") t->screen_probe = val != 0.0f;
+                else if (key == "marker_fix") t->marker_fix = val != 0.0f;
+                else if (key == "marker_vscale") t->marker_vscale = std::clamp(val, 0.0f, 4.0f);
                 else if (key == "shift_damage") t->shift_damage = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.
@@ -1394,7 +1409,7 @@ private:
                 t->enemy_locked = val != 0.0f;
                 continue;
             }
-            if (group_key == "enemy_bar") {
+            if (group_key == "marker_trim") { // Build 50 (old enemy_bar.* values were for the removed manual shift)
                 for (int i = 0; i < EnemyFieldCount; ++i) {
                     if (rest == ENEMY_KEYS[i]) {
                         if (is_invert) t->enemy_bar_invert[i] = val != 0.0f;
