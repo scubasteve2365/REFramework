@@ -3676,7 +3676,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 46");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "BUILD 47");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3769,7 +3769,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "BUILD 46"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 46");
+        put(font, small_size, right - text_w(font, small_size, "BUILD 47"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "BUILD 47");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4838,11 +4838,20 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         g_pragmata_panel_restore.push_back(std::move(restore));
                     }
 
-                    static thread_local std::unordered_map<size_t, int> logged_flat{};
+                    // Build 47: shared by all render threads (one map per thread logged the same line many times a second).
+                    static std::mutex logged_flat_mtx{};
+                    static std::unordered_map<size_t, int> logged_flat{};
                     const int fgen = pragmatavr::HudTuning::get().companion_generation.load();
-                    auto lit = logged_flat.find(name_hash);
-                    if (lit == logged_flat.end() || lit->second != fgen) {
-                        logged_flat[name_hash] = fgen;
+                    bool log_flat = false;
+                    {
+                        std::scoped_lock _{logged_flat_mtx};
+                        auto lit = logged_flat.find(name_hash);
+                        if (lit == logged_flat.end() || lit->second != fgen) {
+                            logged_flat[name_hash] = fgen;
+                            log_flat = true;
+                        }
+                    }
+                    if (log_flat) {
                         const auto vt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 99u;
                         // Build 24: does this GUI draw into its own render target (an image shown elsewhere)?
                         void* rt = nullptr;

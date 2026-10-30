@@ -45,6 +45,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -74,7 +75,8 @@ enum Group : int {
     GroupStamina = 2,
     GroupWeapons = 3,
     GroupTutorial = 4,
-    GroupCount = 5,
+    GroupItems = 5, // Build 47: item pickups (ui2120Gui, top right on a monitor: the cubes collected, etc.)
+    GroupCount = 6,
 };
 
 enum Field : int {
@@ -85,9 +87,9 @@ enum Field : int {
     FieldCount = 4,
 };
 
-inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial"};
-inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box"};
-inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX"};
+inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial", "items"};
+inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box", "Item pickups"};
+inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX", "ITEM PICKUPS"};
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
@@ -119,6 +121,7 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
     {960.0f, 1001.0f}, // stamina
     {1612.0f, 877.0f}, // weapon wheel
     {305.0f, 300.0f},  // tutorial box
+    {1640.0f, 200.0f}, // Build 47: item pickups (estimate, top right; the content extent log measures it)
 }};
 
 // Build 25: each element's area in the game's own layout (canvas pixels, 1920 x 1080, x0 y0 x1 y1), with a margin. From
@@ -133,6 +136,7 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
                                         // Build 31 captures; the old box was about 3x the wheel and took in other HUD)
     {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
+    {1300.0f, 0.0f, 1920.0f, 420.0f},  // Build 47: item pickups, generous estimate of the top right notice (to be measured)
 }};
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
@@ -160,7 +164,7 @@ struct HudTune {
     bool log_elements{true};
     bool hack_locked{true}; // Build 25: kept for old ini files; the locks are now per element (locked[])
     // Build 25: per-element lock. While locked, the menu cannot change that element's values in any HUD mode.
-    std::array<bool, GroupCount> locked{true, true, true, true, true};
+    std::array<bool, GroupCount> locked{true, true, true, true, true, false}; // Build 47: item pickups start unlocked (untuned)
     // Build 25: mod menu sections that are collapsed (bit per MenuSection). DEVELOPER starts collapsed.
     uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
@@ -279,11 +283,13 @@ struct HudTune {
         set_flat(GroupStamina, 0.999f, 0.0f, -100.0f);
         set_flat(GroupWeapons, 0.7896f, -100.0f, 200.0f);
         set_flat(GroupTutorial, 0.7299f, 360.0f, 70.0f);
+        set_flat(GroupItems, 0.75f, -350.0f, 150.0f); // Build 47: starting guess, smaller and pulled in from the top right corner
         flat_groups[GroupHack].gap = 80.0f;
         flat_groups[GroupHealth].gap = 240.0f;
         flat_groups[GroupStamina].gap = 240.0f;
         flat_groups[GroupWeapons].gap = 200.0f;
         flat_groups[GroupTutorial].gap = 250.0f;
+        flat_groups[GroupItems].gap = 200.0f;
         apply_hud_mode();
     }
 };
@@ -330,6 +336,7 @@ inline int group_for(std::string_view name) {
     // tutorial group: FLAT shrank it with the tutorial box values and ANCHORED cut a piece of it onto the panel. It is a
     // Screen view and is now drawn like the game's other menus.
     if (name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
+    if (name == "ui2120Gui") return GroupItems; // Build 47: item pickups (HUD Controls calls it "Inventory Items")
     return -1;
 }
 
@@ -343,6 +350,7 @@ inline int companion_group(std::string_view name, std::string_view& partner) {
     if (name == "ui2141Gui") { partner = "ui2140Gui"; return GroupStamina; }
     if (name == "ui2151Gui") { partner = "ui2150Gui"; return GroupWeapons; }
     if (name == "ui2101Gui") { partner = "ui2100Gui"; return GroupTutorial; }
+    if (name == "ui2121Gui") { partner = "ui2120Gui"; return GroupItems; } // Build 47: if the game has this companion
     return -1;
 }
 
@@ -450,7 +458,12 @@ enum MenuSection : int {
     SectionElement0 = 2, // + Group
     SectionPerformance = 7, // Build 35 (after the five element sections, bits 2 to 6)
     SectionEnemy = 8,       // Build 42: ENEMY BARS AND DAMAGE
+    SectionItems = 9,       // Build 47: ITEM PICKUPS (bit 7 was already taken by PERFORMANCE)
 };
+
+inline int section_for_group(int g) {
+    return g == GroupItems ? SectionItems : SectionElement0 + g;
+}
 
 inline bool section_collapsed(uint32_t collapsed, int section) {
     return section >= 0 && section < 32 && (collapsed & (1u << section)) != 0;
@@ -905,7 +918,7 @@ private:
             m_rows.back().section = sec;
         };
         const auto add_element = [&](int g) {
-            add_section(SectionElement0 + g, GROUP_TITLES[g]);
+            add_section(section_for_group(g), GROUP_TITLES[g]);
             m_rows.back().group = g;
             add_row(MenuRow::Kind::Toggle, g, -1, ActionToggleHackLock, "Lock", "A = lock or unlock this element (locked = its values cannot change)");
             add_row(MenuRow::Kind::Value, g, FieldSize, ActionNone, "Size", "A = edit. Grows or shrinks this element where it is");
@@ -942,6 +955,7 @@ private:
         column = 0;
         add_element(GroupHealth);
         add_element(GroupStamina);
+        add_element(GroupItems); // Build 47
         add_section(SectionEnemy, "ENEMY BARS AND DAMAGE");
         add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock these values (locked = they cannot change)");
         add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Health bar left / right", "A = edit. Moves enemy health bars to sit over the enemy");
@@ -1022,9 +1036,13 @@ public:
             }
         }
         const auto current = copy_current();
+        const auto use_key = nearest_profile(key);
         {
             std::scoped_lock _{profile_mtx()};
-            profile_name() = key;
+            profile_name() = use_key;
+        }
+        if (use_key != key) {
+            spdlog::info("[PragmataVR] HUD settings: headset reports {}, using the existing profile {} (same runtime, FOV within 3 degrees)", key, use_key);
         }
         std::error_code ec{};
         const auto p = path();
@@ -1042,6 +1060,58 @@ public:
     }
 
 private:
+
+    // Build 47: the Pimax reported 90x82, 91x83, 92x84 and 93x85 on different days, and each new key made a new profile
+    // from untuned values. If there is no file for the exact key, use the existing profile of the same runtime whose
+    // FOV is closest (within 3 degrees in each direction).
+    static std::string nearest_profile(const std::string& key) {
+        std::error_code ec{};
+        const auto dir = data_dir();
+        if (std::filesystem::exists(dir / ("pragmatavr_hud_" + key + ".ini"), ec)) {
+            return key;
+        }
+        const auto us = key.rfind('_');
+        const auto ux = key.rfind('x');
+        if (us == std::string::npos || ux == std::string::npos || ux < us) {
+            return key;
+        }
+        const auto runtime = key.substr(0, us);
+        int w = 0, h = 0;
+        try {
+            w = std::stoi(key.substr(us + 1, ux - us - 1));
+            h = std::stoi(key.substr(ux + 1));
+        } catch (...) {
+            return key;
+        }
+        std::string best = key;
+        int best_d = 1 << 30;
+        const std::string prefix = "pragmatavr_hud_" + runtime + "_";
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            const auto fn = e.path().filename().string();
+            if (fn.size() <= prefix.size() + 4 || fn.compare(0, prefix.size(), prefix) != 0 || e.path().extension() != ".ini") {
+                continue;
+            }
+            const auto dims = fn.substr(prefix.size(), fn.size() - prefix.size() - 4);
+            const auto x = dims.find('x');
+            if (x == std::string::npos) {
+                continue;
+            }
+            int fw = 0, fh = 0;
+            try {
+                fw = std::stoi(dims.substr(0, x));
+                fh = std::stoi(dims.substr(x + 1));
+            } catch (...) {
+                continue;
+            }
+            const int dw = std::abs(fw - w);
+            const int dh = std::abs(fh - h);
+            if (dw <= 3 && dh <= 3 && dw + dh < best_d) {
+                best_d = dw + dh;
+                best = runtime + "_" + dims;
+            }
+        }
+        return best;
+    }
 
     static std::string trim(const std::string& s) {
         const auto b = s.find_first_not_of(" \t\r\n");
@@ -1072,7 +1142,7 @@ private:
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial,\n";
-        s += "#   128 PERFORMANCE).\n";
+        s += "#   128 PERFORMANCE, 256 ENEMY BARS AND DAMAGE, 512 ITEM PICKUPS).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
@@ -1405,9 +1475,9 @@ private:
                 const auto& gt = active_group(*t, g);
                 desc += fmt::format(" {}(size={:.3f} x={:.0f} y={:.0f} gap={:.0f})", GROUP_KEYS[g], gt.size, gt.x, gt.y, gt.gap);
             }
-            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} locks={}{}{}{}{} hud_fixed={} companion_mode={} "
+            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} locks={}{}{}{}{}{} hud_fixed={} companion_mode={} "
                 "engine_overlay={} glued_hud_removed={} hide_ghost={} | {} values:{}",
-                file_version, hud_mode_name(t->hud_mode), (int)t->locked[0], (int)t->locked[1], (int)t->locked[2], (int)t->locked[3], (int)t->locked[4], t->hud_fixed, t->companion_mode, t->engine_overlay,
+                file_version, hud_mode_name(t->hud_mode), (int)t->locked[0], (int)t->locked[1], (int)t->locked[2], (int)t->locked[3], (int)t->locked[4], (int)t->locked[5], t->hud_fixed, t->companion_mode, t->engine_overlay,
                 t->glued_hud_removed, t->hide_ghost, hud_mode_name(t->hud_mode), desc);
         }
 
@@ -2204,6 +2274,13 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
     const float cy0 = (std::min)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
     const float cy1 = (std::max)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
     constexpr float M = 4.0f; // buffer pixels from the edge
+    if (g == GroupItems) {
+        // Build 47: the four corners are taken; the item pickups go to the middle of the top edge (outside the lens view
+        // too: the top rows of each eye image).
+        const float tx = (w * 0.5f - (ox + s * (cx0 + cx1) * 0.5f)) / s;
+        const float ty = (M - (oy + s * cy0)) / s;
+        return glm::vec2{tx, ty};
+    }
     const bool right = g == GroupWeapons || g == GroupStamina;
     const bool bottom = g == GroupHealth || g == GroupStamina;
     const float tx = right ? ((w - M) - (ox + s * cx1)) / s : (M - (ox + s * cx0)) / s;
@@ -2216,7 +2293,7 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
     const float ox = (w - 1920.0f * s) * 0.5f;
     const float oy = (h - 1080.0f * s) * 0.5f;
-    for (int g = GroupHealth; g <= GroupTutorial; ++g) {
+    for (int g = GroupHealth; g < GroupCount; ++g) { // Build 47: item pickups too
         if (frame >= 0) {
             const int age = frame - g_group_drawn_frame[g].load();
             if (age < 0 || age > 10) { // Build 29: 10 frames (was 4)
