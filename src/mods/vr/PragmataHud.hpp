@@ -76,7 +76,8 @@ enum Group : int {
     GroupWeapons = 3,
     GroupTutorial = 4,
     GroupItems = 5, // Build 47: item pickups (ui2120Gui, top right on a monitor: the cubes collected, etc.)
-    GroupCount = 6,
+    GroupObjective = 6, // Build 53: objective banner (ui2110Gui, top middle on a monitor: "Restore the power to the lunar base")
+    GroupCount = 7,
 };
 
 enum Field : int {
@@ -87,9 +88,9 @@ enum Field : int {
     FieldCount = 4,
 };
 
-inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial", "items"};
-inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box", "Item pickups"};
-inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX", "ITEM PICKUPS"};
+inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial", "items", "objective"};
+inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box", "Item pickups", "Objective"};
+inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX", "ITEM PICKUPS", "OBJECTIVE"};
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
@@ -122,6 +123,7 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
     {1612.0f, 877.0f}, // weapon wheel
     {305.0f, 300.0f},  // tutorial box
     {1640.0f, 200.0f}, // Build 47: item pickups (estimate, top right; the content extent log measures it)
+    {960.0f, 110.0f},  // Build 53: objective banner (estimate, top middle, from the game's Options preview)
 }};
 
 // Build 25: each element's area in the game's own layout (canvas pixels, 1920 x 1080, x0 y0 x1 y1), with a margin. From
@@ -137,6 +139,7 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
     {1300.0f, 0.0f, 1920.0f, 420.0f},  // Build 47: item pickups, generous estimate of the top right notice (to be measured)
+    {480.0f, 0.0f, 1440.0f, 260.0f},   // Build 53: objective banner, generous estimate (icon, objective line, sub-objective line)
 }};
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
@@ -164,7 +167,7 @@ struct HudTune {
     bool log_elements{true};
     bool hack_locked{true}; // Build 25: kept for old ini files; the locks are now per element (locked[])
     // Build 25: per-element lock. While locked, the menu cannot change that element's values in any HUD mode.
-    std::array<bool, GroupCount> locked{true, true, true, true, true, false}; // Build 47: item pickups start unlocked (untuned)
+    std::array<bool, GroupCount> locked{true, true, true, true, true, false, false}; // Build 47 / 53: item pickups and objective start unlocked (untuned)
     // Build 25: mod menu sections that are collapsed (bit per MenuSection). DEVELOPER starts collapsed.
     uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
@@ -296,6 +299,8 @@ struct HudTune {
         flat_groups[GroupWeapons].gap = 200.0f;
         flat_groups[GroupTutorial].gap = 250.0f;
         flat_groups[GroupItems].gap = 200.0f;
+        set_flat(GroupObjective, 0.75f, 0.0f, 100.0f); // Build 53: starting guess, smaller and pulled down from the top edge
+        flat_groups[GroupObjective].gap = 200.0f;
         apply_hud_mode();
     }
 };
@@ -343,6 +348,7 @@ inline int group_for(std::string_view name) {
     // Screen view and is now drawn like the game's other menus.
     if (name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     if (name == "ui2120Gui") return GroupItems; // Build 47: item pickups (HUD Controls calls it "Inventory Items")
+    if (name == "ui2110Gui") return GroupObjective; // Build 53: objective banner (HUD Controls calls it "Objective Message")
     return -1;
 }
 
@@ -357,6 +363,7 @@ inline int companion_group(std::string_view name, std::string_view& partner) {
     if (name == "ui2151Gui") { partner = "ui2150Gui"; return GroupWeapons; }
     if (name == "ui2101Gui") { partner = "ui2100Gui"; return GroupTutorial; }
     if (name == "ui2121Gui") { partner = "ui2120Gui"; return GroupItems; } // Build 47: if the game has this companion
+    if (name == "ui2111Gui") { partner = "ui2110Gui"; return GroupObjective; } // Build 53: the fix pack keeps it in Screen view
     return -1;
 }
 
@@ -466,10 +473,13 @@ enum MenuSection : int {
     SectionEnemy = 8,       // Build 42: ENEMY BARS AND DAMAGE
     SectionItems = 9,       // Build 47: ITEM PICKUPS (bit 7 was already taken by PERFORMANCE)
     SectionDamage = 10,     // Build 51: DAMAGE NUMBERS (bit 8 is now ENEMY HEALTH BARS)
+    SectionObjective = 11,  // Build 53: OBJECTIVE
 };
 
 inline int section_for_group(int g) {
-    return g == GroupItems ? SectionItems : SectionElement0 + g;
+    if (g == GroupItems) return SectionItems;
+    if (g == GroupObjective) return SectionObjective;
+    return SectionElement0 + g;
 }
 
 inline bool section_collapsed(uint32_t collapsed, int section) {
@@ -986,6 +996,7 @@ private:
         add_element(GroupHack);
         add_element(GroupWeapons);
         add_element(GroupTutorial);
+        add_element(GroupObjective); // Build 53
 
         // ==== ADVANCED ====
         tab = TabAdvanced;
@@ -1159,7 +1170,8 @@ private:
         s += fmt::format("y_sign={:.0f}\n", t.y_sign);
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial,\n";
-        s += "#   128 PERFORMANCE, 256 ENEMY HEALTH BARS, 512 ITEM PICKUPS, 1024 DAMAGE NUMBERS).\n";
+        s += "#   128 PERFORMANCE, 256 ENEMY HEALTH BARS, 512 ITEM PICKUPS, 1024 DAMAGE NUMBERS,\n";
+        s += "#   2048 OBJECTIVE).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
@@ -1503,9 +1515,9 @@ private:
                 const auto& gt = active_group(*t, g);
                 desc += fmt::format(" {}(size={:.3f} x={:.0f} y={:.0f} gap={:.0f})", GROUP_KEYS[g], gt.size, gt.x, gt.y, gt.gap);
             }
-            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} locks={}{}{}{}{}{} hud_fixed={} companion_mode={} "
+            spdlog::info("[PragmataVR] Loaded pragmatavr_hud.ini v{}: HUD mode {} locks={}{}{}{}{}{}{} hud_fixed={} companion_mode={} "
                 "engine_overlay={} glued_hud_removed={} hide_ghost={} | {} values:{}",
-                file_version, hud_mode_name(t->hud_mode), (int)t->locked[0], (int)t->locked[1], (int)t->locked[2], (int)t->locked[3], (int)t->locked[4], (int)t->locked[5], t->hud_fixed, t->companion_mode, t->engine_overlay,
+                file_version, hud_mode_name(t->hud_mode), (int)t->locked[0], (int)t->locked[1], (int)t->locked[2], (int)t->locked[3], (int)t->locked[4], (int)t->locked[5], (int)t->locked[6], t->hud_fixed, t->companion_mode, t->engine_overlay,
                 t->glued_hud_removed, t->hide_ghost, hud_mode_name(t->hud_mode), desc);
         }
 
@@ -2317,6 +2329,13 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
         // too: the top rows of each eye image).
         const float tx = (w * 0.5f - (ox + s * (cx0 + cx1) * 0.5f)) / s;
         const float ty = (M - (oy + s * cy0)) / s;
+        return glm::vec2{tx, ty};
+    }
+    if (g == GroupObjective) {
+        // Build 53: the objective banner goes to the middle of the bottom edge (between health, bottom left, and stamina,
+        // bottom right), so it never shares the top middle with the item pickups.
+        const float tx = (w * 0.5f - (ox + s * (cx0 + cx1) * 0.5f)) / s;
+        const float ty = ((h - M) - (oy + s * cy1)) / s;
         return glm::vec2{tx, ty};
     }
     const bool right = g == GroupWeapons || g == GroupStamina;
