@@ -190,7 +190,7 @@ struct HudTune {
     bool log_elements{true};
     bool hack_locked{true}; // Build 25: kept for old ini files; the locks are now per element (locked[])
     // Build 25: per-element lock. While locked, the menu cannot change that element's values in any HUD mode.
-    std::array<bool, GroupCount> locked{true, true, true, true, true, false, false}; // Build 47 / 53: item pickups and objective start unlocked (untuned)
+    std::array<bool, GroupCount> locked{true, true, true, true, true, true, true}; // v0.9.0: all locked at Steve's Quest 3 tuning
     // Build 25: mod menu sections that are collapsed (bit per MenuSection). DEVELOPER starts collapsed.
     uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
@@ -232,7 +232,7 @@ struct HudTune {
     // as one virtual screen. Steve found the single screen no better and it broke the hacking circle, so Build 11
     // always uses 0 (the ini value is ignored; the game-screen code is kept for reference).
     int layout_mode{0};
-    std::array<float, 4> screen{106.0f, 2.5f, 0.0f, 0.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg). Build 39: Quest 3 tuning
+    std::array<float, 4> screen{100.0f, 2.5f, 0.0f, 0.0f}; // width (degrees), distance (m), left/right (deg), up/down (deg). v0.9.0: Quest 3 tuning
     std::array<bool, 4> screen_invert{};
 
     // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
@@ -280,7 +280,7 @@ struct HudTune {
     // Mod menu placement: a panel fixed in the room where it was opened.
     // distance (m), text size (1 = body text MENU_TEXT_DEG degrees tall, at any distance), up/down (deg),
     // click volume (0..1 of full scale)
-    std::array<float, 4> menu{2.5f, 1.3f, -5.0f, 0.50f}; // Build 39: Steve's values as the default. Build 40: click 50% (new scale)
+    std::array<float, 4> menu{2.5f, 1.3f, -5.0f, 0.10f}; // Build 39: Steve's values as the default. v0.9.0: click 10%
     std::array<bool, 4> menu_invert{};
     std::array<GroupTune, GroupCount> groups{};
     // Build 21: FLAT mode values, kept apart from the 3D values (the hacking circle lock applies to 3D only).
@@ -320,20 +320,26 @@ struct HudTune {
             flat_groups[g].x = x;
             flat_groups[g].y = y;
         };
-        // Build 39: Steve's Quest 3 (Virtual Desktop) tuning is the default for new installs, the most common headset.
+        // v0.9.0: Steve's Quest 3 (Virtual Desktop) tuning on the per-element panels (Build 57) is the default for new
+        // installs, the most common headset.
         set_flat(GroupHack, 0.4005f, -400.0f, 100.0f);
-        set_flat(GroupHealth, 0.7592f, 450.0f, -100.0f);
-        set_flat(GroupStamina, 0.999f, 0.0f, -100.0f);
-        set_flat(GroupWeapons, 0.7896f, -100.0f, 200.0f);
-        set_flat(GroupTutorial, 0.7299f, 360.0f, 70.0f);
-        set_flat(GroupItems, 0.75f, -350.0f, 150.0f); // Build 47: starting guess, smaller and pulled in from the top right corner
+        set_flat(GroupHealth, 0.6749f, 450.0f, -70.0f);
+        set_flat(GroupStamina, 0.9236f, 0.0f, -90.0f);
+        set_flat(GroupWeapons, 0.6490f, -330.0f, 20.0f);
+        set_flat(GroupTutorial, 0.5769f, 320.0f, 40.0f);
+        set_flat(GroupItems, 0.5066f, -330.0f, 190.0f);
         flat_groups[GroupHack].gap = 80.0f;
         flat_groups[GroupHealth].gap = 240.0f;
         flat_groups[GroupStamina].gap = 240.0f;
         flat_groups[GroupWeapons].gap = 200.0f;
         flat_groups[GroupTutorial].gap = 250.0f;
         flat_groups[GroupItems].gap = 200.0f;
-        set_flat(GroupObjective, 0.75f, 0.0f, 100.0f); // Build 53: starting guess, smaller and pulled down from the top edge
+        set_flat(GroupObjective, 0.5480f, 0.0f, 120.0f);
+        // v0.9.0: the hacking circle with the headset projection (World HUD projection = Headset, the default).
+        hack_headset.size = 0.7903f;
+        hack_headset.x = -270.0f;
+        hack_headset.y = 150.0f;
+        hack_headset.gap = 0.0f;
         flat_groups[GroupObjective].gap = 200.0f;
         apply_hud_mode();
     }
@@ -2366,8 +2372,13 @@ inline std::array<std::atomic<int>, GroupCount> g_group_drawn_frame{};
 // Build 55: last time (steady clock ms) a full-screen menu GUI (ui51xx) was drawn; render threads write, the frame reads.
 inline std::atomic<int64_t> g_menu_drawn_ms{0};
 
-// Build 55: a full-screen menu GUI: ui5100Gui to ui5199Gui.
+// Build 55: a full-screen menu GUI: ui5100Gui to ui5199Gui. v0.9.0: also the start-up splash screens (ui1210Gui) and
+// the RE Engine logo (ui0430_01Gui): before the first 3D scene AFW has no depth or motion to warp from, so they shook
+// and doubled until the game's normal rendering started.
 inline bool is_fullscreen_menu(std::string_view name) {
+    if (name == "ui1210Gui" || name == "ui0430_01Gui") {
+        return true;
+    }
     return name.size() == 9 && name.compare(0, 4, "ui51") == 0 && name.compare(6, 3, "Gui") == 0;
 }
 
