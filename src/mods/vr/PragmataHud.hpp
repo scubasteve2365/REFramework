@@ -232,6 +232,7 @@ struct HudTune {
     bool fix_label{true};     // ui3010Gui location label brightness
     bool fix_door_vfx{true};  // ui3500Gui / ui3510Gui VFXtex effect textures hidden
     bool fix_gauge_vfx{true}; // ui2130Gui hackingGauge_VFX effect texture hidden
+    bool screen_probe{true};  // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers
     bool enemy_locked{true}; // Build 42: lock for the ENEMY BARS AND DAMAGE values, like the HUD elements
     // Build 43: the damage numbers shift is off by default while a crash is tested (two Quest 3 crashes came a few
     // seconds after it first applied; damage numbers are many short-lived pieces the game spawns and removes).
@@ -956,13 +957,9 @@ private:
         add_element(GroupHealth);
         add_element(GroupStamina);
         add_element(GroupItems); // Build 47
-        add_section(SectionEnemy, "ENEMY BARS AND DAMAGE");
-        add_row(MenuRow::Kind::Toggle, GROUP_ENEMY, -1, ActionToggleEnemyLock, "Lock", "A = lock or unlock these values (locked = they cannot change)");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyX, ActionNone, "Health bar left / right", "A = edit. Moves enemy health bars to sit over the enemy");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, EnemyY, ActionNone, "Health bar up / down", "A = edit. Moves enemy health bars to sit over the enemy");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageX, ActionNone, "Damage left / right", "A = edit. Moves the damage numbers to sit over the enemy");
-        add_row(MenuRow::Kind::Value, GROUP_ENEMY, DamageY, ActionNone, "Damage up / down", "A = edit. Moves the damage numbers to sit over the enemy");
-        add_row(MenuRow::Kind::Action, GROUP_ENEMY, -1, ActionResetEnemy, "Reset to defaults", "A = back to the starting values (Quest 3)");
+        // Build 48: ENEMY BARS AND DAMAGE hidden for the pre-release. Its shift never took effect (Build 45: the GUI camera
+        // projection is not requested per element) and moving the markers' pieces crashed the game (Builds 41-44). The
+        // proper fix hooks the game's world-to-screen function (see PragmataScreenProbe.hpp).
         column = 1;
         add_element(GroupHack);
         add_element(GroupWeapons);
@@ -981,8 +978,6 @@ private:
             "A = Headset (hacking circle, reticle, enemy markers line up on any headset) or Flat (the old monitor projection)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
-        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleShiftDamage, "Damage numbers shift",
-            "A = test: move the damage numbers with their HUD tab values (now without touching game objects)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
             "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
@@ -1182,6 +1177,8 @@ private:
         s += fmt::format("fix_label={}\n", t.fix_label ? 1 : 0);
         s += fmt::format("fix_door_vfx={}\n", t.fix_door_vfx ? 1 : 0);
         s += fmt::format("fix_gauge_vfx={}\n", t.fix_gauge_vfx ? 1 : 0);
+        s += "# screen_probe (Build 48, diagnostic): 1 = log which game functions turn world positions into screen positions.\n";
+        s += fmt::format("screen_probe={}\n", t.screen_probe ? 1 : 0);
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
         s += "# shift_damage (Build 43): 1 = move the damage numbers by enemy_bar.damage_x / damage_y (off while a crash is tested).\n";
         s += fmt::format("shift_damage={}\n", t.shift_damage ? 1 : 0);
@@ -1368,6 +1365,7 @@ private:
                 else if (key == "fix_label") t->fix_label = val != 0.0f;
                 else if (key == "fix_door_vfx") t->fix_door_vfx = val != 0.0f;
                 else if (key == "fix_gauge_vfx") t->fix_gauge_vfx = val != 0.0f;
+                else if (key == "screen_probe") t->screen_probe = val != 0.0f;
                 else if (key == "shift_damage") t->shift_damage = val != 0.0f;
                 // layout_mode is ignored from Build 11 on (always per-element). hud_fixed and hack_locked from an
                 // older file are ignored too, so the HUD comes back exactly as the hacking circle was tuned.

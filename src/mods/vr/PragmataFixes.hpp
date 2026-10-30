@@ -59,6 +59,7 @@
 #include "utility/String.hpp"
 
 #include "PragmataHud.hpp"
+#include "PragmataScreenProbe.hpp"
 
 class PragmataFixes : public Mod {
 public:
@@ -78,6 +79,13 @@ public:
 
         const auto name = utility::re_game_object::get_name(go);
         const auto h = utility::hash(name);
+
+        // Build 48: screen probe, note when enemy bars / damage numbers draw.
+        if (h == "ui3200Gui"_fnv || h == "ui3210Gui"_fnv) {
+            pragmata_screen_probe::g_enemy_bar_seen_ms.store(now_ms(), std::memory_order_relaxed);
+        } else if (h == "ui3201Gui"_fnv) {
+            pragmata_screen_probe::g_damage_seen_ms.store(now_ms(), std::memory_order_relaxed);
+        }
 
         if (h == "ui3203Gui"_fnv || h == "ui2160Gui"_fnv) {
             if (pragmatavr::HudTuning::get().tune()->fix_brackets) {
@@ -106,6 +114,10 @@ public:
             spdlog::info("[PragmataVR] Fixes: HUD fixes run on the main thread before PrerenderGUI (Build 46)");
         }
         apply();
+        if (pragmatavr::HudTuning::get().tune()->screen_probe) {
+            pragmata_screen_probe::install(); // Build 48, once
+            pragmata_screen_probe::report();
+        }
     }
 
 private:
