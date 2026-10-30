@@ -264,11 +264,36 @@ private:
             if ((tg.kinds & KindLabel) && tune->fix_label) {
                 label(view, tg, ctx);
             }
+            // Build 56: is the replicator panel of the item pickups element shown? (Fixed mode then cuts the bigger area.)
+            if (tg.hash == "ui2120Gui"_fnv) {
+                items_hub(view, ctx);
+            }
             // Build 54: one-time layout dumps of the objective banner and the item pickups element, to find the piece
             // that clips them when Size is below 1.
             if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv) { // Build 55: tutorial too
                 maybe_dump(view, tg, now, ctx);
             }
+        }
+    }
+
+    // Build 56: the replicator panel (main/layout/offset/blur/ui2093) shown = visible with some alpha, here and in its
+    // layout child. Read only.
+    static void items_hub(REManagedObject* view, sdk::VMContext* ctx) {
+        auto panel = get_object(view, L"main/layout/offset/blur/ui2093", ctx);
+        if (panel == nullptr) {
+            log_once("ui2093 missing"_fnv, "ui2120Gui: replicator panel ui2093 not found, item pickups keep the full area");
+            pragmatavr::g_items_hub.store(true, std::memory_order_relaxed);
+            return;
+        }
+        const bool vis = sdk::call_object_func<bool>(panel, "get_Visible", ctx, panel);
+        const auto c = sdk::call_object_func_easy<Vector4f>(panel, "get_ColorScale");
+        auto lay = get_object(panel, L"layout", ctx);
+        const bool lvis = lay == nullptr || sdk::call_object_func<bool>(lay, "get_Visible", ctx, lay);
+        const auto lc = lay != nullptr ? sdk::call_object_func_easy<Vector4f>(lay, "get_ColorScale") : Vector4f{1.0f, 1.0f, 1.0f, 1.0f};
+        const bool shown = vis && lvis && std::isfinite(c.w) && c.w > 0.05f && std::isfinite(lc.w) && lc.w > 0.05f;
+        if (pragmatavr::g_items_hub.exchange(shown, std::memory_order_relaxed) != shown) {
+            spdlog::info("[PragmataVR] Item pickups: replicator panel {} (visible {} alpha {:.2f}, layout visible {} alpha {:.2f})",
+                         shown ? "shown, full area" : "hidden, field area", vis, c.w, lvis, lc.w);
         }
     }
 

@@ -3457,10 +3457,6 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value_color = t.show_boxes ? AMBER : ACCENT;
             v.dim = !t.hud_panel; // ANCHORED only
             break;
-        case pragmatavr::ActionCycleWindowLayers:
-            v.value = t.window_layers == 0 ? "ALL" : (t.window_layers == 1 ? "WINDOW" : "CONTENT");
-            v.value_color = t.window_layers == 0 ? ACCENT : AMBER;
-            break;
         case pragmatavr::ActionToggleMenuNative:
             v.value = t.menu_native ? "ON" : "OFF";
             v.value_color = t.menu_native ? ACCENT : AMBER;
@@ -3721,7 +3717,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B55");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.0 B56");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3814,7 +3810,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B55"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B55");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.0 B56"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.0 B56");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4842,7 +4838,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                                                  : glm::vec2{0.0f};
                     const float dx = anchored ? cshift.x : gt.x + eye_shift;
                     const float dy = anchored ? cshift.y : gt.y; // canvas y points down; Build 22: Up / down positive moves the element down
-                    const float k = gt.size;
+                    // Build 56: panel elements are drawn at full size; their Size is applied to their own OpenXR quad, so the
+                    // game's fixed-size windows (objective, item pickups, tutorial) never cut them.
+                    const float k = anchored ? 1.0f : gt.size;
                     const bool hide_blur = ftune->hide_blur;
                     // Build 24: the 3D panel (not the hacking circle) drawn as a Screen view, like its companion.
                     const auto fvt = fview != nullptr ? sdk::call_object_func<uint32_t>(fview, "get_ViewType", context, fview) : 0u;
@@ -4886,50 +4884,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         }
 
                         auto c = sdk::call_object_func<REManagedObject*>(fview, "get_Child", context, fview);
-                        // Build 55: objective, item pickups and tutorial: optionally move only main/layout/offset's display
-                        // window (over / under) or only its content (blur), see HudTune::window_layers.
-                        int layer_mode = 0;
-                        if (ftune->window_layers != 0 && (fgroup == pragmatavr::GroupObjective || fgroup == pragmatavr::GroupItems ||
-                                                          fgroup == pragmatavr::GroupTutorial)) {
-                            const auto child_named = [&](REManagedObject* parent, std::string_view want) -> REManagedObject* {
-                                auto ch = sdk::call_object_func<REManagedObject*>(parent, "get_Child", context, parent);
-                                for (int i = 0; ch != nullptr && i < 32; ++i) {
-                                    auto nm = sdk::call_object_func<SystemString*>(ch, "get_Name", context, ch);
-                                    if (nm != nullptr && utility::re_string::get_string(nm) == want) {
-                                        return ch;
-                                    }
-                                    ch = sdk::call_object_func<REManagedObject*>(ch, "get_Next", context, ch);
-                                }
-                                return nullptr;
-                            };
-                            auto m = child_named(fview, "main");
-                            auto l = m != nullptr ? child_named(m, "layout") : nullptr;
-                            auto o = l != nullptr ? child_named(l, "offset") : nullptr;
-                            if (o != nullptr) {
-                                c = sdk::call_object_func<REManagedObject*>(o, "get_Child", context, o);
-                                layer_mode = ftune->window_layers;
-                            }
-                            static std::mutex layer_log_mtx{};
-                            static std::unordered_map<size_t, int> layer_logged{};
-                            std::scoped_lock _{layer_log_mtx};
-                            auto& ll = layer_logged[name_hash];
-                            if (ll != ftune->window_layers + 1) {
-                                ll = ftune->window_layers + 1;
-                                spdlog::info("[PragmataVR] Size moves {} in {}{}", ftune->window_layers == 1 ? "WINDOW" : "CONTENT", name,
-                                             o != nullptr ? "" : " (no main/layout/offset, all moved)");
-                            }
-                        }
                         for (int n = 0; c != nullptr && n < 64; ++n) {
-                            if (layer_mode != 0) {
-                                auto nm = sdk::call_object_func<SystemString*>(c, "get_Name", context, c);
-                                const auto cn = nm != nullptr ? utility::re_string::get_string(nm) : std::string{};
-                                const bool display = cn == "over" || cn == "under";
-                                const bool content = cn == "blur";
-                                if ((layer_mode == 1 && !display) || (layer_mode == 2 && !content)) {
-                                    c = sdk::call_object_func<REManagedObject*>(c, "get_Next", context, c);
-                                    continue;
-                                }
-                            }
                             PragmataChildRestore cr{};
                             cr.obj = c;
                             cr.position = sdk::call_object_func_easy<Vector4f>(c, "get_Position");

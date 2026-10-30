@@ -141,8 +141,22 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
     {1000.0f, 0.0f, 1940.0f, 600.0f},  // Build 47: item pickups. Build 54: 1300 -> 1000 left, 420 -> 600 bottom, 1920 -> 1940
                                        // right: the hub panel ("Y" stations) and the resource counter, measured in snapshots
-    {480.0f, 0.0f, 1440.0f, 260.0f},   // Build 53: objective banner, generous estimate (icon, objective line, sub-objective line)
+    {480.0f, 0.0f, 1440.0f, 360.0f},   // Build 53: objective banner (icon, objective line). Build 56: bottom 260 -> 360 for the
+                                       // second and third objective lines (secondaryObjective +102, tertiaryObjective +148)
 }};
+
+// Build 56: item pickups away from the hub: only the resource counter and the pickup notices (the replicator panel,
+// ui2093, is not shown), so Fixed mode cuts a much smaller area out of the top middle of the eye images.
+inline constexpr std::array<float, 4> ITEMS_BOX_FIELD{1150.0f, 0.0f, 1940.0f, 380.0f};
+// Build 56: set on the main thread (PragmataFixes) while the item pickups' replicator panel is shown.
+inline std::atomic<bool> g_items_hub{true};
+
+inline std::array<float, 4> box_for(int g) {
+    if (g == GroupItems && !g_items_hub.load(std::memory_order_relaxed)) {
+        return ITEMS_BOX_FIELD;
+    }
+    return FLAT_BOXES[g];
+}
 
 // Build 21: HUD modes. 3D = the Builds 11-15 per-element 3D placement. FLAT = the game's own flat HUD, as on a monitor,
 // in both eyes (follows the head), with per-element size, position and eye gap. PANEL = the Build 17-20 room-fixed panel.
@@ -174,11 +188,6 @@ struct HudTune {
     uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
     bool show_boxes{false};
-    // Build 55: the objective, item pickups and tutorial elements show their content through a fixed window (a
-    // via.gui.Material in main/layout/offset/over) that cut them when Size is below 1. window_layers picks what Size and
-    // position move in those elements: 0 = everything (Builds 21-54), 1 = only the display window (over / under),
-    // 2 = only the content (blur). A test of which one keeps them whole when shrunk.
-    int window_layers{0};
     // Build 55: draw in NATIVE while a full-screen menu (ui51xx: Firmware Updater, Stamp Club, Bot Database, outfits,
     // terminals) is open, where AFW leaves trails; back to AFW when it closes. Only applies when render mode is AFW.
     bool menu_native{true};
@@ -199,6 +208,7 @@ struct HudTune {
     // into the engine's UI buffer, which is copied each frame onto a room-fixed OpenXR quad (screen.* place and size it).
     // 0 = the Builds 11-15 3D placement.
     int hud_panel{0};
+    bool head_locked{false}; // Build 56: Follows Head: the element quads are placed in view space (derived, never stored)
     // Build 17 test: the engine's overlay layer draw. 0 = REFramework's default, 1 = always skipped, 2 = always drawn.
     int engine_overlay{0};
     // Build 19 test: draws that write the eye image and the UI buffer together get a throwaway image instead of the eye
@@ -279,7 +289,10 @@ struct HudTune {
         hide_ghost = true;
         engine_overlay = 0;
         flat_test = hud_mode == HudModeFlat || hud_mode == HudModeAnchored; // ANCHORED draws the HUD exactly like FLAT
-        hud_panel = hud_mode == HudModeAnchored ? 1 : 0;                     // ... and moves the four elements to the panel
+        // Build 56: both modes cut the panel elements out of the game's HUD image at full size and show each on its own
+        // OpenXR quad, sized by the element's Size: Fixed in the room, Follows Head attached to the view.
+        hud_panel = 1;
+        head_locked = hud_mode == HudModeFlat;
     }
 
     HudTune() {
@@ -593,7 +606,6 @@ enum MenuAction : int {
     ActionToggleDamageLock,     // Build 51
     ActionResetDamage,          // Build 51
     ActionToggleShiftDamage,    // Build 43
-    ActionCycleWindowLayers,    // Build 55
     ActionToggleMenuNative,     // Build 55
 };
 
@@ -1031,8 +1043,6 @@ private:
             "A = hide or show the dark backdrop behind the door and lock hacking HUD");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleCaptureCorners, "Fixed HUD capture",
             "A = Corners (elements cut out where nothing visible is drawn) or Home (at their place in the game layout)");
-        add_row(MenuRow::Kind::Toggle, -1, -1, ActionCycleWindowLayers, "Size moves (test)",
-            "A = cycle what Size and position move in objective, item pickups and tutorial: ALL, WINDOW or CONTENT");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleBoxes, "Show element boxes",
             "A = Fixed mode: outline the areas moved to the room-fixed panel (check nothing is cut off or doubled)");
         add_row(MenuRow::Kind::Action, -1, -1, ActionSnapshot, "Take snapshot", "A = save both eye images to reframework\\data\\snapshots");
@@ -1192,9 +1202,7 @@ private:
         s += "#   2048 OBJECTIVE).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
-        s += "# window_layers (Build 55 test): 0 = Size / position move all of objective, item pickups and tutorial, 1 = only\n";
-        s += "#   their display window, 2 = only their content. menu_native: 1 = NATIVE while a full-screen menu is open.\n";
-        s += fmt::format("window_layers={}\n", t.window_layers);
+        s += "# menu_native: 1 = NATIVE while a full-screen menu is open (Build 55).\n";
         s += fmt::format("menu_native={}\n", t.menu_native ? 1 : 0);
         s += fmt::format("hud_fixed={}\n", t.hud_fixed ? 1 : 0);
         s += fmt::format("lock_invert={}\n", t.lock_invert ? 1 : 0);
@@ -1404,7 +1412,6 @@ private:
                 else if (key == "hack_locked") { t->hack_locked = val != 0.0f; t->locked[GroupHack] = t->hack_locked; } // old files
                 else if (key == "collapsed") t->collapsed = (uint32_t)std::max(0.0f, val);
                 else if (key == "show_boxes") t->show_boxes = val != 0.0f;
-                else if (key == "window_layers") t->window_layers = std::clamp((int)val, 0, 2);
                 else if (key == "menu_native") t->menu_native = val != 0.0f;
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
@@ -1906,11 +1913,6 @@ private:
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: enemy health bars {}", t->enemy_locked ? "locked" : "unlocked");
                     play_click(true);
-                } else if (row.action == ActionCycleWindowLayers) {
-                    t->window_layers = (t->window_layers + 1) % 3;
-                    commit(t);
-                    spdlog::info("[PragmataVR] Menu: Size moves {}", t->window_layers == 0 ? "ALL" : (t->window_layers == 1 ? "WINDOW" : "CONTENT"));
-                    play_click(true);
                 } else if (row.action == ActionToggleMenuNative) {
                     t->menu_native = !t->menu_native;
                     commit(t);
@@ -2331,6 +2333,8 @@ struct AnchoredBox {
     int group{0};
     long x0{0}, y0{0}, x1{0}, y1{0}; // area in the UI buffer (captured and erased from the eyes)
     long ox{0}, oy{0};               // Build 38: where the area goes on the panel, relative to x0 / y0 (Left / right, Up / down)
+    float dcx{0.0f}, dcy{0.0f};      // Build 56: center of the element's quad on the panel (UI buffer pixels)
+    float dw{0.0f}, dh{0.0f};        // Build 56: size of the element's quad on the panel (UI buffer pixels, after Size)
 };
 
 // Build 28: the frame (VR frame count) each element last drew in FLAT / ANCHORED. Its box is only used while it draws,
@@ -2354,31 +2358,25 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
     if (!t.fixed_capture_corners || g <= GroupHack || g >= GroupCount || w <= 0.0f || h <= 0.0f) {
         return glm::vec2{0.0f};
     }
+    // Build 56: elements are drawn at full size (Size is applied to their quads), so the areas use the full boxes.
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
     const float ox = (w - 1920.0f * s) * 0.5f;
     const float oy = (h - 1080.0f * s) * 0.5f;
-    const auto& b = FLAT_BOXES[g];
-    const auto& gt = t.flat_groups[g];
-    const float px = FLAT_PIVOTS[g][0];
-    const float py = FLAT_PIVOTS[g][1];
-    const float cx0 = (std::min)(px + gt.size * (b[0] - px), px + gt.size * (b[2] - px));
-    const float cx1 = (std::max)(px + gt.size * (b[0] - px), px + gt.size * (b[2] - px));
-    const float cy0 = (std::min)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
-    const float cy1 = (std::max)(py + gt.size * (b[1] - py), py + gt.size * (b[3] - py));
+    const auto b = box_for(g);
+    const float cx0 = b[0], cy0 = b[1], cx1 = b[2], cy1 = b[3];
     constexpr float M = 4.0f; // buffer pixels from the edge
+    constexpr float GAP = 8.0f;
     if (g == GroupItems) {
-        // Build 47: the four corners are taken; the item pickups go to the middle of the top edge (outside the lens view
-        // too: the top rows of each eye image).
-        const float tx = (w * 0.5f - (ox + s * (cx0 + cx1) * 0.5f)) / s;
-        const float ty = (M - (oy + s * cy0)) / s;
-        return glm::vec2{tx, ty};
+        // Top edge, just right of the tutorial box (top left corner); the weapon wheel takes the top right corner.
+        const auto tb = box_for(GroupTutorial);
+        const float left = M + s * (tb[2] - tb[0]) + GAP;
+        return glm::vec2{(left - (ox + s * cx0)) / s, (M - (oy + s * cy0)) / s};
     }
     if (g == GroupObjective) {
-        // Build 53: the objective banner goes to the middle of the bottom edge (between health, bottom left, and stamina,
-        // bottom right), so it never shares the top middle with the item pickups.
-        const float tx = (w * 0.5f - (ox + s * (cx0 + cx1) * 0.5f)) / s;
-        const float ty = ((h - M) - (oy + s * cy1)) / s;
-        return glm::vec2{tx, ty};
+        // Bottom edge, just right of health (bottom left corner); stamina takes the bottom right corner.
+        const auto hb = box_for(GroupHealth);
+        const float left = M + s * (hb[2] - hb[0]) + GAP;
+        return glm::vec2{(left - (ox + s * cx0)) / s, ((h - M) - (oy + s * cy1)) / s};
     }
     const bool right = g == GroupWeapons || g == GroupStamina;
     const bool bottom = g == GroupHealth || g == GroupStamina;
@@ -2392,33 +2390,39 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
     const float ox = (w - 1920.0f * s) * 0.5f;
     const float oy = (h - 1080.0f * s) * 0.5f;
-    for (int g = GroupHealth; g < GroupCount; ++g) { // Build 47: item pickups too
+    for (int g = GroupHealth; g < GroupCount; ++g) {
         if (frame >= 0) {
             const int age = frame - g_group_drawn_frame[g].load();
             if (age < 0 || age > 10) { // Build 29: 10 frames (was 4)
                 continue; // not drawn in the last few frames
             }
         }
-        const auto& b = FLAT_BOXES[g];
+        const auto b = box_for(g);
         const auto& gt = t.flat_groups[g];
         const float px = FLAT_PIVOTS[g][0];
         const float py = FLAT_PIVOTS[g][1];
-        // Build 38: in Fixed mode the element is drawn at its own place in the game layout (only its size changes), so
-        // its area sits at the screen edge where the game put it, away from the reticle and the hacking circle in the
-        // middle of the view. Left / right and Up / down move it on the panel instead (ox / oy), same final layout.
-        const auto sh = fixed_capture_shift(t, g, w, h); // Build 39: corner placement (zero = own place)
-        const float cx0 = px + gt.size * (b[0] - px) + sh.x;
-        const float cy0 = py + gt.size * (b[1] - py) + sh.y;
-        const float cx1 = px + gt.size * (b[2] - px) + sh.x;
-        const float cy1 = py + gt.size * (b[3] - py) + sh.y;
+        // Build 56: the game draws the element at full size (its own layout, moved to its capture spot); this area is cut
+        // out and shown on the element's own quad.
+        const auto sh = fixed_capture_shift(t, g, w, h);
         AnchoredBox a{};
         a.group = g;
-        a.ox = (long)std::lround(s * (gt.x - sh.x));
-        a.oy = (long)std::lround(s * (gt.y - sh.y));
-        a.x0 = (long)std::clamp(ox + s * (std::min)(cx0, cx1), 0.0f, w);
-        a.y0 = (long)std::clamp(oy + s * (std::min)(cy0, cy1), 0.0f, h);
-        a.x1 = (long)std::clamp(ox + s * (std::max)(cx0, cx1), 0.0f, w);
-        a.y1 = (long)std::clamp(oy + s * (std::max)(cy0, cy1), 0.0f, h);
+        a.x0 = (long)std::clamp(ox + s * (b[0] + sh.x), 0.0f, w);
+        a.y0 = (long)std::clamp(oy + s * (b[1] + sh.y), 0.0f, h);
+        a.x1 = (long)std::clamp(ox + s * (b[2] + sh.x), 0.0f, w);
+        a.y1 = (long)std::clamp(oy + s * (b[3] + sh.y), 0.0f, h);
+        // Where the quad goes on the panel (buffer pixels): the area as the Builds 21-55 in-game Size, Left / right and
+        // Up / down put it (grown around the element's pivot), so existing tuning keeps its place.
+        const float k = gt.size;
+        const float bx0 = px + k * (b[0] - px) + gt.x;
+        const float by0 = py + k * (b[1] - py) + gt.y;
+        const float bx1 = px + k * (b[2] - px) + gt.x;
+        const float by1 = py + k * (b[3] - py) + gt.y;
+        a.dcx = ox + s * (bx0 + bx1) * 0.5f;
+        a.dcy = oy + s * (by0 + by1) * 0.5f;
+        a.dw = s * std::fabs(bx1 - bx0);
+        a.dh = s * std::fabs(by1 - by0);
+        a.ox = (long)std::lround(a.dcx - (a.x0 + a.x1) * 0.5f); // kept for the log
+        a.oy = (long)std::lround(a.dcy - (a.y0 + a.y1) * 0.5f);
         if (a.x1 > a.x0 + 1 && a.y1 > a.y0 + 1) {
             out.push_back(a);
         }

@@ -141,6 +141,14 @@ public:
     } menu_quad{};
     // PragmataVR Build 17: the HUD panel, another room-fixed quad (the engine's UI buffer), submitted under the menu.
     MenuQuad hud_quad{};
+    // PragmataVR Build 56: one quad per HUD element, each showing its area of hud_quad's swapchain image.
+    struct HudElementQuad {
+        XrRect2Di rect{};
+        XrPosef pose{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+        XrExtent2Df size{1.0f, 1.0f};
+    };
+    std::vector<HudElementQuad> hud_elements{};
+    bool hud_head_locked{false}; // Follows Head: the element quads are in view space
 
     bool supportsEyeGazeInteraction{false};
     XrActionSet eyeGazeActionSet{NULL};

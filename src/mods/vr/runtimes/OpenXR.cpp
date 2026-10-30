@@ -1,4 +1,5 @@
-﻿#include <chrono>
+﻿#include <array>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 
@@ -1631,6 +1632,7 @@ XrResult OpenXR::end_frame() {
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad hud_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    std::array<XrCompositionLayerQuad, 8> hud_element_layers{}; // PragmataVR Build 56 (7 HUD elements at most)
 
     // we CANT push the layers every time, it cause some layer error
     // in xrEndFrame, so we must only do it when shouldRender is true
@@ -1653,19 +1655,26 @@ XrResult OpenXR::end_frame() {
         layer.views = projection_layer_views.data();
         layers.push_back((XrCompositionLayerBaseHeader*)&layer);
 
-        // Room-fixed HUD panel (PragmataVR Build 17), under the menu. The UI buffer holds premultiplied alpha.
+        // HUD elements (PragmataVR Build 17, Build 56: one quad per element), under the menu. The UI buffer holds
+        // premultiplied alpha. Fixed: room space. Follows Head: view space.
         const auto& hq = this->hud_quad;
         if (hq.visible && hq.swapchain != XR_NULL_HANDLE && hq.owner == this->session && hq.used_width > 0 && hq.used_height > 0) {
-            hud_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            hud_layer.space = this->stage_space;
-            hud_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            hud_layer.subImage.swapchain = hq.swapchain;
-            hud_layer.subImage.imageRect.offset = {0, 0};
-            hud_layer.subImage.imageRect.extent = {hq.used_width, hq.used_height};
-            hud_layer.subImage.imageArrayIndex = 0;
-            hud_layer.pose = hq.pose;
-            hud_layer.size = hq.size;
-            layers.push_back((XrCompositionLayerBaseHeader*)&hud_layer);
+            const XrSpace hud_space = this->hud_head_locked && this->view_space != XR_NULL_HANDLE ? this->view_space : this->stage_space;
+            const size_t n = (std::min)(this->hud_elements.size(), hud_element_layers.size());
+            for (size_t i = 0; i < n; ++i) {
+                const auto& e = this->hud_elements[i];
+                auto& l = hud_element_layers[i];
+                l = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+                l.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                l.space = hud_space;
+                l.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                l.subImage.swapchain = hq.swapchain;
+                l.subImage.imageRect = e.rect;
+                l.subImage.imageArrayIndex = 0;
+                l.pose = e.pose;
+                l.size = e.size;
+                layers.push_back((XrCompositionLayerBaseHeader*)&l);
+            }
         }
 
         // Room-fixed menu panel, composited by the runtime on top of the eye images (PragmataVR mod menu).

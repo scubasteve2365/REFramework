@@ -453,6 +453,8 @@ PragmataHudPanel g_pragmata_hud{};
 // Build 38: per element area (same order as pragmata_trace::g_rects): where it goes on the panel, relative to its place
 // in the UI buffer (the element's Left / right and Up / down). Guarded by pragmata_trace::g_rects_mtx.
 std::vector<POINT> g_pragmata_rect_offsets{};
+// Build 56: per element area (same order): its quad on the panel, center x / y and width / height in UI buffer pixels.
+std::vector<std::array<float, 4>> g_pragmata_rect_display{};
 
 bool pragmata_ensure_comp(PragmataHudPanel& p) {
     if (p.comp != nullptr) {
@@ -805,17 +807,21 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
 
     // Build 25: the panel shows only the element areas (the same areas cleared from the eye images), so the hacking
     // circle and enemy markers stay in the eyes only. Show element boxes adds a cyan outline around each area.
+    std::vector<D3D12_RECT> element_rects{};
+    std::vector<std::array<float, 4>> element_display{};
     if (pragmata_ensure_comp(p)) {
         std::vector<D3D12_RECT> rects{};
         std::vector<int> groups{};
-        std::vector<POINT> offsets{};
+        std::vector<std::array<float, 4>> display{};
         {
             std::scoped_lock _{pragmata_trace::g_rects_mtx};
             rects = pragmata_trace::g_rects;
             groups = pragmata_trace::g_rect_groups;
-            offsets = g_pragmata_rect_offsets;
+            display = g_pragmata_rect_display;
         }
-        offsets.resize(rects.size(), POINT{0, 0});
+        display.resize(rects.size(), std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+        element_rects = rects;
+        element_display = display;
         const auto copies = pragmata_trace::panel_copies(groups);
         std::scoped_lock _{cmds.mtx};
         auto cl = cmds.cmd_list.Get();
@@ -860,25 +866,23 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         D3D12_TEXTURE_COPY_LOCATION dst_loc{};
         dst_loc.pResource = p.comp.Get();
         dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        // Build 38: each area is copied to its place on the panel (moved by the element's Left / right, Up / down), clipped
-        // to the image. dst_rects are what Show element boxes outlines.
+        // Build 56: each area is copied to the same place in the image; every element gets its own quad showing its
+        // area (OpenXR::end_frame), placed and sized on the panel by its Size, Left / right and Up / down.
         std::vector<D3D12_RECT> dst_rects{};
         const LONG pw = (LONG)p.src_w;
         const LONG ph = (LONG)p.src_h;
         for (size_t i = 0; i < rects.size(); ++i) {
             D3D12_RECT sr = rects[i];
-            LONG dx = sr.left + offsets[i].x;
-            LONG dy = sr.top + offsets[i].y;
-            if (dx < 0) { sr.left -= dx; dx = 0; }
-            if (dy < 0) { sr.top -= dy; dy = 0; }
-            if (dx + (sr.right - sr.left) > pw) sr.right = sr.left + (pw - dx);
-            if (dy + (sr.bottom - sr.top) > ph) sr.bottom = sr.top + (ph - dy);
+            sr.left = std::clamp(sr.left, 0L, pw);
+            sr.right = std::clamp(sr.right, 0L, pw);
+            sr.top = std::clamp(sr.top, 0L, ph);
+            sr.bottom = std::clamp(sr.bottom, 0L, ph);
             if (sr.right <= sr.left || sr.bottom <= sr.top) {
                 continue;
             }
             D3D12_BOX box{(UINT)sr.left, (UINT)sr.top, 0u, (UINT)sr.right, (UINT)sr.bottom, 1u};
-            cl->CopyTextureRegion(&dst_loc, (UINT)dx, (UINT)dy, 0, &src_loc, &box);
-            dst_rects.push_back(D3D12_RECT{dx, dy, dx + (sr.right - sr.left), dy + (sr.bottom - sr.top)});
+            cl->CopyTextureRegion(&dst_loc, (UINT)sr.left, (UINT)sr.top, 0, &src_loc, &box);
+            dst_rects.push_back(sr);
         }
         tr(cap, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 
@@ -914,13 +918,51 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         return;
     }
 
-    const auto placement = pragmatavr::hud_panel_placement(*tune, st.hud, (float)p.src_w, (float)p.src_h);
+    // Build 56: Follows Head places the panel in view space (identity anchor, so it moves with the head with no lag);
+    // Fixed places it in the room at the HUD anchor.
+    const pragmatavr::HudTuning::Pose view_anchor{};
+    const auto placement = pragmatavr::hud_panel_placement(*tune, tune->head_locked ? view_anchor : st.hud, (float)p.src_w, (float)p.src_h);
     hq.pose.orientation = XrQuaternionf{placement.orientation.x, placement.orientation.y, placement.orientation.z, placement.orientation.w};
     hq.pose.position = XrVector3f{placement.position.x, placement.position.y, placement.position.z};
     hq.size = XrExtent2Df{placement.width_m, placement.height_m};
     hq.used_width = p.src_w;
     hq.used_height = p.src_h;
+
+    // Build 56: one quad per element: its area of the image, centered and sized as AnchoredBox dcx / dcy / dw / dh on the
+    // panel plane. Show element boxes outlines the areas inside each quad.
+    openxr->hud_head_locked = tune->head_locked;
+    openxr->hud_elements.clear();
+    const float mpp = p.src_w > 0 ? placement.width_m / (float)p.src_w : 0.0f;
+    const glm::mat3 prot = glm::mat3_cast(placement.orientation);
+    for (size_t i = 0; i < element_rects.size() && i < element_display.size(); ++i) {
+        const auto& r = element_rects[i];
+        const auto& dsp = element_display[i];
+        const LONG x0 = std::clamp(r.left, 0L, (LONG)p.src_w);
+        const LONG x1 = std::clamp(r.right, 0L, (LONG)p.src_w);
+        const LONG y0 = std::clamp(r.top, 0L, (LONG)p.src_h);
+        const LONG y1 = std::clamp(r.bottom, 0L, (LONG)p.src_h);
+        if (x1 <= x0 + 1 || y1 <= y0 + 1 || dsp[2] <= 1.0f || dsp[3] <= 1.0f) {
+            continue;
+        }
+        const glm::vec3 local{(dsp[0] - (float)p.src_w * 0.5f) * mpp, ((float)p.src_h * 0.5f - dsp[1]) * mpp, 0.0f};
+        const glm::vec3 pos = placement.position + prot * local;
+        runtimes::OpenXR::HudElementQuad e{};
+        e.rect.offset = XrOffset2Di{(int32_t)x0, (int32_t)y0};
+        e.rect.extent = XrExtent2Di{(int32_t)(x1 - x0), (int32_t)(y1 - y0)};
+        e.pose.orientation = hq.pose.orientation;
+        e.pose.position = XrVector3f{pos.x, pos.y, pos.z};
+        e.size = XrExtent2Df{dsp[2] * mpp, dsp[3] * mpp};
+        openxr->hud_elements.push_back(e);
+    }
     hq.visible = true;
+
+    static size_t last_count = 0;
+    static bool last_head = false;
+    if (openxr->hud_elements.size() != last_count || last_head != tune->head_locked) {
+        last_count = openxr->hud_elements.size();
+        last_head = tune->head_locked;
+        spdlog::info("[PragmataVR] HUD element quads: {} ({})", last_count, last_head ? "view space, Follows Head" : "room, Fixed");
+    }
 
     static bool logged = false;
     if (!logged) {
@@ -1009,10 +1051,12 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 std::vector<D3D12_RECT> rects{};
                 std::vector<int> groups{};
                 std::vector<POINT> offs{};
+                std::vector<std::array<float, 4>> disp{};
                 for (const auto& b : boxes) {
                     rects.push_back(D3D12_RECT{(LONG)b.x0, (LONG)b.y0, (LONG)b.x1, (LONG)b.y1});
                     groups.push_back(b.group);
                     offs.push_back(POINT{(LONG)b.ox, (LONG)b.oy});
+                    disp.push_back(std::array<float, 4>{b.dcx, b.dcy, b.dw, b.dh});
                 }
                 static std::string last_desc{};
                 std::string desc{};
@@ -1027,6 +1071,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 pragmata_trace::g_rects = std::move(rects);
                 pragmata_trace::g_rect_groups = std::move(groups);
                 g_pragmata_rect_offsets = std::move(offs);
+                g_pragmata_rect_display = std::move(disp);
             }
         }
         // Build 31: probe fence on the game's queue, every present.
