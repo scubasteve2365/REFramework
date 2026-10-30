@@ -131,14 +131,16 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
 // and position) from the eye images to the room-fixed panel. The hacking circle is not anchored.
 inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
-    {0.0f, 900.0f, 400.0f, 1030.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes)
+    {0.0f, 900.0f, 400.0f, 1080.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes. Build 54:
+                                       // bottom 1030 -> 1080, the status icons under the bar were cut off)
     {720.0f, 950.0f, 1200.0f, 1020.0f}, // stamina (Build 34: bottom 1050 -> 1020, measured)
     {1160.0f, 500.0f, 1575.0f, 890.0f}, // weapon wheel (Build 28: the wheel reaches well above its companion's box. Build 34:
                                         // right 1920 -> 1575, bottom 1080 -> 890, left 1180 -> 1160, measured from the
                                         // Build 31 captures; the old box was about 3x the wheel and took in other HUD)
     {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
-    {1300.0f, 0.0f, 1920.0f, 420.0f},  // Build 47: item pickups, generous estimate of the top right notice (to be measured)
+    {1000.0f, 0.0f, 1940.0f, 600.0f},  // Build 47: item pickups. Build 54: 1300 -> 1000 left, 420 -> 600 bottom, 1920 -> 1940
+                                       // right: the hub panel ("Y" stations) and the resource counter, measured in snapshots
     {480.0f, 0.0f, 1440.0f, 260.0f},   // Build 53: objective banner, generous estimate (icon, objective line, sub-objective line)
 }};
 

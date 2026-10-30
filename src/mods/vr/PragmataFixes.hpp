@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -263,6 +264,142 @@ private:
             if ((tg.kinds & KindLabel) && tune->fix_label) {
                 label(view, tg, ctx);
             }
+            // Build 54: one-time layout dumps of the objective banner and the item pickups element, to find the piece
+            // that clips them when Size is below 1.
+            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv) {
+                maybe_dump(view, tg, now, ctx);
+            }
+        }
+    }
+
+    // ==== Build 54: GUI layout dump (diagnostic, main thread, read only) ====
+    static inline std::unordered_map<size_t, int> s_dumps_done{};
+    static inline std::unordered_map<size_t, int64_t> s_first_seen{};
+    static inline std::unordered_map<std::string, bool> s_type_listed{};
+
+    static void maybe_dump(REManagedObject* view, const Target& tg, int64_t now, sdk::VMContext* ctx) {
+        auto& first = s_first_seen[tg.hash];
+        if (first == 0) {
+            first = now;
+        }
+        auto& done = s_dumps_done[tg.hash];
+        // Three dumps: right away, after 3 s and after 15 s (the element animates in, and its content changes).
+        static constexpr std::array<int64_t, 3> at{0, 3000, 15000};
+        if (done >= (int)at.size() || now - first < at[done]) {
+            return;
+        }
+        ++done;
+        spdlog::info("[PragmataVR] Layout dump {} #{} (view type {}):", tg.name, done,
+                     sdk::call_object_func<uint32_t>(view, "get_ViewType", ctx, view));
+        int count = 0;
+        dump_node(view, 0, count, ctx);
+        spdlog::info("[PragmataVR] Layout dump {} #{} end ({} nodes)", tg.name, done, count);
+    }
+
+    static bool clip_like(std::string_view n) {
+        static constexpr std::array<std::string_view, 9> keys{"Clip", "Mask", "Scissor", "Region", "Stencil", "Rect", "Size", "Overflow", "Cull"};
+        for (auto k : keys) {
+            if (n.find(k) != std::string_view::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Lists, once per GUI type, the getters whose names suggest clipping or sizes (this type and its parents).
+    static void list_type(sdk::RETypeDefinition* td) {
+        if (td == nullptr) {
+            return;
+        }
+        const auto tn = td->get_full_name();
+        if (!s_type_listed.emplace(tn, true).second) {
+            return;
+        }
+        std::string names{};
+        for (auto t = td; t != nullptr; t = t->get_parent_type()) {
+            const auto tfn = t->get_full_name();
+            if (tfn == "System.Object" || tfn == "via.Component") {
+                break;
+            }
+            for (auto& m : t->get_methods()) {
+                const char* mn = m.get_name();
+                if (mn == nullptr) {
+                    continue;
+                }
+                const std::string_view v{mn};
+                if (v.rfind("get_", 0) == 0 && clip_like(v) && m.get_num_params() == 0) {
+                    auto rt = m.get_return_type();
+                    names += fmt::format(" {}:{}", v.substr(4), rt != nullptr ? rt->get_full_name() : std::string{"?"});
+                }
+            }
+        }
+        spdlog::info("[PragmataVR] Layout type {}:{}", tn, names.empty() ? std::string{" (no clip / size getters)"} : names);
+    }
+
+    // Values of this node's bool / float / size getters with clip-like names.
+    static std::string clip_values(REManagedObject* o, sdk::RETypeDefinition* td) {
+        std::string out{};
+        for (auto t = td; t != nullptr; t = t->get_parent_type()) {
+            const auto tfn = t->get_full_name();
+            if (tfn == "System.Object" || tfn == "via.Component") {
+                break;
+            }
+            for (auto& m : t->get_methods()) {
+                const char* mn = m.get_name();
+                if (mn == nullptr || m.get_num_params() != 0) {
+                    continue;
+                }
+                const std::string_view v{mn};
+                if (v.rfind("get_", 0) != 0 || !clip_like(v)) {
+                    continue;
+                }
+                auto rt = m.get_return_type();
+                const auto rn = rt != nullptr ? rt->get_full_name() : std::string{};
+                if (rn != "System.Boolean" && rn != "System.Single" && rn != "via.Size" && rn != "System.Int32" && rn != "System.UInt32" &&
+                    rn != "via.vec2" && rn != "via.vec4" && rn.rfind("via.gui.", 0) != 0) {
+                    continue;
+                }
+                if (rn.rfind("via.gui.", 0) == 0 && rt != nullptr && !rt->is_value_type()) {
+                    continue; // object references: skip
+                }
+                std::vector<void*> none{};
+                const auto r = m.invoke(o, std::span<void*>(none));
+                if (r.exception_thrown) {
+                    continue;
+                }
+                const float* f = (const float*)r.bytes.data();
+                if (rn == "System.Boolean") out += fmt::format(" {}={}", v.substr(4), r.byte != 0 ? 1 : 0);
+                else if (rn == "System.Single") out += fmt::format(" {}={:.1f}", v.substr(4), r.f);
+                else if (rn == "via.Size" || rn == "via.vec2") out += fmt::format(" {}=({:.1f},{:.1f})", v.substr(4), f[0], f[1]);
+                else if (rn == "via.vec4") out += fmt::format(" {}=({:.1f},{:.1f},{:.1f},{:.1f})", v.substr(4), f[0], f[1], f[2], f[3]);
+                else out += fmt::format(" {}={}", v.substr(4), r.dword);
+            }
+        }
+        return out;
+    }
+
+    static void dump_node(REManagedObject* o, int depth, int& count, sdk::VMContext* ctx) {
+        for (auto c = o; c != nullptr && count < 400; ) {
+            ++count;
+            auto td = utility::re_managed_object::get_type_definition(c);
+            list_type(td);
+            auto nm = sdk::call_object_func<SystemString*>(c, "get_Name", ctx, c);
+            const auto name = nm != nullptr ? utility::re_string::get_string(nm) : std::string{};
+            const bool vis = sdk::call_object_func<bool>(c, "get_Visible", ctx, c);
+            const auto pos = sdk::call_object_func_easy<Vector4f>(c, "get_Position");
+            const auto sc = sdk::call_object_func_easy<Vector4f>(c, "get_Scale");
+            spdlog::info("[PragmataVR] Layout {:>{}}{} [{}] vis={} pos=({:.1f},{:.1f}) scale=({:.2f},{:.2f}){}", "", depth * 2, name,
+                         td != nullptr ? td->get_full_name() : std::string{"?"}, vis ? 1 : 0, pos.x, pos.y, sc.x, sc.y, clip_values(c, td));
+            if (depth < 12) {
+                auto child = sdk::call_object_func<REManagedObject*>(c, "get_Child", ctx, c);
+                if (child != nullptr) {
+                    dump_node(child, depth + 1, count, ctx);
+                }
+            }
+            if (depth == 0) {
+                break; // the view itself has no siblings to list
+            }
+            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
         }
     }
 
