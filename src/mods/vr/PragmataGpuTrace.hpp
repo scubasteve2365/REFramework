@@ -121,7 +121,7 @@ inline std::atomic<uint64_t> g_fallback_window{0};         // Build 29: copies m
 // drawing leaves the panel through the existing 10-frame check (its box is dropped).
 inline constexpr int SLOT_COUNT = 8;
 inline constexpr int PROBE_ROWS_MAX = 24;
-inline constexpr UINT64 PROBE_BYTES = 1600ull * 1024ull;
+inline constexpr UINT64 PROBE_BYTES = 2400ull * 1024ull; // Build 58: 1600 -> 2400 KB (subtitles and bigger health / item pickups areas)
 inline constexpr int PROBE_GROUPS = 8;
 enum SlotState : int {
     SlotFree = 0,

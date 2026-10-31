@@ -63,6 +63,7 @@
 #include "PragmataHud.hpp"
 #include "PragmataScreenProbe.hpp"
 #include "PragmataMarkerFix.hpp"
+#include "PragmataTexDiag.hpp"
 
 class PragmataFixes : public Mod {
 public:
@@ -132,6 +133,7 @@ public:
         }
         apply();
         report_gui_list();
+        pragmata_tex_diag::tick(); // Build 58: texture streaming diagnostic (logging only)
         pragmata_marker_fix::install(); // Build 50, once
         if (pragmatavr::HudTuning::get().tune()->screen_probe) {
             pragmata_screen_probe::install(); // Build 48, once
@@ -145,6 +147,7 @@ private:
         KindGauge = 1u << 1,
         KindDoor = 1u << 2,
         KindLabel = 1u << 3,
+        KindSubtitle = 1u << 4, // Build 58
     };
 
     struct Target {
@@ -153,7 +156,7 @@ private:
         uint32_t kinds;
     };
 
-    static inline const std::array<Target, 10> TARGETS{{
+    static inline const std::array<Target, 11> TARGETS{{
         {"ui2100Gui", "ui2100Gui"_fnv, KindGhost},
         {"ui2110Gui", "ui2110Gui"_fnv, KindGhost},
         {"ui2120Gui", "ui2120Gui"_fnv, KindGhost},
@@ -164,12 +167,13 @@ private:
         {"ui3500Gui", "ui3500Gui"_fnv, KindDoor},
         {"ui3510Gui", "ui3510Gui"_fnv, KindDoor},
         {"ui3010Gui", "ui3010Gui"_fnv, KindLabel},
+        {"ui2010Gui", "ui2010Gui"_fnv, KindSubtitle}, // Build 58: subtitles shown? (read only)
     }};
 
     // Only elements drawn within this window are looked up (absent HUD screens cost nothing).
     static constexpr int64_t SEEN_WINDOW_MS = 2000;
 
-    static inline std::array<std::atomic<int64_t>, 10> s_seen_ms{};
+    static inline std::array<std::atomic<int64_t>, 11> s_seen_ms{};
     static inline bool s_announced{false};
 
     // Main thread only.
@@ -308,10 +312,69 @@ private:
             }
             // Build 54: one-time layout dumps of the objective banner and the item pickups element, to find the piece
             // that clips them when Size is below 1.
-            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv) { // Build 55: tutorial too
+            // Build 58: is a subtitle on screen? (Fixed and Follows Head then cut its area out of the eyes.)
+            if (tg.kinds & KindSubtitle) {
+                subtitles(view, ctx);
+            }
+            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv ||
+                tg.hash == "ui2010Gui"_fnv) { // Build 55: tutorial too. Build 58: subtitles too
                 maybe_dump(view, tg, now, ctx);
             }
         }
+    }
+
+    // Build 58: a subtitle is shown when some via.gui.Text in ui2010Gui is visible (it and every parent), has some alpha
+    // and a non-empty message. If the tree holds no Text at all the check cannot work, so the area is always used.
+    static void subtitles(REManagedObject* view, sdk::VMContext* ctx) {
+        int nodes = 0;
+        int texts = 0;
+        std::string sample{};
+        const bool shown_now = find_text(view, 0, nodes, texts, sample, ctx);
+        const bool shown = shown_now || texts == 0;
+        if (texts == 0) {
+            log_once("ui2010 no text"_fnv, fmt::format("ui2010Gui: no via.gui.Text found ({} nodes), subtitle area always used", nodes));
+        }
+        if (pragmatavr::g_subtitles_shown.exchange(shown, std::memory_order_relaxed) != shown) {
+            static int changes = 0;
+            if (++changes <= 40) {
+                spdlog::info("[PragmataVR] Subtitles: {} ({} text pieces, {} nodes){}{}", shown ? "shown" : "hidden", texts, nodes,
+                             sample.empty() ? "" : ": ", sample.substr(0, 80));
+            }
+        }
+    }
+
+    static bool find_text(REManagedObject* o, int depth, int& nodes, int& texts, std::string& sample, sdk::VMContext* ctx) {
+        for (auto c = o; c != nullptr && nodes < 400; ) {
+            ++nodes;
+            if (sdk::call_object_func<bool>(c, "get_Visible", ctx, c)) {
+                const auto col = sdk::call_object_func_easy<Vector4f>(c, "get_ColorScale");
+                const bool opaque = !std::isfinite(col.w) || col.w > 0.02f;
+                if (opaque) {
+                    if (type_name(c) == "via.gui.Text") {
+                        ++texts;
+                        auto msg = sdk::call_object_func<SystemString*>(c, "get_Message", ctx, c);
+                        const auto m = msg != nullptr ? utility::re_string::get_string(msg) : std::string{};
+                        if (m.find_first_not_of(" \t\r\n") != std::string::npos) {
+                            sample = m;
+                            return true;
+                        }
+                    }
+                    if (depth < 14) {
+                        auto child = sdk::call_object_func<REManagedObject*>(c, "get_Child", ctx, c);
+                        if (child != nullptr && find_text(child, depth + 1, nodes, texts, sample, ctx)) {
+                            return true;
+                        }
+                    }
+                }
+            } else if (type_name(c) == "via.gui.Text") {
+                ++texts; // a hidden text still proves the check can see them
+            }
+            if (depth == 0) {
+                break;
+            }
+            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+        }
+        return false;
     }
 
     // Build 56: the replicator panel (main/layout/offset/blur/ui2093) shown = visible with some alpha, here and in its

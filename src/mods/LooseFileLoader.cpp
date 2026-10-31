@@ -6,6 +6,9 @@
 #include <spdlog/sinks/basic_file_sink.h>
 
 #include "LooseFileLoader.hpp"
+#if defined(PRAGMATA)
+#include "vr/PragmataTexDiag.hpp"
+#endif
 
 LooseFileLoader* g_loose_file_loader{nullptr};
 
@@ -345,6 +348,10 @@ bool LooseFileLoader::handle_path(const wchar_t* path, size_t hash) {
     if (path == nullptr || path[0] == L'\0') {
         return false;
     }
+
+#if defined(PRAGMATA)
+    pragmata_tex_diag::note(path, pragmata_tex_diag::SourcePathHash); // PragmataVR Build 58: texture streaming diagnostic
+#endif
 
     ++m_files_encountered;
 

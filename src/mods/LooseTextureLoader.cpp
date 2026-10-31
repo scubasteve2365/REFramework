@@ -13,6 +13,9 @@
 
 #include "LooseFileLoader.hpp"
 #include "LooseTextureLoader.hpp"
+#if defined(PRAGMATA)
+#include "vr/PragmataTexDiag.hpp"
+#endif
 #include "REFramework.hpp"
 
 LooseTextureLoader& LooseTextureLoader::get() {
@@ -710,6 +713,13 @@ void LooseTextureLoader::handle_start_enqueue_texture_upload(safetyhook::Context
 }
 
 void LooseTextureLoader::handle_resource_hash_path(safetyhook::Context& context) {
+#if defined(PRAGMATA)
+    // PragmataVR Build 58: texture streaming diagnostic (logging only).
+    if (context.rcx != 0 && context.rdx != 0 && context.rdx < 4096) {
+        pragmata_tex_diag::note(std::wstring_view{reinterpret_cast<const wchar_t*>(context.rcx), static_cast<size_t>(context.rdx) / sizeof(wchar_t)},
+                                pragmata_tex_diag::SourceResourceHash);
+    }
+#endif
     if (!m_enabled->value())
         return;
 

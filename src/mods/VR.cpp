@@ -3328,8 +3328,13 @@ DWORD WINAPI pragmata_xinput_get_state(DWORD index, XINPUT_STATE* state) {
     const auto result = original(index, state);
     g_pragmata_xinput_game_calls++;
 
-    if (result == ERROR_SUCCESS && state != nullptr && pragmatavr::HudTuning::get().should_block_pad()) {
-        state->Gamepad = XINPUT_GAMEPAD{};
+    if (result == ERROR_SUCCESS && state != nullptr) {
+        auto& hud = pragmatavr::HudTuning::get();
+        if (hud.should_block_pad()) {
+            state->Gamepad = XINPUT_GAMEPAD{};
+        } else {
+            hud.filter_game_buttons(state->Gamepad.wButtons); // Build 58: hold L3 + R3 to open the menu
+        }
     }
 
     return result;
@@ -3722,7 +3727,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.1");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.2 B58");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3815,7 +3820,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.1"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.1");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.2 B58"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.2 B58");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4829,7 +4834,11 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 }
 
                 if (fgroup >= 0) {
-                    pragmatavr::g_group_drawn_frame[fgroup] = m_frame_count; // Build 28: ANCHORED uses boxes of drawn elements only
+                    // Build 28: ANCHORED uses boxes of drawn elements only. Build 58: ui2010Gui draws all the time, so the
+                    // subtitles count as drawn only while a line is on screen.
+                    if (fgroup != pragmatavr::GroupSubtitles || pragmatavr::g_subtitles_shown.load(std::memory_order_relaxed)) {
+                        pragmatavr::g_group_drawn_frame[fgroup] = m_frame_count;
+                    }
                     auto fview = sdk::call_object_func<REComponent*>(gui_element, "get_View", context, gui_element);
                     const auto& gt = pragmatavr::active_group(*ftune, fgroup); // Build 38: hack uses its headset values when set
                     // Build 25: ANCHORED takes depth from the panel distance, so the anchored elements get no eye gap
@@ -4935,7 +4944,9 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                             k, gt.x, gt.y, gt.gap);
                     }
 
-                    if (!fnative || to_screen) {
+                    // Build 58: the subtitles are a Screen view of their own (not a 3D panel switched to Screen): keep them
+                    // flat in the HUD image as well, off REFramework's sheet, so they are cut out onto their quad.
+                    if (!fnative || to_screen || fgroup == pragmatavr::GroupSubtitles) {
                         return true; // drawn as a Screen view: skip REFramework's floating sheet for it
                     }
                     // 3D panels go on as before (World mode, drawn with the flat projection; the 3D tuning is skipped)

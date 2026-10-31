@@ -77,7 +77,8 @@ enum Group : int {
     GroupTutorial = 4,
     GroupItems = 5, // Build 47: item pickups (ui2120Gui, top right on a monitor: the cubes collected, etc.)
     GroupObjective = 6, // Build 53: objective banner (ui2110Gui, top middle on a monitor: "Restore the power to the lunar base")
-    GroupCount = 7,
+    GroupSubtitles = 7, // v0.9.2 Build 58: subtitles and the Skip Dialogue prompt (ui2010Gui, bottom middle on a monitor)
+    GroupCount = 8,
 };
 
 enum Field : int {
@@ -88,9 +89,9 @@ enum Field : int {
     FieldCount = 4,
 };
 
-inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial", "items", "objective"};
-inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box", "Item pickups", "Objective"};
-inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX", "ITEM PICKUPS", "OBJECTIVE"};
+inline constexpr std::array<const char*, GroupCount> GROUP_KEYS{"hack", "health", "stamina", "weapons", "tutorial", "items", "objective", "subtitles"};
+inline constexpr std::array<const char*, GroupCount> GROUP_LABELS{"Hacking circle", "Health", "Stamina", "Weapon wheel", "Tutorial box", "Item pickups", "Objective", "Subtitles"};
+inline constexpr std::array<const char*, GroupCount> GROUP_TITLES{"HACKING CIRCLE", "HEALTH", "STAMINA", "WEAPON WHEEL", "TUTORIAL BOX", "ITEM PICKUPS", "OBJECTIVE", "SUBTITLES"};
 
 // The ini format this build writes. Older files (Build 10 and before) had the hacking circle reset to neutral by the
 // Build 8 fresh ini, so their hack.* values are ignored and the locked values below are used instead.
@@ -124,6 +125,7 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
     {305.0f, 300.0f},  // tutorial box
     {1640.0f, 200.0f}, // Build 47: item pickups (estimate, top right; the content extent log measures it)
     {960.0f, 110.0f},  // Build 53: objective banner (estimate, top middle, from the game's Options preview)
+    {960.0f, 850.0f},  // Build 58: subtitles (estimate, bottom middle, from where REFramework's sheet showed them)
 }};
 
 // Build 25: each element's area in the game's own layout (canvas pixels, 1920 x 1080, x0 y0 x1 y1), with a margin. From
@@ -131,7 +133,10 @@ inline constexpr std::array<std::array<float, 2>, GroupCount> FLAT_PIVOTS{{
 // and position) from the eye images to the room-fixed panel. The hacking circle is not anchored.
 inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
     {0.0f, 0.0f, 0.0f, 0.0f},          // hacking circle (stays in the eyes)
-    {0.0f, 900.0f, 400.0f, 1080.0f},   // health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes. Build 54:
+    {0.0f, 820.0f, 560.0f, 1080.0f},   // health (Build 58: top 900 -> 820, right 400 -> 560: with more max health and in
+                                       // Overdrive the numbers reached about 40 px above and the bar about 85 px past the old
+                                       // area, measured in the 2026-10-31 snapshots)
+                                       // Older: health (Build 30: left edge 70 -> 0, the bar's left end showed in the eyes. Build 54:
                                        // bottom 1030 -> 1080, the status icons under the bar were cut off)
     {720.0f, 950.0f, 1200.0f, 1020.0f}, // stamina (Build 34: bottom 1050 -> 1020, measured)
     {1400.0f, 640.0f, 1850.0f, 1080.0f}, // weapon wheel (Build 57: the full-size wheel is around its pivot 1612, 877, about
@@ -141,11 +146,14 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
                                         // Build 31 captures; the old box was about 3x the wheel and took in other HUD)
     {60.0f, 200.0f, 590.0f, 450.0f},   // tutorial box (Build 32: right 620 -> 590, bottom 480 -> 400; Build 34: bottom 450, a
                                        // 4-line tutorial reached the 400 edge; room for about 2 more lines)
-    {1100.0f, 0.0f, 1940.0f, 600.0f},  // Build 47: item pickups. Build 57: left 1000 -> 1100 (the replicator panel starts at
+    {1100.0f, 0.0f, 1940.0f, 720.0f},  // Build 47: item pickups. Build 58: bottom 600 -> 720, the REM Replicator beta panel
+                                       // has more rows than alpha and ran about 75 px past the old bottom. Build 57: left 1000 -> 1100 (the replicator panel starts at
                                        // about 1104), so the area fits between the tutorial box and the weapon wheel. Build 54: 1300 -> 1000 left, 420 -> 600 bottom, 1920 -> 1940
                                        // right: the hub panel ("Y" stations) and the resource counter, measured in snapshots
     {480.0f, 0.0f, 1440.0f, 360.0f},   // Build 53: objective banner (icon, objective line). Build 56: bottom 260 -> 360 for the
                                        // second and third objective lines (secondaryObjective +102, tertiaryObjective +148)
+    {160.0f, 700.0f, 1760.0f, 1000.0f}, // Build 58: subtitles (speaker name, up to about three lines, and the Skip Dialogue
+                                        // prompt to the right). Estimated from REFramework's sheet in snapshots 1793454882/889.
 }};
 
 // Build 56: item pickups away from the hub: only the resource counter and the pickup notices (the replicator panel,
@@ -153,6 +161,9 @@ inline constexpr std::array<std::array<float, 4>, GroupCount> FLAT_BOXES{{
 inline constexpr std::array<float, 4> ITEMS_BOX_FIELD{1150.0f, 0.0f, 1940.0f, 380.0f};
 // Build 56: set on the main thread (PragmataFixes) while the item pickups' replicator panel is shown.
 inline std::atomic<bool> g_items_hub{true};
+// Build 58: set on the main thread (PragmataFixes) while ui2010Gui shows subtitle text. ui2010Gui is drawn all the time,
+// so its (large, low in the view) area is only cut out of the eyes while a line is actually on screen.
+inline std::atomic<bool> g_subtitles_shown{true};
 
 // Build 57: while a snapshot is taken, the GUI draw callbacks collect the names of every GUI drawn (steady clock ms;
 // PragmataFixes logs them), to identify effects such as the low health screen edges.
@@ -190,9 +201,12 @@ struct HudTune {
     bool log_elements{true};
     bool hack_locked{true}; // Build 25: kept for old ini files; the locks are now per element (locked[])
     // Build 25: per-element lock. While locked, the menu cannot change that element's values in any HUD mode.
-    std::array<bool, GroupCount> locked{true, true, true, true, true, true, true}; // v0.9.0: all locked at Steve's Quest 3 tuning
+    std::array<bool, GroupCount> locked{true, true, true, true, true, true, true, false}; // Build 58: subtitles start unlocked // v0.9.0: all locked at Steve's Quest 3 tuning
     // Build 25: mod menu sections that are collapsed (bit per MenuSection). DEVELOPER starts collapsed.
-    uint32_t collapsed{1u << 1}; // bit 1 = SectionDeveloper
+    // Build 58: a fresh install starts with every HUD element section collapsed (a less overwhelming first look); VIEW,
+    // PERFORMANCE and the plain headers stay open. Existing ini files keep their own collapsed value.
+    uint32_t collapsed{(1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5) | (1u << 6) | (1u << 8) | (1u << 9) |
+                       (1u << 10) | (1u << 11) | (1u << 12)};
     // Build 25: ANCHORED test aid, outlines of the areas moved to the room-fixed panel.
     bool show_boxes{false};
     // Build 55: draw in NATIVE while a full-screen menu (ui51xx: Firmware Updater, Stamp Club, Bot Database, outfits,
@@ -341,6 +355,8 @@ struct HudTune {
         hack_headset.y = 150.0f;
         hack_headset.gap = 0.0f;
         flat_groups[GroupObjective].gap = 200.0f;
+        // Build 58: subtitles start at their own place, a little smaller, raised toward the middle of the view.
+        set_flat(GroupSubtitles, 0.7000f, 0.0f, -150.0f);
         apply_hud_mode();
     }
 };
@@ -389,6 +405,7 @@ inline int group_for(std::string_view name) {
     if (name == "ui2100Gui" || name == "ui2002_00Gui") return GroupTutorial;
     if (name == "ui2120Gui") return GroupItems; // Build 47: item pickups (HUD Controls calls it "Inventory Items")
     if (name == "ui2110Gui") return GroupObjective; // Build 53: objective banner (HUD Controls calls it "Objective Message")
+    if (name == "ui2010Gui") return GroupSubtitles; // Build 58: subtitles (AFW warped them on REFramework's sheet)
     return -1;
 }
 
@@ -514,11 +531,13 @@ enum MenuSection : int {
     SectionItems = 9,       // Build 47: ITEM PICKUPS (bit 7 was already taken by PERFORMANCE)
     SectionDamage = 10,     // Build 51: DAMAGE NUMBERS (bit 8 is now ENEMY HEALTH BARS)
     SectionObjective = 11,  // Build 53: OBJECTIVE
+    SectionSubtitles = 12,  // Build 58: SUBTITLES
 };
 
 inline int section_for_group(int g) {
     if (g == GroupItems) return SectionItems;
     if (g == GroupObjective) return SectionObjective;
+    if (g == GroupSubtitles) return SectionSubtitles;
     return SectionElement0 + g;
 }
 
@@ -689,6 +708,29 @@ public:
         return std::chrono::steady_clock::now() < m_block_pad_until.load();
     }
 
+    // Build 58: how long both stick clicks must be held to open the menu. Overdrive (and maybe other game actions) uses
+    // the same L3 + R3 press, so the game does not see the pair while it is held; a short press is replayed to it.
+    static constexpr int CHORD_HOLD_MS = 600;
+    static constexpr int CHORD_REPLAY_MS = 150;
+
+    // Build 58: called from the XInputGetState hook (the game's thread) with the buttons the game is about to get.
+    // While L3 and R3 are both held (and the menu is closed) the pair is hidden; after a short press that did not open
+    // the menu, the pair is reported held for CHORD_REPLAY_MS so the game's own L3 + R3 action still happens.
+    void filter_game_buttons(WORD& buttons) const {
+        constexpr WORD sticks = XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB;
+        if (now_ms_steady() < m_chord_replay_until_ms.load(std::memory_order_relaxed)) {
+            buttons |= sticks;
+            return;
+        }
+        if ((buttons & sticks) == sticks) {
+            buttons &= (WORD)~sticks;
+        }
+    }
+
+    static int64_t now_ms_steady() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     void poll_pad() {
         auto get_state = xinput_get_state.load();
         if (get_state == nullptr) {
@@ -735,10 +777,33 @@ public:
         const bool both_sticks = (buttons & XINPUT_GAMEPAD_LEFT_THUMB) && (buttons & XINPUT_GAMEPAD_RIGHT_THUMB);
         const bool both_sticks_prev = (prev & XINPUT_GAMEPAD_LEFT_THUMB) && (prev & XINPUT_GAMEPAD_RIGHT_THUMB);
 
-        if (both_sticks && !both_sticks_prev && now - m_last_chord > std::chrono::milliseconds(300)) {
+        // Build 58: open = hold both stick clicks for CHORD_HOLD_MS; close = a press of both (or B). A short press while
+        // the menu is closed is replayed to the game (filter_game_buttons), so Overdrive still works.
+        if (both_sticks && !both_sticks_prev) {
+            m_chord_start = now;
+            m_chord_fired = false;
+            m_chord_menu_was_open = menu_open.load();
+            if (m_chord_menu_was_open && now - m_last_chord > std::chrono::milliseconds(300)) {
+                m_last_chord = now;
+                m_chord_fired = true;
+                handle_key(VK_F1, false); // close
+                return;
+            }
+        }
+        if (both_sticks && !m_chord_fired && !m_chord_menu_was_open &&
+            now - m_chord_start >= std::chrono::milliseconds(CHORD_HOLD_MS)) {
+            m_chord_fired = true;
             m_last_chord = now;
-            handle_key(VK_F1, false);
+            if (!menu_open.load()) {
+                handle_key(VK_F1, false); // open
+            }
             return;
+        }
+        if (!both_sticks && both_sticks_prev) {
+            if (!m_chord_fired && !m_chord_menu_was_open && !menu_open.load()) {
+                m_chord_replay_until_ms.store(now_ms_steady() + CHORD_REPLAY_MS, std::memory_order_relaxed);
+            }
+            m_chord_fired = true;
         }
 
         if (!menu_open.load()) {
@@ -1039,6 +1104,7 @@ private:
         add_element(GroupWeapons);
         add_element(GroupTutorial);
         add_element(GroupObjective); // Build 53
+        add_element(GroupSubtitles); // Build 58
 
         // ==== ADVANCED ====
         tab = TabAdvanced;
@@ -1199,8 +1265,8 @@ private:
     static std::string to_text(const HudTune& t) {
         std::string s{};
         s += "# PragmataVR 3D HUD tuning. Saved changes apply within about a second, no restart needed.\n";
-        s += "# The VR mod menu (both thumbsticks or F1) rewrites this file whenever a value changes.\n";
-        s += "# Menu: both thumbsticks or F1 open/close. D-pad / arrows navigate, A / Enter edits the highlighted value\n";
+        s += "# The VR mod menu (hold both thumbstick clicks or F1) rewrites this file whenever a value changes.\n";
+        s += "# Menu: hold both thumbstick clicks (about half a second) or F1 to open; both clicks, B or F1 close. D-pad / arrows navigate, A / Enter edits the highlighted value\n";
         s += "#   (Left/Right change it, RB / Shift = big steps, A or B = done), or runs an action.\n";
         s += "#   B / Backspace = stop editing or close. Pause = snapshot of both eyes.\n";
         s += "# <element>.size / .x / .y / .gap: hack, health, stamina, weapons, tutorial. x/y/gap in layout units (1920x1080 basis).\n";
@@ -1217,7 +1283,7 @@ private:
         s += fmt::format("log_elements={}\n", t.log_elements ? 1 : 0);
         s += "# collapsed: mod menu sections that are collapsed (sum of: 1 VIEW, 2 DEVELOPER, 4 hack, 8 health, 16 stamina, 32 weapons, 64 tutorial,\n";
         s += "#   128 PERFORMANCE, 256 ENEMY HEALTH BARS, 512 ITEM PICKUPS, 1024 DAMAGE NUMBERS,\n";
-        s += "#   2048 OBJECTIVE).\n";
+        s += "#   2048 OBJECTIVE, 4096 SUBTITLES).\n";
         s += fmt::format("collapsed={}\n", t.collapsed);
         s += fmt::format("show_boxes={}\n", t.show_boxes ? 1 : 0);
         s += "# menu_native: 1 = NATIVE while a full-screen menu is open (Build 55). hide_low_health: 1 = no red screen\n";
@@ -2250,6 +2316,10 @@ private:
     WORD m_pad_prev{0};
     int m_stick_prev{0};
     std::chrono::steady_clock::time_point m_last_chord{};
+    std::chrono::steady_clock::time_point m_chord_start{}; // Build 58: hold to open
+    bool m_chord_fired{true};
+    bool m_chord_menu_was_open{false};
+    std::atomic<int64_t> m_chord_replay_until_ms{0};
     std::atomic<std::chrono::steady_clock::time_point> m_block_pad_until{};
 };
 
@@ -2401,13 +2471,27 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
         return glm::vec2{(left - (ox + s * cx0)) / s, (M - (oy + s * cy0)) / s};
     }
     if (g == GroupObjective) {
-        // Bottom edge, just right of health (bottom left corner); stamina takes the bottom right corner.
+        // Bottom edge, just right of health (bottom left corner).
         const auto hb = box_for(GroupHealth);
         const float left = M + s * (hb[2] - hb[0]) + GAP;
         return glm::vec2{(left - (ox + s * cx0)) / s, ((h - M) - (oy + s * cy1)) / s};
     }
-    const bool right = g == GroupWeapons || g == GroupStamina;
-    const bool bottom = g == GroupHealth || g == GroupStamina;
+    if (g == GroupStamina) {
+        // Build 58: bottom left, just above health (health grew wider, so health + objective + stamina no longer fit
+        // side by side on the bottom edge).
+        const auto hb = box_for(GroupHealth);
+        const float bottom_px = (h - M) - s * (hb[3] - hb[1]) - GAP;
+        return glm::vec2{(M - (ox + s * cx0)) / s, (bottom_px - (oy + s * cy1)) / s};
+    }
+    if (g == GroupSubtitles) {
+        // Build 58: horizontally where the game puts them, just above the objective (the tallest element on the bottom
+        // edge). Low in the view; only cut out while a subtitle is on screen (g_subtitles_shown).
+        const auto ob = box_for(GroupObjective);
+        const float bottom_px = (h - M) - s * (ob[3] - ob[1]) - GAP;
+        return glm::vec2{0.0f, (bottom_px - (oy + s * cy1)) / s};
+    }
+    const bool right = g == GroupWeapons;
+    const bool bottom = g == GroupHealth;
     const float tx = right ? ((w - M) - (ox + s * cx1)) / s : (M - (ox + s * cx0)) / s;
     const float ty = bottom ? ((h - M) - (oy + s * cy1)) / s : (M - (oy + s * cy0)) / s;
     return glm::vec2{tx, ty};
