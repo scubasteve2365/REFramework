@@ -229,6 +229,16 @@ void Graphics::on_config_load(const utility::Config& cfg) {
         spdlog::info("[PragmataVR] Ultrawide/FOV fix was off in re2_fw_config.txt; turned on (Pragmata VR needs it)");
     }
     m_ultrawide_fix->value() = true;
+    // PragmataVR v0.9.1: the HUD capture areas assume the game's 16:9 UI canvas is fitted into the eye image (Constrain
+    // UI and Constrain child UI), as on every test system. A fresh re2_fw_config.txt has them off, and the HUD panels
+    // then cut the wrong areas (only slivers of the HUD showed). The vertical FOV fix matches the tested setup too.
+    if (!m_ultrawide_constrain_ui->value() || !m_ultrawide_constrain_child_ui->value() || !m_ultrawide_vertical_fov->value()) {
+        spdlog::info("[PragmataVR] Ultrawide Constrain UI / Constrain child UI / vertical FOV were off in re2_fw_config.txt; "
+                     "turned on (Pragmata VR's HUD needs them)");
+    }
+    m_ultrawide_constrain_ui->value() = true;
+    m_ultrawide_constrain_child_ui->value() = true;
+    m_ultrawide_vertical_fov->value() = true;
 #endif
 }
 
