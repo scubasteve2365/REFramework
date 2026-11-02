@@ -881,7 +881,9 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
                 d_loc.pResource = p.good.Get();
                 d_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 D3D12_BOX box{(UINT)c.rect.left, (UINT)c.rect.top, 0u, (UINT)c.rect.right, (UINT)c.rect.bottom, 1u};
-                cl->CopyTextureRegion(&d_loc, (UINT)c.rect.left, (UINT)c.rect.top, 0, &s_loc, &box);
+                // Build 66: kept at its storage place (the objective just above its capture spot, see panel_store_dy).
+                const LONG sdy = (LONG)pragmatavr::panel_store_dy(*tune, c.group, c.rect.top, c.rect.bottom);
+                cl->CopyTextureRegion(&d_loc, (UINT)c.rect.left, (UINT)(c.rect.top + sdy), 0, &s_loc, &box);
                 tr(c.src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
             }
             tr(p.good.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
@@ -905,6 +907,16 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         const LONG ph = (LONG)p.src_h;
         for (size_t i = 0; i < rects.size(); ++i) {
             D3D12_RECT sr = rects[i];
+            // Build 66: each element sits at its storage place in the good texture and in the panel image (only the
+            // objective moves, see panel_store_dy); its quad below shows that place.
+            const int sg = i < groups.size() ? groups[i] : -1;
+            const LONG sdy = (LONG)pragmatavr::panel_store_dy(*tune, sg, sr.top, sr.bottom);
+            sr.top += sdy;
+            sr.bottom += sdy;
+            if (i < element_rects.size()) {
+                element_rects[i].top += sdy;
+                element_rects[i].bottom += sdy;
+            }
             sr.left = std::clamp(sr.left, 0L, pw);
             sr.right = std::clamp(sr.right, 0L, pw);
             sr.top = std::clamp(sr.top, 0L, ph);
@@ -912,7 +924,9 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
             if (sr.right <= sr.left || sr.bottom <= sr.top) {
                 continue;
             }
-            D3D12_BOX box{(UINT)sr.left, (UINT)sr.top, 0u, (UINT)sr.right, (UINT)sr.bottom, 1u};
+            // Without a good texture the capture itself is read, where the element is at its capture area.
+            const LONG src_dy = p.good != nullptr ? 0 : -sdy;
+            D3D12_BOX box{(UINT)sr.left, (UINT)(sr.top + src_dy), 0u, (UINT)sr.right, (UINT)(sr.bottom + src_dy), 1u};
             cl->CopyTextureRegion(&dst_loc, (UINT)sr.left, (UINT)sr.top, 0, &src_loc, &box);
             dst_rects.push_back(sr);
         }

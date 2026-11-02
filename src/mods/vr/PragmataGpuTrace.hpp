@@ -24,6 +24,7 @@
 #include <optional>
 #include <chrono>
 #include <array>
+// Build 66: uses pragmatavr:: from PragmataHud.hpp, which D3D12Component.cpp includes first.
 #include <climits>
 #include <string>
 
@@ -920,6 +921,24 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             if (groups.size() != rects.size()) {
                 groups.assign(rects.size(), -1);
             }
+            // Build 66: every area is erased from the eyes, but while the objective banner and the subtitles take turns in
+            // their shared spot, the spot is credited only to the one drawing, and to neither right after a swap.
+            const std::vector<D3D12_RECT> erase_rects = rects;
+            if (const int owner = pragmatavr::g_share_owner.load(std::memory_order_relaxed); owner >= 0) {
+                const bool settled = pragmatavr::g_share_handoffs.fetch_add(1, std::memory_order_relaxed) >= pragmatavr::SHARE_SKIP_HANDOFFS;
+                std::vector<D3D12_RECT> kr{};
+                std::vector<int> kg{};
+                for (size_t k = 0; k < rects.size(); ++k) {
+                    const int g = groups[k];
+                    if ((g == pragmatavr::GroupObjective || g == pragmatavr::GroupSubtitles) && (!settled || g != owner)) {
+                        continue;
+                    }
+                    kr.push_back(rects[k]);
+                    kg.push_back(g);
+                }
+                rects = std::move(kr);
+                groups = std::move(kg);
+            }
 
             // Build 31: copy the element boxes into a free slot and probe rows into its readback buffer.
             Slot* slot = nullptr;
@@ -1028,16 +1047,16 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             }
 
             // Erase the element areas so they do not reach the eye images.
-            if (g_erase.load() && !rects.empty()) {
+            if (g_erase.load() && !erase_rects.empty()) {
                 const auto rtv = fresh_rtv(ui, du.Format);
                 if (rtv != 0) {
                     const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
                     D3D12_CPU_DESCRIPTOR_HANDLE h{};
                     h.ptr = (SIZE_T)rtv;
                     if (g_clear_rtv_hook != nullptr) {
-                        g_clear_rtv_hook->get_original<decltype(clear_rtv)>()(self, h, clear, (UINT)rects.size(), rects.data());
+                        g_clear_rtv_hook->get_original<decltype(clear_rtv)>()(self, h, clear, (UINT)erase_rects.size(), erase_rects.data());
                     } else {
-                        self->ClearRenderTargetView(h, clear, (UINT)rects.size(), rects.data());
+                        self->ClearRenderTargetView(h, clear, (UINT)erase_rects.size(), erase_rects.data());
                     }
                 }
             }

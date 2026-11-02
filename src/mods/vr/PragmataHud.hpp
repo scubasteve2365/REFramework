@@ -194,6 +194,19 @@ inline std::atomic<bool> g_subtitle_yield{false};
 // Build 62: last time (steady clock ms) a tutorial / info window (ui2201Gui) was drawn.
 inline std::atomic<int64_t> g_window_drawn_ms{0};
 
+// Build 66: the objective banner and the subtitles share one capture spot (the bottom middle of the UI buffer, where the
+// game already draws the subtitles and where the objective is moved to be cut out). While both are on screen they take
+// turns: the GUI draw callback lets only one of them draw, swapping every SHARE_FRAMES frames, and each UI buffer hand-off
+// credits that spot only to the one drawing (pragmata_trace barrier). The hand-offs right after a swap can still hold the
+// other one's frame (the engine records a little behind the draw callbacks), so they credit neither. Each panel keeps its
+// last good picture between its turns, and the objective's picture is kept in a separate place of the panel image
+// (panel_store_dy) so the two do not overwrite each other there.
+inline constexpr int SHARE_FRAMES = 8;
+inline constexpr uint32_t SHARE_SKIP_HANDOFFS = 6;
+inline std::atomic<int> g_share_owner{-1};        // GroupObjective or GroupSubtitles while they take turns, else -1
+inline std::atomic<uint32_t> g_share_handoffs{0}; // UI buffer hand-offs since the last swap
+inline std::atomic<uint32_t> g_share_swaps{0};    // swaps (for the 10 s report)
+
 // Build 62: where the game aims the gun reticle. app.GuiBehaviorV2.applyPostureData places ui2001Gui at the aim point
 // projected with the game camera (one eye, HMD included). The marker fix hook stores the canvas position the reticle is
 // drawn at and its direction (tangents in the eye's centred view, from the projection matrix), so its layer is shown in
@@ -271,6 +284,9 @@ struct HudTune {
     bool subtitle_pin{true};
     // Build 62: developer switch, like Reticle: true = NEW (subtitles on their own panel), false = ORIGINAL (as v0.9.1).
     bool subtitles_new{false}; // Build 63: ORIGINAL by default (experimental)
+    // Build 66: 1 = objective banner and subtitles take turns in their shared capture spot (both stay on their panels);
+    // 0 = Build 62 behaviour (the subtitles give way, drawn in the eyes, while the objective banner shows).
+    bool subtitle_share{true};
     // Build 61: item pickups area: 0 = automatic (the big area only while a replicator list is open), 1 = always the big
     // area (Builds 58-60), 2 = always the field area.
     int items_area{0};
@@ -1411,6 +1427,9 @@ private:
         s += fmt::format("subtitle_pin={}\n", t.subtitle_pin ? 1 : 0);
         s += "# subtitles_new: 1 = subtitles on their own panel, 0 = original drawing (Build 62).\n";
         s += fmt::format("subtitles_new={}\n", t.subtitles_new ? 1 : 0);
+        s += "# subtitle_share: 1 = objective banner and subtitles take turns in their shared capture spot, both on their\n";
+        s += "#   panels; 0 = subtitles give way (drawn in the eyes) while the objective banner shows (Build 66).\n";
+        s += fmt::format("subtitle_share={}\n", t.subtitle_share ? 1 : 0);
         s += "# items_area: item pickups area. 0 = automatic (big area only while a replicator list is open), 1 = always big,\n";
         s += "#   2 = always the small field area (Build 61).\n";
         s += fmt::format("items_area={}\n", t.items_area);
@@ -1639,6 +1658,7 @@ private:
                 else if (key == "reticle_new") t->reticle_new = val != 0.0f;
                 else if (key == "subtitle_pin") t->subtitle_pin = val != 0.0f;
                 else if (key == "subtitles_new") t->subtitles_new = val != 0.0f;
+                else if (key == "subtitle_share") t->subtitle_share = val != 0.0f;
                 else if (key == "items_area") t->items_area = std::clamp((int)val, 0, 2);
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
@@ -2706,6 +2726,33 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
     return glm::vec2{tx, ty};
 }
 
+// Build 66: whose turn it is in the shared capture spot this frame (GroupObjective or GroupSubtitles), or -1 when they do
+// not need to share (one of them is not on screen, sharing is off, or the subtitles give way to a window or menu).
+inline int share_turn(const HudTune& t, int frame) {
+    if (!t.subtitle_share || !t.subtitles_new || !t.hud_panel || !t.fixed_capture_corners) {
+        return -1;
+    }
+    if (!g_subtitles_shown.load(std::memory_order_relaxed) || g_subtitle_yield.load(std::memory_order_relaxed)) {
+        return -1;
+    }
+    const int oage = frame - g_group_drawn_frame[GroupObjective].load(std::memory_order_relaxed);
+    if (oage < 0 || oage > 10) {
+        return -1;
+    }
+    return ((frame / SHARE_FRAMES) & 1) != 0 ? GroupSubtitles : GroupObjective;
+}
+
+// Build 66: where an element's picture is kept in the panel image, as a shift (UI buffer px) from its capture area. The
+// objective is kept just above its capture spot (a part of the panel image no element uses) so the subtitles, captured in
+// the same spot, do not overwrite it. Everything else is kept at its capture area.
+inline long panel_store_dy(const HudTune& t, int g, long top, long bottom) {
+    if (g != GroupObjective || !t.subtitle_share) {
+        return 0;
+    }
+    const long dy = -((bottom - top) + 16);
+    return top + dy >= 0 ? dy : -top;
+}
+
 inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h, int frame = -1) {
     std::vector<AnchoredBox> out{};
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
@@ -2713,16 +2760,17 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
     const float oy = (h - 1080.0f * s) * 0.5f;
     // Build 62: the subtitles give way while the objective banner (its capture spot covers their place) or a window or
     // full-screen menu is shown: they are not cut then (the Riot Blaster window was cut in snapshot 1793546956).
+    // Build 66: with subtitle_share they no longer give way to the objective (the two take turns, see share_turn).
     if (frame >= 0) {
         const int oage = frame - g_group_drawn_frame[GroupObjective].load();
         const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        const bool yield = (oage >= 0 && oage <= 10) || now - g_window_drawn_ms.load(std::memory_order_relaxed) < 500 ||
+        const bool yield = (!t.subtitle_share && oage >= 0 && oage <= 10) || now - g_window_drawn_ms.load(std::memory_order_relaxed) < 500 ||
                            now - g_menu_drawn_ms.load(std::memory_order_relaxed) < 500;
         if (g_subtitle_yield.exchange(yield, std::memory_order_relaxed) != yield) {
             static int logs = 0;
             if (++logs <= 40) {
-                spdlog::info("[PragmataVR] Subtitles: {}", yield ? "give way (objective, window or menu shown)" : "own panel again");
+                spdlog::info("[PragmataVR] Subtitles: {}", yield ? (t.subtitle_share ? "give way (window or menu shown)" : "give way (objective, window or menu shown)") : "own panel again");
             }
         }
     }
