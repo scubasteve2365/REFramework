@@ -821,7 +821,18 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
             display = g_pragmata_rect_display;
         }
         display.resize(rects.size(), std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
-        const auto copies = pragmata_trace::panel_copies(groups);
+        // Build 67: probe-only areas (group ids past the elements) are read by panel_copies but never copied or shown.
+        std::vector<int> want_groups{};
+        for (size_t i = 0; i < groups.size(); ++i) {
+            if (groups[i] >= pragmatavr::GroupCount) {
+                if (i < rects.size()) {
+                    rects[i] = D3D12_RECT{0, 0, 0, 0};
+                }
+                continue;
+            }
+            want_groups.push_back(groups[i]);
+        }
+        const auto copies = pragmata_trace::panel_copies(want_groups);
         // Build 60: an element that shows up again (after its box was dropped) keeps its old picture in the good texture
         // until a capture holding it arrives. If none does (the element draws nothing visible, like the tutorial box
         // flashing in when LT is pressed), the old picture was shown: once a piece of the start-up warning screen. Its
@@ -1159,6 +1170,23 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     groups.push_back(b.group);
                     offs.push_back(POINT{(LONG)b.ox, (LONG)b.oy});
                     disp.push_back(std::array<float, 4>{b.dcx, b.dcy, b.dw, b.dh});
+                }
+                // Build 67: probe-only areas while a window or menu is up and a subtitle line shows (see band_probe_rects):
+                // captured and checked, never erased from the eyes and never shown on the panel.
+                {
+                    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (t->subtitles_new && pragmatavr::g_subtitles_shown.load(std::memory_order_relaxed) && pragmatavr::menu_or_window_up(now_ms)) {
+                        const auto pr = pragmatavr::band_probe_rects(*t, (float)d.Width, (float)d.Height);
+                        if (pr[1][2] > pr[1][0]) {
+                            for (int k = 0; k < 2; ++k) {
+                                rects.push_back(D3D12_RECT{(LONG)pr[k][0], (LONG)pr[k][1], (LONG)pr[k][2], (LONG)pr[k][3]});
+                                groups.push_back(k == 0 ? pragmatavr::PROBE_SUBTITLES : pragmatavr::PROBE_BAND);
+                                offs.push_back(POINT{0, 0});
+                                disp.push_back(std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+                            }
+                        }
+                    }
                 }
                 static std::string last_desc{};
                 std::string desc{};

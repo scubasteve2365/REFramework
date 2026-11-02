@@ -192,6 +192,22 @@ inline void install() {
             r[0] += dx + tx;
             r[1] += dy + ty;
 
+            // Build 67: in-world markers (button prompts, enemy bars and damage numbers) are kept out of the HUD capture
+            // areas, so no piece of them is cut out of the view onto a HUD element's panel ("Y" prompt on the objective).
+            if (tl_owner_hash == "ui2020Gui"_fnv || tl_owner_hash == "ui3200Gui"_fnv || tl_owner_hash == "ui3201Gui"_fnv ||
+                tl_owner_hash == "ui3203Gui"_fnv || tl_owner_hash == "ui3210Gui"_fnv) {
+                const float k = w > 0.0f ? 1920.0f / w : 1.0f; // canvas px per marker px (1 for the usual 1920 x 1080)
+                float cx = r[0] * k;
+                float cy = r[1] * k;
+                if (pragmatavr::nudge_marker(cx, cy)) {
+                    r[0] = cx / k;
+                    r[1] = cy / k;
+                    if (pragmatavr::g_marker_nudges.fetch_add(1, std::memory_order_relaxed) < 3) {
+                        spdlog::info("[PragmataVR] Marker fix: a marker was moved out of a HUD capture area (to {:.0f}, {:.0f})", cx, cy);
+                    }
+                }
+            }
+
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 3) {
                 spdlog::info("[PragmataVR] Marker fix: [2][0] {:.4f} [2][1] {:.4f} size {:.0f} x {:.0f} -> shift ({:.1f}, {:.1f}) + fine-tune ({:.0f}, {:.0f})",

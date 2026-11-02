@@ -74,6 +74,21 @@
 bool inside_on_end = false;
 uint32_t actual_frame_count = 0;
 
+// PragmataVR Build 67: world scale. The eye-to-head offsets (both the eye distance and any eye height or depth offset)
+// are multiplied by the world scale wherever REFramework hands them to the game camera or to AFW, and head movement is
+// multiplied the same way in apply_hmd_transform. Above 1 the world looks smaller. Rotations are not changed.
+static Matrix4x4f pragmata_scale_eye(Matrix4x4f m) {
+#if defined(PRAGMATA)
+    const float ws = pragmatavr::g_world_scale.load(std::memory_order_relaxed);
+    if (ws != 1.0f) {
+        m[3].x *= ws;
+        m[3].y *= ws;
+        m[3].z *= ws;
+    }
+#endif
+    return m;
+}
+
 thread_local bool inside_gui_draw = false;
 
 std::shared_ptr<VR>& VR::get() {
@@ -2565,6 +2580,9 @@ void VR::apply_hmd_transform(glm::quat& rotation, Vector4f& position) {
 
     auto current_relative_pos = rotation_offset * (get_position(0) - m_standing_origin) /*+ current_relative_eye_pos*/;
     current_relative_pos.w = 0.0f;
+#if defined(PRAGMATA)
+    current_relative_pos *= pragmatavr::g_world_scale.load(std::memory_order_relaxed); // Build 67: world scale
+#endif
 
     auto current_head_pos = camera_rotation * current_relative_pos;
 
@@ -3175,10 +3193,10 @@ Vector4f VR::get_current_offset() {
 
     if (count % 2 == m_left_eye_interval) {
         //return Vector4f{m_eye_distance * -1.0f, 0.0f, 0.0f, 0.0f};
-        return get_runtime()->eyes[vr::Eye_Left][3];
+        return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Left])[3];
     }
     
-    return get_runtime()->eyes[vr::Eye_Right][3];
+    return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Right])[3];
     //return Vector4f{m_eye_distance, 0.0f, 0.0f, 0.0f};
 }
 
@@ -3193,10 +3211,10 @@ Matrix4x4f VR::get_current_eye_transform(bool flip) {
     const auto mod_count = flip ? m_right_eye_interval : m_left_eye_interval;
 
     if (count % 2 == mod_count) {
-        return get_runtime()->eyes[vr::Eye_Left];
+        return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Left]);
     }
 
-    return get_runtime()->eyes[vr::Eye_Right];
+    return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Right]);
 }
 
 Matrix4x4f VR::get_current_projection_matrix(bool flip) {
@@ -3238,10 +3256,10 @@ Matrix4x4f VR::get_eye_transform(uint32_t pass) {
     std::shared_lock _{get_runtime()->eyes_mtx};
 
     if (pass % 2 == 0) {
-        return get_runtime()->eyes[vr::Eye_Left];
+        return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Left]);
     }
 
-    return get_runtime()->eyes[vr::Eye_Right];
+    return pragmata_scale_eye(get_runtime()->eyes[vr::Eye_Right]);
 }
 
 void VR::on_pre_imgui_frame() {
@@ -3279,8 +3297,8 @@ void VR::update_camera_data(int frame_count) {
         EyeIndex nEye = (m_render_frame_count % 2 == m_left_eye_interval) ? EyeLeft : EyeRight;
         EyeIndex nEyeOther = (m_render_frame_count % 2 == m_left_eye_interval) ? EyeRight : EyeLeft;
 
-        glm::mat4 matEyePosRender = get_runtime()->eyes[nEye];
-        glm::mat4 matEyePosProj = get_runtime()->eyes[nEyeOther];
+        glm::mat4 matEyePosRender = pragmata_scale_eye(get_runtime()->eyes[nEye]); // Build 67: world scale
+        glm::mat4 matEyePosProj = pragmata_scale_eye(get_runtime()->eyes[nEyeOther]);
 
         cameraData[nEye].camWorldToViewMatrix = glm::inverse(m_original_camera_matrix);
         cameraData[nEye].camViewToWorldMatrix = m_original_camera_matrix;
@@ -3762,7 +3780,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.3 B66");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.3 B67");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3855,7 +3873,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.3 B66"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.3 B66");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.3 B67"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.3 B67");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4106,7 +4124,10 @@ void VR::on_present() {
         // v0.9.2: start-up (splash screens) always NATIVE, also with Native in menus off; 3 minutes at most.
         static const auto first_ms = now_ms;
         const bool in_boot = !pragmatavr::g_boot_done.load(std::memory_order_relaxed) && now_ms - first_ms < 180000;
-        const bool in_menu = in_boot || (pt->menu_native && now_ms - pragmatavr::g_menu_drawn_ms.load(std::memory_order_relaxed) < 1000);
+        // Build 67: optionally NATIVE while a subtitle line is drawn in the eyes over a window or menu (subtitle_menu_native).
+        const bool sub_over_menu = pt->subtitle_menu_native && pt->subtitles_new && pragmatavr::g_subtitles_shown.load(std::memory_order_relaxed) &&
+                                   pragmatavr::g_subtitle_yield.load(std::memory_order_relaxed) && pragmatavr::menu_or_window_up(now_ms);
+        const bool in_menu = in_boot || sub_over_menu || (pt->menu_native && now_ms - pragmatavr::g_menu_drawn_ms.load(std::memory_order_relaxed) < 1000);
         static bool last_in_menu = false;
         if (pt->render_afw && in_menu != last_in_menu) {
             spdlog::info("[PragmataVR] Full-screen menu {}: render {}", in_menu ? "open" : "closed", in_menu ? "NATIVE" : "AFW");
@@ -4808,6 +4829,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             spdlog::info("[PragmataVR] Start-up over ({} drawn): render mode follows the settings again", name);
         }
         if (pragmatavr::is_fullscreen_menu(name)) {
+            pragmatavr::note_yield_cause(name); // Build 67: for the subtitle log
             pragmatavr::g_menu_drawn_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
             static std::mutex menu_log_mtx{};

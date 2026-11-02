@@ -193,6 +193,9 @@ inline std::atomic<bool> g_subtitles_shown{false}; // Build 61: off until the ch
 inline std::atomic<bool> g_subtitle_yield{false};
 // Build 62: last time (steady clock ms) a tutorial / info window (ui2201Gui) was drawn.
 inline std::atomic<int64_t> g_window_drawn_ms{0};
+// Build 67: world scale (EXPERIMENTAL tab, ini screen.world_scale): multiplies the eye offsets and head movement that
+// REFramework adds to the game camera. Read by the view matrix hook and AFW's camera data every frame.
+inline std::atomic<float> g_world_scale{1.0f};
 
 // Build 66: the objective banner and the subtitles share one capture spot (the bottom middle of the UI buffer, where the
 // game already draws the subtitles and where the objective is moved to be cut out). While both are on screen they take
@@ -287,6 +290,9 @@ struct HudTune {
     // Build 66: 1 = objective banner and subtitles take turns in their shared capture spot (both stay on their panels);
     // 0 = Build 62 behaviour (the subtitles give way, drawn in the eyes, while the objective banner shows).
     bool subtitle_share{true};
+    // Build 67: 1 = render NATIVE (no AFW) while a subtitle line shows over a window or menu that reaches the subtitles'
+    // band (they are then drawn in the eyes, where AFW would double them), whatever Native in menus says.
+    bool subtitle_menu_native{false};
     // Build 61: item pickups area: 0 = automatic (the big area only while a replicator list is open), 1 = always the big
     // area (Builds 58-60), 2 = always the field area.
     int items_area{0};
@@ -324,8 +330,8 @@ struct HudTune {
     int layout_mode{0};
     // width (degrees), distance (m), left/right (deg), up/down (deg). v0.9.0: Quest 3 tuning. Build 61: [4] = reticle distance (m),
     // 1.0 = where REFramework's own 2D UI sheet showed it (VR_2DUIDistance).
-    std::array<float, 5> screen{100.0f, 2.5f, 0.0f, 0.0f, 3.0f}; // Build 62: reticle 3.0 m (was 1.0)
-    std::array<bool, 5> screen_invert{};
+    std::array<float, 6> screen{100.0f, 2.5f, 0.0f, 0.0f, 3.0f, 1.0f}; // Build 62: reticle 3.0 m (was 1.0). Build 67: world scale 1.0
+    std::array<bool, 6> screen_invert{};
 
     // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
     // values in re2_fw_config.txt for them no longer matter.
@@ -646,13 +652,14 @@ enum ScreenField : int {
     ScreenYaw = 2,
     ScreenPitch = 3,
     ScreenReticleDist = 4, // Build 61
+    ScreenWorldScale = 5,  // Build 67: eye distance and head movement multiplier (above 1 the world looks smaller)
 };
-inline constexpr int SCREEN_FIELDS = 5;
-inline constexpr std::array<const char*, SCREEN_FIELDS> SCREEN_KEYS{"width", "distance", "yaw", "pitch", "reticle_distance"};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MIN{20.0f, 0.5f, -60.0f, -45.0f, 0.3f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f, 20.0f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f, 0.1f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f, 0.5f};
+inline constexpr int SCREEN_FIELDS = 6;
+inline constexpr std::array<const char*, SCREEN_FIELDS> SCREEN_KEYS{"width", "distance", "yaw", "pitch", "reticle_distance", "world_scale"};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MIN{20.0f, 0.5f, -60.0f, -45.0f, 0.3f, 0.25f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f, 20.0f, 10.0f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f, 0.1f, 0.05f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f, 0.5f, 0.25f};
 
 // Build 40: enemy health bars (ui3200Gui, boss ui3210Gui). With the headset projection they land a fixed amount left of
 // and above the enemy (Quest 3 test); these move them back, in canvas pixels (y positive = down). Headset projection only.
@@ -1055,6 +1062,7 @@ public:
         case ScreenYaw: return fmt::format("{:+.0f} deg", t.screen[2]);
         case ScreenPitch: return fmt::format("{:+.0f} deg", t.screen[3]);
         case ScreenReticleDist: return fmt::format("{:.1f} m", t.screen[4]);
+        case ScreenWorldScale: return fmt::format("{:.2f}x", t.screen[5]);
         default: return {};
         }
     }
@@ -1217,6 +1225,9 @@ private:
             "A = On: the game keeps high resolution textures loaded in VR (uses more VRAM). Off: the game's own choice");
         add_row(MenuRow::Kind::Action, -1, -1, ActionReloadTextures, "Reload textures",
             "A = test: drop and reload the game's streamed textures now (may hitch). For comparing texture detail");
+        add_header("WORLD SCALE", "WORK IN PROGRESS"); // Build 67
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenWorldScale, ActionNone, "World scale",
+            "A = edit. Above 1.00 the world looks smaller (wider eye distance). High values can show AFW artifacts");
         column = 1;
         add_header("RETICLE", "WORK IN PROGRESS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleReticleMode, "Reticle",
@@ -1430,6 +1441,9 @@ private:
         s += "# subtitle_share: 1 = objective banner and subtitles take turns in their shared capture spot, both on their\n";
         s += "#   panels; 0 = subtitles give way (drawn in the eyes) while the objective banner shows (Build 66).\n";
         s += fmt::format("subtitle_share={}\n", t.subtitle_share ? 1 : 0);
+        s += "# subtitle_menu_native: 1 = NATIVE (no AFW) while a subtitle line shows over a window or menu that covers the\n";
+        s += "#   subtitles' band (they are drawn in the eyes then), whatever Native in menus says (Build 67).\n";
+        s += fmt::format("subtitle_menu_native={}\n", t.subtitle_menu_native ? 1 : 0);
         s += "# items_area: item pickups area. 0 = automatic (big area only while a replicator list is open), 1 = always big,\n";
         s += "#   2 = always the small field area (Build 61).\n";
         s += fmt::format("items_area={}\n", t.items_area);
@@ -1659,6 +1673,7 @@ private:
                 else if (key == "subtitle_pin") t->subtitle_pin = val != 0.0f;
                 else if (key == "subtitles_new") t->subtitles_new = val != 0.0f;
                 else if (key == "subtitle_share") t->subtitle_share = val != 0.0f;
+                else if (key == "subtitle_menu_native") t->subtitle_menu_native = val != 0.0f;
                 else if (key == "items_area") t->items_area = std::clamp((int)val, 0, 2);
                 else if (key == "hud_fixed") t->hud_fixed = val != 0.0f;
                 else if (key == "lock_invert") t->lock_invert = val != 0.0f;
@@ -1818,6 +1833,7 @@ private:
     static void publish_names(const HudTune& t) {
         g_subtitle_hash.store(t.subtitle_gui.empty() || !t.subtitles_new ? 0 : name_hash(t.subtitle_gui), std::memory_order_relaxed);
         g_items_area_mode_cache.store(t.items_area, std::memory_order_relaxed);
+        g_world_scale.store(std::clamp(t.screen[ScreenWorldScale], 0.25f, 10.0f), std::memory_order_relaxed); // Build 67
     }
 
     void commit(const std::shared_ptr<HudTune>& t) {
@@ -2306,7 +2322,9 @@ private:
                     play_click(true);
                 } else if (row.action == ActionResetScreen) {
                     const auto inverts = t->screen_invert;
+                    const float world_scale = t->screen[ScreenWorldScale]; // Build 67: not a HUD screen value
                     t->screen = HudTune{}.screen;
+                    t->screen[ScreenWorldScale] = world_scale;
                     t->screen_invert = inverts;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reset HUD screen");
@@ -2726,6 +2744,55 @@ inline glm::vec2 fixed_capture_shift(const HudTune& t, int g, float w, float h) 
     return glm::vec2{tx, ty};
 }
 
+// Build 67: the capture areas cut out this frame, in canvas px (the game's 1920 x 1080 GUI canvas; areas in the bands
+// above and below the 16:9 view have y outside 0..1080). In-world markers (button prompts, enemy bars, damage numbers)
+// that would land in one are nudged clear of it by the marker fix, so no piece of them is cut onto an element's panel.
+struct ViewZone {
+    float x0{0.0f}, y0{0.0f}, x1{0.0f}, y1{0.0f};
+};
+inline std::mutex g_view_zones_mtx{};
+inline std::vector<ViewZone> g_view_zones{};      // guarded by g_view_zones_mtx
+inline float g_view_zones_top{0.0f};              // canvas y of the eye image's top and bottom edges (guarded)
+inline float g_view_zones_bottom{1080.0f};
+inline std::atomic<int64_t> g_view_zones_ms{0};   // when they were last set (steady clock ms)
+inline std::atomic<uint32_t> g_marker_nudges{0};  // markers nudged (for the log)
+
+// Build 67: moves a marker's anchor (canvas px) up or down out of the capture areas. A marker's pieces are assumed to
+// reach MARKER_HALF_W to each side, MARKER_UP above and MARKER_DOWN below its anchor (the "Y" prompt sits above its
+// anchor). Areas in the top half push markers down, areas in the bottom half push them up; markers beyond the eye image
+// are left alone. Returns true when it moved the marker.
+inline constexpr float MARKER_HALF_W = 320.0f;
+inline constexpr float MARKER_UP = 120.0f;
+inline constexpr float MARKER_DOWN = 40.0f;
+inline bool nudge_marker(float& cx, float& cy) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - g_view_zones_ms.load(std::memory_order_relaxed) > 500) {
+        return false;
+    }
+    std::scoped_lock _{g_view_zones_mtx};
+    if (cy < g_view_zones_top - MARKER_DOWN || cy > g_view_zones_bottom + MARKER_UP) {
+        return false;
+    }
+    bool moved = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const auto& z : g_view_zones) {
+            if (cx + MARKER_HALF_W <= z.x0 || cx - MARKER_HALF_W >= z.x1) {
+                continue;
+            }
+            if (cy + MARKER_DOWN <= z.y0 || cy - MARKER_UP >= z.y1) {
+                continue;
+            }
+            if ((z.y0 + z.y1) * 0.5f >= 540.0f) {
+                cy = z.y0 - MARKER_DOWN; // bottom area: above it
+            } else {
+                cy = z.y1 + MARKER_UP; // top area: below it
+            }
+            moved = true;
+        }
+    }
+    return moved;
+}
+
 // Build 66: whose turn it is in the shared capture spot this frame (GroupObjective or GroupSubtitles), or -1 when they do
 // not need to share (one of them is not on screen, sharing is off, or the subtitles give way to a window or menu).
 inline int share_turn(const HudTune& t, int frame) {
@@ -2753,6 +2820,78 @@ inline long panel_store_dy(const HudTune& t, int g, long top, long bottom) {
     return top + dy >= 0 ? dy : -top;
 }
 
+// Build 67: do the subtitles really have to give way to a window or full-screen menu? Windows and menus are big panels
+// whose dark backing usually reaches down into the band below the view, where the subtitles are cut out. While one is
+// up and a subtitle line shows, two probe-only areas ride along with each UI buffer capture (never erased from the eyes,
+// never shown on a panel): the subtitle area itself (it holds the line, so the pass is not a blank one) and a thin
+// column in the same band right of it, which no HUD element and no subtitle uses (between the objective's capture spot
+// and the reticle's). A menu backing that reaches the subtitles covers that column too. When a capture holding the
+// line shows that column empty, the subtitles stay on their panel; when it shows pixels there, they give way as before.
+inline constexpr int PROBE_SUBTITLES = 14;
+inline constexpr int PROBE_BAND = 15;
+inline std::atomic<int64_t> g_band_busy_ms{0};    // last capture that saw the menu in the probe column
+inline std::atomic<int64_t> g_band_clear_ms{0};   // last non-blank capture that saw the column empty
+inline std::atomic<int64_t> g_menu_up_since_ms{0}; // when the current window / menu run started (0 = none up)
+inline std::mutex g_yield_cause_mtx{};
+inline std::string g_yield_cause{};               // the window or menu GUI drawn last (for the log)
+inline void note_yield_cause(std::string_view name) {
+    std::scoped_lock _{g_yield_cause_mtx};
+    if (g_yield_cause != name) {
+        g_yield_cause.assign(name.data(), name.size());
+    }
+}
+inline std::string yield_cause() {
+    std::scoped_lock _{g_yield_cause_mtx};
+    return g_yield_cause;
+}
+
+inline bool menu_or_window_up(int64_t now) {
+    return now - g_window_drawn_ms.load(std::memory_order_relaxed) < 500 || now - g_menu_drawn_ms.load(std::memory_order_relaxed) < 500;
+}
+
+// The two probe areas in UI buffer px: [0] the subtitles' own area, [1] the probe column. Empty when they do not fit.
+inline std::array<std::array<long, 4>, 2> band_probe_rects(const HudTune& t, float w, float h) {
+    std::array<std::array<long, 4>, 2> out{};
+    if (w <= 0.0f || h <= 0.0f || !t.fixed_capture_corners) {
+        return out;
+    }
+    const float s = (std::min)(w / 1920.0f, h / 1080.0f);
+    const float ox = (w - 1920.0f * s) * 0.5f;
+    const float oy = (h - 1080.0f * s) * 0.5f;
+    const auto sb = box_for(GroupSubtitles);
+    const float ady = anchor_dy(GroupSubtitles, w, h);
+    const float y0 = oy + s * (sb[1] + ady);
+    const float y1 = oy + s * (sb[3] + ady);
+    // Where the line is drawn right now (lifted while they give way), so a capture holding it is known not to be blank.
+    const auto ssh = fixed_capture_shift(t, GroupSubtitles, w, h);
+    out[0] = {(long)(ox + s * sb[0]), (long)(y0 + s * ssh.y), (long)(ox + s * sb[2]), (long)(y1 + s * ssh.y)};
+    const auto ob = box_for(GroupObjective);
+    const auto osh = fixed_capture_shift(t, GroupObjective, w, h);
+    const auto rb = box_for(GroupReticle);
+    const auto rsh = fixed_capture_shift(t, GroupReticle, w, h);
+    long x0 = (long)(ox + s * (ob[2] + osh.x)) + 6;
+    long x1 = (long)(ox + s * (rb[0] + rsh.x)) - 6;
+    const long sub_x1 = (long)(ox + s * sb[2]);
+    if (x0 < sub_x1 + 6) {
+        x0 = sub_x1 + 6;
+    }
+    if (x1 - x0 < 8) {
+        return out; // no free column on this headset: the subtitles always give way (as before)
+    }
+    out[1] = {x0, (long)y0, x1, (long)y1};
+    return out;
+}
+
+// Called with each probe reading (panel thread): any = the column had pixels, line = the subtitle area had pixels.
+inline void note_band_reading(bool band_has, bool line_has) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (band_has) {
+        g_band_busy_ms.store(now, std::memory_order_relaxed);
+    } else if (line_has) {
+        g_band_clear_ms.store(now, std::memory_order_relaxed);
+    }
+}
+
 inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, float h, int frame = -1) {
     std::vector<AnchoredBox> out{};
     const float s = (std::min)(w / 1920.0f, h / 1080.0f);
@@ -2765,12 +2904,30 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
         const int oage = frame - g_group_drawn_frame[GroupObjective].load();
         const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        const bool yield = (!t.subtitle_share && oage >= 0 && oage <= 10) || now - g_window_drawn_ms.load(std::memory_order_relaxed) < 500 ||
-                           now - g_menu_drawn_ms.load(std::memory_order_relaxed) < 500;
+        // Build 67: a window or menu only makes them give way while its backing reaches their band (probe column).
+        const bool menu_up = menu_or_window_up(now);
+        if (!menu_up) {
+            g_menu_up_since_ms.store(0, std::memory_order_relaxed);
+        } else if (g_menu_up_since_ms.load(std::memory_order_relaxed) == 0) {
+            g_menu_up_since_ms.store(now, std::memory_order_relaxed);
+        }
+        bool band_clear = false;
+        if (menu_up) {
+            const auto since = g_menu_up_since_ms.load(std::memory_order_relaxed);
+            const auto clear_ms = g_band_clear_ms.load(std::memory_order_relaxed);
+            const auto busy_ms = g_band_busy_ms.load(std::memory_order_relaxed);
+            band_clear = clear_ms > since + 100 && clear_ms > busy_ms && now - clear_ms < 400;
+        }
+        const bool yield = (!t.subtitle_share && oage >= 0 && oage <= 10) || (menu_up && !band_clear);
         if (g_subtitle_yield.exchange(yield, std::memory_order_relaxed) != yield) {
             static int logs = 0;
             if (++logs <= 40) {
-                spdlog::info("[PragmataVR] Subtitles: {}", yield ? (t.subtitle_share ? "give way (window or menu shown)" : "give way (objective, window or menu shown)") : "own panel again");
+                if (yield) {
+                    spdlog::info("[PragmataVR] Subtitles: give way ({}{})", menu_up ? "window or menu reaching their band: " : "objective banner",
+                                 menu_up ? yield_cause() : std::string{});
+                } else {
+                    spdlog::info("[PragmataVR] Subtitles: own panel again{}", menu_up ? fmt::format(" ({} does not reach their band)", yield_cause()) : std::string{});
+                }
             }
         }
     }
@@ -2817,6 +2974,19 @@ inline std::vector<AnchoredBox> anchored_boxes_px(const HudTune& t, float w, flo
         if (a.x1 > a.x0 + 1 && a.y1 > a.y0 + 1) {
             out.push_back(a);
         }
+    }
+    // Build 67: the areas cut this frame, for the marker nudge (canvas px).
+    if (frame >= 0 && s > 0.0f) {
+        std::vector<ViewZone> zones{};
+        for (const auto& a : out) {
+            zones.push_back(ViewZone{((float)a.x0 - ox) / s, ((float)a.y0 - oy) / s, ((float)a.x1 - ox) / s, ((float)a.y1 - oy) / s});
+        }
+        std::scoped_lock _{g_view_zones_mtx};
+        g_view_zones = std::move(zones);
+        g_view_zones_top = -oy / s;
+        g_view_zones_bottom = (h - oy) / s;
+        g_view_zones_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
     }
     return out;
 }

@@ -239,6 +239,9 @@ inline std::vector<PanelCopy> panel_copies(const std::vector<int>& want_groups) 
         }
     }
     const uint64_t done = g_probe_fence != nullptr ? g_probe_fence->GetCompletedValue() : 0;
+    uint64_t band_seq = 0;
+    bool band_has = false;
+    bool line_has = false;
     for (auto& sl : g_slots) {
         if (sl.state != SlotPending || sl.fence == 0 || done < sl.fence || sl.mapped == nullptr) {
             continue;
@@ -276,6 +279,20 @@ inline std::vector<PanelCopy> panel_copies(const std::vector<int>& want_groups) 
         }
         sl.state = SlotReady;
         g_probe_read_window++;
+        // Build 67: the subtitle band probe (only in captures taken while a window or menu is up).
+        {
+            bool has_probe = false;
+            for (const int g : sl.groups) {
+                if (g == pragmatavr::PROBE_BAND) {
+                    has_probe = true;
+                }
+            }
+            if (has_probe && sl.seq > band_seq) {
+                band_seq = sl.seq;
+                band_has = sl.has[pragmatavr::PROBE_BAND];
+                line_has = sl.has[pragmatavr::PROBE_SUBTITLES];
+            }
+        }
         bool any = false;
         for (int g = 0; g < PROBE_GROUPS; ++g) {
             if (sl.has[g]) {
@@ -286,6 +303,9 @@ inline std::vector<PanelCopy> panel_copies(const std::vector<int>& want_groups) 
         if (!any) {
             g_probe_blank_window++;
         }
+    }
+    if (band_seq != 0) {
+        pragmatavr::note_band_reading(band_has, line_has);
     }
     for (const int g : want_groups) {
         int best = -1;
@@ -923,7 +943,12 @@ inline void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, c
             }
             // Build 66: every area is erased from the eyes, but while the objective banner and the subtitles take turns in
             // their shared spot, the spot is credited only to the one drawing, and to neither right after a swap.
-            const std::vector<D3D12_RECT> erase_rects = rects;
+            std::vector<D3D12_RECT> erase_rects{};
+            for (size_t k = 0; k < rects.size(); ++k) {
+                if (groups[k] < pragmatavr::GroupCount) { // Build 67: probe-only areas are never erased
+                    erase_rects.push_back(rects[k]);
+                }
+            }
             if (const int owner = pragmatavr::g_share_owner.load(std::memory_order_relaxed); owner >= 0) {
                 const bool settled = pragmatavr::g_share_handoffs.fetch_add(1, std::memory_order_relaxed) >= pragmatavr::SHARE_SKIP_HANDOFFS;
                 std::vector<D3D12_RECT> kr{};

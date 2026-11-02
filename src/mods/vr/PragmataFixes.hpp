@@ -102,6 +102,7 @@ public:
         // Build 62: tutorial / info windows (the subtitles give way while they show).
         if (h == "ui2201Gui"_fnv || h == "ui2202Gui"_fnv) {
             pragmatavr::g_window_drawn_ms.store(now_ms(), std::memory_order_relaxed);
+            pragmatavr::note_yield_cause(name); // Build 67: for the subtitle log
         }
 
         // Build 57: the red low health effect at the screen edges.
