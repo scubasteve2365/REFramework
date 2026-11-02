@@ -64,6 +64,7 @@
 #include "PragmataScreenProbe.hpp"
 #include "PragmataMarkerFix.hpp"
 #include "PragmataTexDiag.hpp"
+#include "PragmataMaxDetail.hpp"
 
 class PragmataFixes : public Mod {
 public:
@@ -150,6 +151,7 @@ public:
             if (t - last >= 500) {
                 last = t;
                 pragmata_tex_diag::sharp_textures(pragmatavr::HudTuning::get().tune()->sharp_textures);
+                pragmata_max_detail::apply(pragmatavr::HudTuning::get().tune()->max_detail); // Build 68
             }
             // Build 62: developer test, and the state 5 s after it.
             static int64_t reload_at = 0;

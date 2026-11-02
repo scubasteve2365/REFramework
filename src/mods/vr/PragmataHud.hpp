@@ -278,6 +278,7 @@ struct HudTune {
     // Build 59: sharp textures in VR. The game's own render config is asked for the highest minimum streaming texture
     // resolution and no load level bias (PragmataTexDiag.hpp), so textures do not stay at low detail in the headset.
     bool sharp_textures{true};
+    bool max_detail{false}; // Build 68: EXPERIMENTAL (see PragmataMaxDetail.hpp)
     // Build 60: developer switch for the gun reticle: true = NEW (Build 61: on its own view-space layer, RETICLE Size and
     // Distance), false = ORIGINAL (drawn exactly as in v0.9.1).
     bool reticle_new{false}; // Build 63: ORIGINAL by default (experimental)
@@ -286,7 +287,7 @@ struct HudTune {
     std::string subtitle_gui{"ui2010Gui"};
     bool subtitle_pin{true};
     // Build 62: developer switch, like Reticle: true = NEW (subtitles on their own panel), false = ORIGINAL (as v0.9.1).
-    bool subtitles_new{false}; // Build 63: ORIGINAL by default (experimental)
+    bool subtitles_new{true}; // Build 63: ORIGINAL by default (experimental). Build 68: NEW by default (fresh installs)
     // Build 66: 1 = objective banner and subtitles take turns in their shared capture spot (both stay on their panels);
     // 0 = Build 62 behaviour (the subtitles give way, drawn in the eyes, while the objective banner shows).
     bool subtitle_share{true};
@@ -743,6 +744,7 @@ enum MenuAction : int {
     ActionToggleReticleMode,    // Build 60
     ActionToggleSubtitleMode,   // Build 62
     ActionReloadTextures,       // Build 62 (developer test)
+    ActionToggleMaxDetail,      // Build 68
 };
 
 class HudTuning {
@@ -1223,6 +1225,8 @@ private:
         add_header("TEXTURES", "WORK IN PROGRESS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleSharpTextures, "Sharp textures",
             "A = On: the game keeps high resolution textures loaded in VR (uses more VRAM). Off: the game's own choice");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleMaxDetail, "Max detail",
+            "A = On: highest detail meshes and all texture levels everywhere (more GPU and VRAM). Off: the game's own choice");
         add_row(MenuRow::Kind::Action, -1, -1, ActionReloadTextures, "Reload textures",
             "A = test: drop and reload the game's streamed textures now (may hitch). For comparing texture detail");
         add_header("WORLD SCALE", "WORK IN PROGRESS"); // Build 67
@@ -1430,6 +1434,9 @@ private:
         s += fmt::format("hide_low_health={}\n", t.hide_low_health ? 1 : 0);
         s += "# sharp_textures: 1 = keep high resolution textures loaded in VR (Build 59).\n";
         s += fmt::format("sharp_textures={}\n", t.sharp_textures ? 1 : 0);
+        s += "# max_detail: 1 = highest mesh detail everywhere, all texture mip levels, every texture at top streaming\n";
+        s += "#   priority (Build 68, experimental; more GPU and VRAM use).\n";
+        s += fmt::format("max_detail={}\n", t.max_detail ? 1 : 0);
         s += "# reticle_new: 1 = gun reticle on its own layer (RETICLE Size and Distance), 0 = original drawing (Build 61).\n";
         s += fmt::format("reticle_new={}\n", t.reticle_new ? 1 : 0);
         s += "# subtitle_gui: the GUI that draws the subtitles (Build 61; none = subtitles not moved to a panel).\n";
@@ -1669,6 +1676,7 @@ private:
                 else if (key == "menu_native") t->menu_native = val != 0.0f;
                 else if (key == "hide_low_health") t->hide_low_health = val != 0.0f;
                 else if (key == "sharp_textures") t->sharp_textures = val != 0.0f;
+                else if (key == "max_detail") t->max_detail = val != 0.0f;
                 else if (key == "reticle_new") t->reticle_new = val != 0.0f;
                 else if (key == "subtitle_pin") t->subtitle_pin = val != 0.0f;
                 else if (key == "subtitles_new") t->subtitles_new = val != 0.0f;
@@ -2191,6 +2199,11 @@ private:
                     t->reticle_new = !t->reticle_new;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: reticle {}", t->reticle_new ? "new" : "original");
+                    play_click(true);
+                } else if (row.action == ActionToggleMaxDetail) {
+                    t->max_detail = !t->max_detail;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: max detail {}", t->max_detail ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleSharpTextures) {
                     t->sharp_textures = !t->sharp_textures;

@@ -200,11 +200,19 @@ inline void install() {
                 float cx = r[0] * k;
                 float cy = r[1] * k;
                 if (pragmatavr::nudge_marker(cx, cy)) {
+                    // Build 68: the first few of each marker kind, with where the game had it and where it went.
+                    static std::atomic<int> per_kind[5]{};
+                    const int kind = tl_owner_hash == "ui2020Gui"_fnv ? 0 : tl_owner_hash == "ui3200Gui"_fnv ? 1 :
+                                     tl_owner_hash == "ui3201Gui"_fnv ? 2 : tl_owner_hash == "ui3203Gui"_fnv ? 3 : 4;
+                    static const char* const kind_names[5]{"ui2020Gui (button prompt)", "ui3200Gui (enemy bar)", "ui3201Gui (damage)",
+                                                           "ui3203Gui", "ui3210Gui (boss bar)"};
+                    pragmatavr::g_marker_nudges.fetch_add(1, std::memory_order_relaxed);
+                    if (per_kind[kind].fetch_add(1, std::memory_order_relaxed) < 5) {
+                        spdlog::info("[PragmataVR] Marker fix: {} moved out of a HUD capture area, ({:.0f}, {:.0f}) -> ({:.0f}, {:.0f})",
+                                     kind_names[kind], r[0] * k, r[1] * k, cx, cy);
+                    }
                     r[0] = cx / k;
                     r[1] = cy / k;
-                    if (pragmatavr::g_marker_nudges.fetch_add(1, std::memory_order_relaxed) < 3) {
-                        spdlog::info("[PragmataVR] Marker fix: a marker was moved out of a HUD capture area (to {:.0f}, {:.0f})", cx, cy);
-                    }
                 }
             }
 
