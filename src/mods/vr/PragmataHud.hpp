@@ -1284,9 +1284,9 @@ private:
         add_element(GroupSubtitles); // Build 58
         add_header("TEXTURES", "WORK IN PROGRESS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleSharpTextures, "Sharp textures",
-            "A = On: the game keeps high resolution textures loaded in VR (uses more VRAM). Off: the game's own choice");
+            "A = On: never load textures below full size (lifts the game's low size floor). Light. Off: the game's own floor");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleMaxDetail, "Max detail",
-            "A = On: highest detail meshes and all texture levels everywhere (more GPU and VRAM). Off: the game's own choice");
+            "A = On: most detailed models even far away, no texture detail caps, bigger texture memory. Heavy on GPU and VRAM");
         add_row(MenuRow::Kind::Action, -1, -1, ActionReloadTextures, "Reload textures",
             "A = test: drop and reload the game's streamed textures now (may hitch). For comparing texture detail");
         add_header("WORLD SCALE", "WORK IN PROGRESS"); // Build 67
