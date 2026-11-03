@@ -1067,7 +1067,9 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
                 e.pose.position = XrVector3f{local.x, local.y, local.z};
             } else {
                 const auto& vrm = VR::get();
-                const glm::quat q = glm::normalize(glm::inverse(vrm->get_rotation_offset()));
+                // 1.0.1: with Decoupled Camera Pitch the view keeps only the camera's turn, so its tilt is added back here
+                // (the reticle moved against the gun when aiming up or down).
+                const glm::quat q = glm::normalize(glm::inverse(vrm->get_rotation_offset()) * vrm->get_decoupled_pitch_rotation());
                 const auto so = vrm->get_standing_origin();
                 const glm::vec3 pos = glm::vec3{so.x, so.y, so.z} + q * local;
                 e.view_space = false;

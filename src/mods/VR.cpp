@@ -2590,6 +2590,20 @@ void VR::apply_hmd_transform(glm::quat& rotation, Vector4f& position) {
     position = position + current_head_pos;
 }
 
+#if defined(PRAGMATA)
+// 1.0.1: with Decoupled Camera Pitch the eye views keep only the game camera's turn (yaw); its up / down tilt is left
+// out. This is that tilt, as a rotation in the turned frame (identity when decoupled pitch is off), so the reticle layer
+// can be put back on the game camera's real aim: aim (stage) = inverse(rotation offset) * this * forward.
+glm::quat VR::get_decoupled_pitch_rotation() const {
+    if (!m_decoupled_pitch->value()) {
+        return glm::identity<glm::quat>();
+    }
+    const auto cam_q = glm::normalize(m_original_camera_rotation);
+    const auto yaw_q = glm::normalize(glm::quat{utility::math::remove_y_component(Matrix4x4f{cam_q})});
+    return glm::normalize(glm::inverse(yaw_q) * cam_q);
+}
+#endif
+
 void VR::apply_hmd_transform(::REJoint* camera_joint) {
     
 
@@ -3509,6 +3523,10 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value = t.hide_low_health ? "HIDDEN" : "SHOWN";
             v.value_color = t.hide_low_health ? ACCENT : AMBER;
             break;
+        case pragmatavr::ActionToggleDecoupledPitch: // 1.0.1
+            v.value = t.decoupled_pitch == 1 ? "ON" : "OFF";
+            v.value_color = t.decoupled_pitch == 1 ? ACCENT : AMBER;
+            break;
         case pragmatavr::ActionToggleMenuNative:
             v.value = t.menu_native ? "ON" : "OFF";
             v.value_color = t.menu_native ? ACCENT : AMBER;
@@ -3789,7 +3807,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v1.0");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v1.0.1");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3882,7 +3900,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v1.0"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v1.0");
+        put(font, small_size, right - text_w(font, small_size, "v1.0.1"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v1.0.1");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4137,6 +4155,31 @@ void VR::on_present() {
         const bool sub_over_menu = pt->subtitle_menu_native && pt->subtitles_new && pragmatavr::g_subtitles_shown.load(std::memory_order_relaxed) &&
                                    pragmatavr::g_subtitle_yield.load(std::memory_order_relaxed) && pragmatavr::menu_or_window_up(now_ms);
         const bool in_menu = in_boot || sub_over_menu || (pt->menu_native && now_ms - pragmatavr::g_menu_drawn_ms.load(std::memory_order_relaxed) < 1000);
+        // 1.0.1: Decoupled Camera Pitch lives in the mod's ini (remembered across launches). The ini value is applied to
+        // REFramework's setting; a change made in REFramework's own menu is taken into the ini. First launch with no ini
+        // value: REFramework's current value (from re2_fw_config.txt) is taken over.
+        {
+            static int applied = -1;
+            const int rf = m_decoupled_pitch->value() ? 1 : 0;
+            if (pt->decoupled_pitch < 0) {
+                pragmatavr::HudTuning::get().set_decoupled_pitch(rf != 0);
+                applied = rf;
+                spdlog::info("[PragmataVR] Decoupled pitch {} (taken from re2_fw_config.txt into the mod settings)", rf ? "on" : "off");
+            } else if (applied < 0 || (pt->decoupled_pitch != applied && rf == applied)) {
+                if (rf != pt->decoupled_pitch) {
+                    m_decoupled_pitch->value() = pt->decoupled_pitch != 0;
+                    g_framework->request_save_config();
+                }
+                if (applied >= 0 || rf != pt->decoupled_pitch) {
+                    spdlog::info("[PragmataVR] Decoupled pitch {}", pt->decoupled_pitch ? "on" : "off");
+                }
+                applied = pt->decoupled_pitch;
+            } else if (rf != applied) {
+                pragmatavr::HudTuning::get().set_decoupled_pitch(rf != 0);
+                applied = rf;
+                spdlog::info("[PragmataVR] Decoupled pitch {} (changed in REFramework's menu, kept in the mod settings)", rf ? "on" : "off");
+            }
+        }
         static bool last_in_menu = false;
         if (pt->render_afw && in_menu != last_in_menu) {
             spdlog::info("[PragmataVR] Full-screen menu {}: render {}", in_menu ? "open" : "closed", in_menu ? "NATIVE" : "AFW");

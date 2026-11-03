@@ -305,6 +305,9 @@ struct HudTune {
     // resolution and no load level bias (PragmataTexDiag.hpp), so textures do not stay at low detail in the headset.
     bool sharp_textures{true};
     bool max_detail{false}; // Build 68: EXPERIMENTAL (see PragmataMaxDetail.hpp)
+    // 1.0.1: REFramework's Decoupled Camera Pitch, kept here so it is remembered (re2_fw_config.txt is only written when
+    // REFramework's own menu closes). -1 = not chosen yet: the value in re2_fw_config.txt is taken over on first launch.
+    int decoupled_pitch{-1};
     // Build 60: developer switch for the gun reticle: true = NEW (Build 61: on its own view-space layer, RETICLE Size and
     // Distance), false = ORIGINAL (drawn exactly as in v0.9.1).
     bool reticle_new{false}; // Build 63: ORIGINAL by default (experimental)
@@ -798,6 +801,7 @@ enum MenuAction : int {
     ActionResetDamage,          // Build 51
     ActionToggleShiftDamage,    // Build 43
     ActionToggleMenuNative,     // Build 55
+    ActionToggleDecoupledPitch, // 1.0.1
     ActionToggleLowHealth,      // Build 57
     ActionToggleSharpTextures,  // Build 59
     ActionToggleReticleMode,    // Build 60
@@ -1326,6 +1330,8 @@ private:
             "A = hide or show the red effect at the screen edges when health is low (made for a flat monitor)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleMenuNative, "Native in menus",
             "A = On: full-screen menus (Firmware Updater, terminals...) draw in NATIVE while open, no AFW trails. Off: keep AFW");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleDecoupledPitch, "Decoupled pitch",
+            "A = On: the view stays level when the camera tilts up or down (aim with the right stick, look with your head)");
         column = 1;
         add_header("DEVELOPER", "TOOLS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHackBackdrop, "Door hack backdrop",
@@ -1402,6 +1408,16 @@ public:
             m_loaded_once = false; // load the profile on the next check
             m_last_check = {};
         }
+    }
+
+    // 1.0.1: REFramework's Decoupled Camera Pitch was changed in REFramework's own menu: keep it in the ini.
+    void set_decoupled_pitch(bool on) {
+        auto t = copy_current();
+        if (t->decoupled_pitch == (on ? 1 : 0)) {
+            return;
+        }
+        t->decoupled_pitch = on ? 1 : 0;
+        commit(t);
     }
 
 private:
@@ -1499,6 +1515,10 @@ private:
         s += "# max_detail: 1 = highest mesh detail everywhere, all texture mip levels, every texture at top streaming\n";
         s += "#   priority (Build 68, experimental; more GPU and VRAM use).\n";
         s += fmt::format("max_detail={}\n", t.max_detail ? 1 : 0);
+        if (t.decoupled_pitch >= 0) {
+            s += "# decoupled_pitch: 1 = REFramework's Decoupled Camera Pitch on (the view stays level when the camera tilts) (1.0.1).\n";
+            s += fmt::format("decoupled_pitch={}\n", t.decoupled_pitch);
+        }
         s += "# reticle_new: 1 = gun reticle on its own layer (RETICLE Size and Distance), 0 = original drawing (Build 61).\n";
         s += fmt::format("reticle_new={}\n", t.reticle_new ? 1 : 0);
         s += "# reticle_auto_depth: 1 = the reticle is shown at the depth of what the aim is on (the game's depth buffer, AFW\n";
@@ -1746,6 +1766,7 @@ private:
                 else if (key == "hide_low_health") t->hide_low_health = val != 0.0f;
                 else if (key == "sharp_textures") t->sharp_textures = val != 0.0f;
                 else if (key == "max_detail") t->max_detail = val != 0.0f;
+                else if (key == "decoupled_pitch") t->decoupled_pitch = val != 0.0f ? 1 : 0;
                 else if (key == "reticle_new") t->reticle_new = val != 0.0f;
                 else if (key == "reticle_auto_depth") t->reticle_auto_depth = val != 0.0f;
                 else if (key == "reticle_depth_min") t->reticle_depth_min = std::clamp(val, 0.0f, 20.0f);
@@ -2290,6 +2311,11 @@ private:
                     t->hide_low_health = !t->hide_low_health;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: low health edges {}", t->hide_low_health ? "hidden" : "shown");
+                    play_click(true);
+                } else if (row.action == ActionToggleDecoupledPitch) {
+                    t->decoupled_pitch = t->decoupled_pitch == 1 ? 0 : 1;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: decoupled pitch {}", t->decoupled_pitch == 1 ? "on" : "off");
                     play_click(true);
                 } else if (row.action == ActionToggleMenuNative) {
                     t->menu_native = !t->menu_native;

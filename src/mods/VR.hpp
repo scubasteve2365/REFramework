@@ -261,6 +261,11 @@ public:
         return m_original_camera_matrix;
     }
 
+#if defined(PRAGMATA)
+    // 1.0.1: the game camera's up / down tilt that Decoupled Camera Pitch leaves out of the eye views (identity when off).
+    glm::quat get_decoupled_pitch_rotation() const;
+#endif
+
     const Matrix4x4f& get_last_render_matrix() {
         return m_render_camera_matrix;
     }
