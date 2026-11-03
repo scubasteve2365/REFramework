@@ -60,6 +60,31 @@ inline bool set_renderer_bool(const char* name, bool v) {
     return true;
 }
 
+// Build 69: a static int property of via.render.Renderer.
+inline bool get_renderer_int(const char* name, int32_t& out) {
+    auto t = sdk::find_type_definition("via.render.Renderer");
+    auto m = t != nullptr ? t->get_method((std::string{"get_"} + name).c_str()) : nullptr;
+    if (m == nullptr) {
+        return false;
+    }
+    out = m->call<int32_t>(sdk::get_thread_context());
+    return true;
+}
+
+inline bool set_renderer_int(const char* name, int32_t v) {
+    auto t = sdk::find_type_definition("via.render.Renderer");
+    auto m = t != nullptr ? t->get_method((std::string{"set_"} + name).c_str()) : nullptr;
+    if (m == nullptr) {
+        return false;
+    }
+    m->call<void*>(sdk::get_thread_context(), v);
+    return true;
+}
+
+// Build 69: StreamingResidentTextureTargetSize read 4096 on Steve's PC (likely MB of streamed texture data the game aims
+// to keep). With Max detail on it is raised to RESIDENT_TARGET so more full size textures can stay loaded.
+inline constexpr int32_t RESIDENT_TARGET = 16384;
+
 // The detail related values the game uses (logged; static properties, no instance needed).
 inline std::string state() {
     std::string out{};
@@ -137,6 +162,8 @@ inline void apply(bool on) {
     static bool have_orig = false;
     static bool orig_disable_lod = false;
     static bool orig_ignore_fixed = false;
+    static int32_t orig_resident = 0;
+    static bool have_resident = false;
     static bool applied = false;
     static int64_t last_state_log = 0;
     if (!init) {
@@ -153,6 +180,13 @@ inline void apply(bool on) {
             orig_ignore_fixed = b;
         }
     }
+    if (!have_resident) {
+        int32_t r = 0;
+        if (get_renderer_int("StreamingResidentTextureTargetSize", r) && r > 0) {
+            have_resident = true;
+            orig_resident = r;
+        }
+    }
     if (on) {
         bool lod = false, fixed = false;
         bool changed = false;
@@ -161,6 +195,10 @@ inline void apply(bool on) {
         }
         if (get_renderer_bool("IgnoreFixedMipNum", fixed) && !fixed) {
             changed |= set_renderer_bool("IgnoreFixedMipNum", true);
+        }
+        int32_t resident = 0;
+        if (have_resident && get_renderer_int("StreamingResidentTextureTargetSize", resident) && resident < (std::max)(RESIDENT_TARGET, orig_resident)) {
+            changed |= set_renderer_int("StreamingResidentTextureTargetSize", (std::max)(RESIDENT_TARGET, orig_resident));
         }
         if (changed || !applied) {
             applied = true;
@@ -180,6 +218,9 @@ inline void apply(bool on) {
         if (have_orig) {
             set_renderer_bool("DisableLod", orig_disable_lod);
             set_renderer_bool("IgnoreFixedMipNum", orig_ignore_fixed);
+        }
+        if (have_resident) {
+            set_renderer_int("StreamingResidentTextureTargetSize", orig_resident);
         }
         spdlog::info("[PragmataVR] Max detail: off (game values back):{}", state());
     }
