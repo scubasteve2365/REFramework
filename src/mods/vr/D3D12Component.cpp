@@ -15,6 +15,7 @@
 #include <../../directxtk12-src/Inc/DescriptorHeap.h>
 #include "PragmataHud.hpp"
 #include "PragmataGpuTrace.hpp"
+#include "PragmataDepthProbe.hpp"
 
 namespace {
 // PragmataVR: copies the VR mod menu (drawn by ImGui into REFramework's IMGUI render target) into the
@@ -1034,8 +1035,30 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
             const float sw = (float)p.src_w;
             const float sh = (float)p.src_h;
             const float s = (std::min)(sw / 1920.0f, sh / 1080.0f);
-            const float dist = tune->screen[pragmatavr::ScreenReticleDist];
-            const float k = (std::max)(0.05f, rg.size);
+            // Reticle depth: hand the reticle's direction to the depth tick (main thread), and with Depth = TARGET show the
+            // reticle at the depth of what the aim is on (RETICLE Distance when nothing is there or no depth has come back
+            // lately). Its size follows the depth as Depth Scale sets (below).
+            auto& rdepth = pragmatavr::g_reticle_depth;
+            rdepth.tan_x.store(tx, std::memory_order_relaxed);
+            rdepth.tan_y.store(ty, std::memory_order_relaxed);
+            float dist = tune->screen[pragmatavr::ScreenReticleDist];
+            if (pragmatavr::reticle_depth_on(*tune)) { // Build 69: Depth-based mode (AFW only)
+                const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const float d = rdepth.depth_m.load(std::memory_order_relaxed);
+                if (d > 0.0f && std::isfinite(d) && now - rdepth.ms.load(std::memory_order_relaxed) < 500) {
+                    // Build 69: the depth is in game metres; with World scale the world is seen 1 / scale as big, so the
+                    // layer (room metres) goes to d / scale to sit on the target.
+                    const float ws = (std::max)(0.25f, pragmatavr::g_world_scale.load(std::memory_order_relaxed));
+                    dist = d / ws;
+                }
+            }
+            // Depth Scale: the quad keeps the same size in view at any depth (0), or shrinks further away and grows nearer,
+            // relative to its size at RETICLE Distance: 0.5 = perspective, 1 = twice that.
+            const float ref_dist = tune->screen[pragmatavr::ScreenReticleDist];
+            const float persp = ref_dist > 0.0f && dist > 0.0f
+                ? std::clamp(std::pow(ref_dist / dist, 2.0f * tune->screen[pragmatavr::ScreenReticleDepthScale]), 0.1f, 4.0f) : 1.0f;
+            const float k = (std::max)(0.05f, rg.size) * persp;
             const float m_per_canvas_px = dist / (960.0f * m00);
             const glm::vec3 local{tx * dist, ty * dist, -dist};
             if (tune->head_locked) {
@@ -1456,6 +1479,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     if ((vr->is_using_any_afw()) && m_eyeFrameBuffers.eyeFrameBuffers[0].color.pTexture && vr->depthTex[0]) {
         static FrameBufferDesc s_CurrentEyeFrameBuffer{};
+#if defined(PRAGMATA)
+        // Reticle depth from this eye's depth buffer (see PragmataDepthProbe.hpp).
+        pragmata_depth_probe::sample(vr->d3d12Renderer->GetDevice(), vr->d3d12Renderer->GetCommandQueue(), vr->depthTex[0], vr->cameraData[nEye]);
+#endif
 
         s_CurrentEyeFrameBuffer.color = texDesc[texIndex];
         s_CurrentEyeFrameBuffer.depth = vr->depthDesc[0];

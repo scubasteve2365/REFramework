@@ -3443,8 +3443,9 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value = pragmatavr::HudTuning::format_screen(t, row.field);
             v.invert_on = t.screen_invert[row.field];
             v.dim = !t.hud_panel && (t.flat_test || !t.hud_fixed); // ANCHORED panel, or the room-fixed 3D HUD
-            if (row.field == pragmatavr::ScreenReticleDist) {
-                v.dim = !t.reticle_new || pragmatavr::group_locked(t, pragmatavr::GroupReticle); // Build 61
+            if (row.field == pragmatavr::ScreenReticleDist || row.field == pragmatavr::ScreenReticleDepthScale) {
+                v.dim = !pragmatavr::reticle_layer_on(t) || pragmatavr::group_locked(t, pragmatavr::GroupReticle) ||
+                        (row.field == pragmatavr::ScreenReticleDepthScale && !pragmatavr::reticle_depth_on(t)); // Build 61 / 69
             }
         } else if (row.group == pragmatavr::GROUP_ENEMY) {
             v.value = fmt::format("{:+.0f}", t.enemy_bar[row.field]);
@@ -3459,7 +3460,7 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.invert_on = t.groups[row.group].invert[row.field];
             v.dim = per_panel_off || pragmatavr::group_locked(t, row.group) ||
                     (row.field == pragmatavr::FieldGap && t.hud_panel && row.group != pragmatavr::GroupHack) || // ANCHORED: no eye gap
-                    (row.group == pragmatavr::GroupReticle && !t.reticle_new); // Build 61: Reticle = ORIGINAL
+                    (row.group == pragmatavr::GroupReticle && !pragmatavr::reticle_layer_on(t)); // Build 61: Reticle = ORIGINAL
         }
         break;
     case Kind::Toggle:
@@ -3489,8 +3490,12 @@ PragmataRowView pragmata_row_view(const pragmatavr::HudTune& t, const pragmatavr
             v.value_color = t.subtitles_new ? ACCENT : AMBER;
             break;
         case pragmatavr::ActionToggleReticleMode:
-            v.value = t.reticle_new ? "NEW" : "ORIGINAL";
-            v.value_color = t.reticle_new ? ACCENT : AMBER;
+            // Build 69: ORIGINAL / NEW / DEPTH-BASED (Depth-based only in the AFW render mode).
+            switch (pragmatavr::reticle_mode(t)) {
+            case pragmatavr::ReticleModeDepth: v.value = "DEPTH-BASED"; v.value_color = ACCENT; break;
+            case pragmatavr::ReticleModeNew: v.value = "NEW"; v.value_color = ACCENT; break;
+            default: v.value = "ORIGINAL"; v.value_color = AMBER; break;
+            }
             break;
         case pragmatavr::ActionToggleSharpTextures:
             v.value = t.sharp_textures ? "ON" : "OFF";
@@ -3784,7 +3789,7 @@ void VR::on_frame() {
     const float title_spacing = title_size * 0.14f;
     const float tier_spacing = tier_size * 0.14f;
     const float title_w = spaced(bold, title_size, 0, 0, 0, "PRAGMATA VR", title_spacing, false) + fs * 0.6f +
-        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.3 B68");
+        spaced(bold, title_size, 0, 0, 0, "MOD MENU", title_spacing, false) + gap * 2.0f + text_w(font, small_size, "v0.9.3 B69");
 
     // Build 36: the tab bar (LT, the four tab titles, RT) replaces the two band titles.
     const float tab_gap = std::round(fs * 1.6f);
@@ -3877,7 +3882,7 @@ void VR::on_frame() {
     {
         const float tx = left + spaced(bold, title_size, left, y, TEXT_BRIGHT, "PRAGMATA VR", title_spacing, true) + fs * 0.6f;
         spaced(bold, title_size, tx, y, ACCENT, "MOD MENU", title_spacing, true);
-        put(font, small_size, right - text_w(font, small_size, "v0.9.3 B68"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.3 B68");
+        put(font, small_size, right - text_w(font, small_size, "v0.9.3 B69"), y + (title_size - small_size) * 0.75f, TEXT_DIM, "v0.9.3 B69");
 
         const float ly = std::floor(y + title_size * 1.25f + fs * 0.25f);
         dl->AddLine(ImVec2{left, ly}, ImVec2{right, ly}, ACCENT_FAINT, 1.0f);
@@ -4897,7 +4902,7 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
             if (ftune->enabled && ftune->flat_test) {
                 std::string_view fpartner{};
                 int fgroup = pragmatavr::group_for(name);
-                if (fgroup == pragmatavr::GroupReticle && !ftune->reticle_new) {
+                if (fgroup == pragmatavr::GroupReticle && !pragmatavr::reticle_layer_on(*ftune)) { // Build 69: mode in effect
                     fgroup = -1; // Build 60: Reticle = ORIGINAL, drawn as in v0.9.1
                 }
                 if (fgroup == pragmatavr::GroupSubtitles && !ftune->subtitles_new) {

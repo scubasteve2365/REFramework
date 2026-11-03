@@ -222,6 +222,32 @@ struct ReticleAim {
 };
 inline ReticleAim g_reticle_aim{};
 
+// Reticle depth (port of uevrlib's reticule targeting: show the reticle at the depth of what the aim is on).
+// pragmata_reticle_depth::tick (main thread, before PrerenderGUI) hands the aim ray to the depth buffer probe
+// (PragmataDepthProbe.hpp, render thread) and smooths the distance it reads back; the reticle layer (D3D12Component,
+// render thread) is then placed at that depth instead of the fixed RETICLE Distance.
+struct ReticleDepth {
+    std::atomic<float> tan_x{0.0f}, tan_y{0.0f}; // reticle direction (tan, x right, y up), written by the layer code
+    std::atomic<float> depth_m{0.0f};            // smoothed depth along the reticle axis (m), 0 = none yet
+    std::atomic<int64_t> ms{0};                  // steady clock ms of the last depth update
+    std::atomic<int64_t> seen_ms{0};             // steady clock ms the gun reticle GUI was last drawn
+    // The aim ray in world space (main thread), and what the game's depth buffer shows along it (render thread): the
+    // distance along the ray, -1 = nothing drawn there (sky).
+    std::atomic<float> ray_ox{0.0f}, ray_oy{0.0f}, ray_oz{0.0f};
+    std::atomic<float> ray_dx{0.0f}, ray_dy{0.0f}, ray_dz{0.0f};
+    std::atomic<float> ray_guess_m{20.0f};       // where along the ray to look in the eye image (the last depth)
+    std::atomic<int64_t> ray_ms{0};              // 0 = no ray (depth off)
+    std::atomic<float> buf_dist_m{0.0f};
+    std::atomic<int64_t> buf_ms{0};              // steady clock ms of the last depth buffer result
+};
+inline ReticleDepth g_reticle_depth{};
+
+// Build 69: reticle modes. ORIGINAL = drawn as the game does; NEW = own layer at RETICLE Distance (Build 63);
+// DEPTH-BASED = own layer at the depth of what the aim is on (PR #1 by hookmanuk, the game's depth buffer). Depth-based
+// needs the AFW render mode (that is where the depth buffer and per-eye matrices are); with NATIVE it is not offered,
+// and a saved Depth-based setting acts as ORIGINAL (no AFW smearing to fix there).
+enum ReticleMode : int { ReticleModeOriginal = 0, ReticleModeNew = 1, ReticleModeDepth = 2 };
+
 // Build 57: while a snapshot is taken, the GUI draw callbacks collect the names of every GUI drawn (steady clock ms;
 // PragmataFixes logs them), to identify effects such as the low health screen edges.
 inline std::atomic<int64_t> g_gui_list_until_ms{0};
@@ -282,6 +308,13 @@ struct HudTune {
     // Build 60: developer switch for the gun reticle: true = NEW (Build 61: on its own view-space layer, RETICLE Size and
     // Distance), false = ORIGINAL (drawn exactly as in v0.9.1).
     bool reticle_new{false}; // Build 63: ORIGINAL by default (experimental)
+    // Reticle depth: true = TARGET (the reticle is shown at the depth of what the aim is on, from the game's depth
+    // buffer, like uevrlib's reticule; RETICLE Distance when nothing is drawn there, or not in AFW render mode), false =
+    // FIXED (always at RETICLE Distance). Only used with reticle_new (Build 69: menu mode DEPTH-BASED).
+    bool reticle_auto_depth{false}; // Build 69: the Reticle row cycles ORIGINAL / NEW / DEPTH-BASED (DEPTH-BASED = new + this)
+    float reticle_depth_min{1.0f};  // depths closer than this (m from the game camera) are ignored
+    float reticle_depth_max{100.0f}; // the furthest the reticle is shown (m)
+    float reticle_depth_smooth{0.06f}; // smoothing time constant (s); 0 = none
     // Build 61: the subtitle GUI (ini subtitle_gui) and whether it is pinned to its monitor anchor while the HUD panels
     // are on (the game otherwise places walk-and-talk subtitles next to the speaker, outside their capture area).
     std::string subtitle_gui{"ui2010Gui"};
@@ -331,8 +364,8 @@ struct HudTune {
     int layout_mode{0};
     // width (degrees), distance (m), left/right (deg), up/down (deg). v0.9.0: Quest 3 tuning. Build 61: [4] = reticle distance (m),
     // 1.0 = where REFramework's own 2D UI sheet showed it (VR_2DUIDistance).
-    std::array<float, 6> screen{100.0f, 2.5f, 0.0f, 0.0f, 3.0f, 1.0f}; // Build 62: reticle 3.0 m (was 1.0). Build 67: world scale 1.0
-    std::array<bool, 6> screen_invert{};
+    std::array<float, 7> screen{100.0f, 2.5f, 0.0f, 0.0f, 3.0f, 1.0f, 0.5f}; // Build 62: reticle 3.0 m (was 1.0). Build 67: world scale 1.0. Build 69: reticle depth scale 0.5
+    std::array<bool, 7> screen_invert{};
 
     // Build 35: PERFORMANCE section. These drive REFramework's own settings (VR::on_present applies them), so the
     // values in re2_fw_config.txt for them no longer matter.
@@ -468,6 +501,31 @@ inline const GroupTune& active_group(const HudTune& t, int g) {
 }
 
 // The hacking circle lock protects its 3D values only.
+// Build 69: the reticle mode in effect (Depth-based without the AFW render mode acts as ORIGINAL), the layer and depth
+// switches the rest of the code uses, and the next mode for the menu's A button.
+inline int reticle_mode(const HudTune& t) {
+    if (!t.reticle_new) {
+        return ReticleModeOriginal;
+    }
+    if (t.reticle_auto_depth) {
+        return t.render_afw ? ReticleModeDepth : ReticleModeOriginal;
+    }
+    return ReticleModeNew;
+}
+inline bool reticle_layer_on(const HudTune& t) {
+    return reticle_mode(t) != ReticleModeOriginal;
+}
+inline bool reticle_depth_on(const HudTune& t) {
+    return reticle_mode(t) == ReticleModeDepth;
+}
+inline int reticle_mode_next(const HudTune& t) {
+    switch (reticle_mode(t)) {
+    case ReticleModeOriginal: return ReticleModeNew;
+    case ReticleModeNew: return t.render_afw ? ReticleModeDepth : ReticleModeOriginal;
+    default: return ReticleModeOriginal;
+    }
+}
+
 inline bool group_locked(const HudTune& t, int g) {
     return g >= 0 && g < GroupCount && t.locked[g];
 }
@@ -654,13 +712,14 @@ enum ScreenField : int {
     ScreenPitch = 3,
     ScreenReticleDist = 4, // Build 61
     ScreenWorldScale = 5,  // Build 67: eye distance and head movement multiplier (above 1 the world looks smaller)
+    ScreenReticleDepthScale = 6, // Build 69 (PR #1, hookmanuk): reticle size with depth (Depth-based): 0 = same size at any depth, 1 = twice perspective
 };
-inline constexpr int SCREEN_FIELDS = 6;
-inline constexpr std::array<const char*, SCREEN_FIELDS> SCREEN_KEYS{"width", "distance", "yaw", "pitch", "reticle_distance", "world_scale"};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MIN{20.0f, 0.5f, -60.0f, -45.0f, 0.3f, 0.25f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f, 20.0f, 10.0f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f, 0.1f, 0.05f};
-inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f, 0.5f, 0.25f};
+inline constexpr int SCREEN_FIELDS = 7;
+inline constexpr std::array<const char*, SCREEN_FIELDS> SCREEN_KEYS{"width", "distance", "yaw", "pitch", "reticle_distance", "world_scale", "reticle_depth_scale"};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MIN{20.0f, 0.5f, -60.0f, -45.0f, 0.3f, 0.25f, 0.0f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_MAX{140.0f, 10.0f, 60.0f, 45.0f, 20.0f, 10.0f, 1.0f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP{2.0f, 0.1f, 1.0f, 1.0f, 0.1f, 0.05f, 0.1f};
+inline constexpr std::array<float, SCREEN_FIELDS> SCREEN_STEP_BIG{10.0f, 0.5f, 5.0f, 5.0f, 0.5f, 0.25f, 0.5f};
 
 // Build 40: enemy health bars (ui3200Gui, boss ui3210Gui). With the headset projection they land a fixed amount left of
 // and above the enemy (Quest 3 test); these move them back, in canvas pixels (y positive = down). Headset projection only.
@@ -1065,6 +1124,7 @@ public:
         case ScreenPitch: return fmt::format("{:+.0f} deg", t.screen[3]);
         case ScreenReticleDist: return fmt::format("{:.1f} m", t.screen[4]);
         case ScreenWorldScale: return fmt::format("{:.2f}x", t.screen[5]);
+        case ScreenReticleDepthScale: return fmt::format("{:.1f}", t.screen[6]);
         default: return {};
         }
     }
@@ -1235,7 +1295,7 @@ private:
         column = 1;
         add_header("RETICLE", "WORK IN PROGRESS");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleReticleMode, "Reticle",
-            "A = New (own layer: no AFW doubling, follows the game camera; tune it below) or Original (as before)");
+            "A = cycle Original (as the game draws it), New (own layer at Distance: no AFW doubling) and Depth-based (own layer at the depth you aim at; AFW only)");
         // Build 60: the reticle stays where the gun points.
         add_section(section_for_group(GroupReticle), GROUP_TITLES[GroupReticle]);
         m_rows.back().group = GroupReticle;
@@ -1245,8 +1305,10 @@ private:
             "A = edit. Moves the reticle sideways onto where your shots land");
         add_row(MenuRow::Kind::Value, GroupReticle, FieldY, ActionNone, "Up / down",
             "A = edit. Moves the reticle up or down onto where your shots land");
+        add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenReticleDepthScale, ActionNone, "Depth scale",
+            "A = edit. Depth-based: how much the reticle's size follows its depth. 0 = never changes, 1 = most");
         add_row(MenuRow::Kind::Value, GROUP_SCREEN, ScreenReticleDist, ActionNone, "Distance",
-            "A = edit. How far away the gun reticle is shown (meters): its depth. Its size in view stays the same");
+            "A = edit. How far away the gun reticle is shown (meters); Depth-based uses it when the aim hits nothing");
         add_row(MenuRow::Kind::Action, GroupReticle, -1, ActionResetGroup, "Reset to defaults", "A = back to the starting values (blocked while locked)");
 
         // ==== ADVANCED ====
@@ -1439,6 +1501,13 @@ private:
         s += fmt::format("max_detail={}\n", t.max_detail ? 1 : 0);
         s += "# reticle_new: 1 = gun reticle on its own layer (RETICLE Size and Distance), 0 = original drawing (Build 61).\n";
         s += fmt::format("reticle_new={}\n", t.reticle_new ? 1 : 0);
+        s += "# reticle_auto_depth: 1 = the reticle is shown at the depth of what the aim is on (the game's depth buffer, AFW\n";
+        s += "#   render mode), 0 = always at RETICLE Distance. reticle_depth_min / _max: nearest and furthest depth used (m).\n";
+        s += "#   reticle_depth_smooth: smoothing time (s). screen.reticle_depth_scale: size with depth (menu Depth Scale).\n";
+        s += fmt::format("reticle_auto_depth={}\n", t.reticle_auto_depth ? 1 : 0);
+        s += fmt::format("reticle_depth_min={:.2f}\n", t.reticle_depth_min);
+        s += fmt::format("reticle_depth_max={:.1f}\n", t.reticle_depth_max);
+        s += fmt::format("reticle_depth_smooth={:.3f}\n", t.reticle_depth_smooth);
         s += "# subtitle_gui: the GUI that draws the subtitles (Build 61; none = subtitles not moved to a panel).\n";
         s += "# subtitle_pin: 1 = subtitles held at their screen spot while shown on their panel (not next to the speaker).\n";
         s += fmt::format("subtitle_gui={}\n", t.subtitle_gui.empty() ? std::string{"none"} : t.subtitle_gui);
@@ -1678,6 +1747,10 @@ private:
                 else if (key == "sharp_textures") t->sharp_textures = val != 0.0f;
                 else if (key == "max_detail") t->max_detail = val != 0.0f;
                 else if (key == "reticle_new") t->reticle_new = val != 0.0f;
+                else if (key == "reticle_auto_depth") t->reticle_auto_depth = val != 0.0f;
+                else if (key == "reticle_depth_min") t->reticle_depth_min = std::clamp(val, 0.0f, 20.0f);
+                else if (key == "reticle_depth_max") t->reticle_depth_max = std::clamp(val, 2.0f, 1000.0f);
+                else if (key == "reticle_depth_smooth") t->reticle_depth_smooth = std::clamp(val, 0.0f, 1.0f);
                 else if (key == "subtitle_pin") t->subtitle_pin = val != 0.0f;
                 else if (key == "subtitles_new") t->subtitles_new = val != 0.0f;
                 else if (key == "subtitle_share") t->subtitle_share = val != 0.0f;
@@ -2085,7 +2158,7 @@ private:
 
         if (vk == VK_RETURN && row.kind == MenuRow::Kind::Value && !menu_on_invert.load()) {
             if ((row.group >= 0 && row.group < GroupCount && group_locked(*t, row.group)) || (row.group == GROUP_ENEMY && enemy_field_locked(*t, row.field)) ||
-                (row.group == GROUP_SCREEN && row.field == ScreenReticleDist && group_locked(*t, GroupReticle))) { // Build 61
+                (row.group == GROUP_SCREEN && (row.field == ScreenReticleDist || row.field == ScreenReticleDepthScale) && group_locked(*t, GroupReticle))) { // Build 61
                 play_click(false);
                 return;
             }
@@ -2196,9 +2269,12 @@ private:
                     spdlog::info("[PragmataVR] Menu: subtitles {}", t->subtitles_new ? "new" : "original");
                     play_click(true);
                 } else if (row.action == ActionToggleReticleMode) {
-                    t->reticle_new = !t->reticle_new;
+                    // Build 69: ORIGINAL -> NEW -> DEPTH-BASED (AFW render mode only) -> ORIGINAL.
+                    const int next = reticle_mode_next(*t);
+                    t->reticle_new = next != ReticleModeOriginal;
+                    t->reticle_auto_depth = next == ReticleModeDepth;
                     commit(t);
-                    spdlog::info("[PragmataVR] Menu: reticle {}", t->reticle_new ? "new" : "original");
+                    spdlog::info("[PragmataVR] Menu: reticle {}", next == ReticleModeDepth ? "depth-based" : (next == ReticleModeNew ? "new" : "original"));
                     play_click(true);
                 } else if (row.action == ActionToggleMaxDetail) {
                     t->max_detail = !t->max_detail;
@@ -2374,6 +2450,7 @@ private:
                         t->flat_groups[row.group] = default_flat_group(row.group);
                         if (row.group == GroupReticle) {
                             t->screen[ScreenReticleDist] = HudTune{}.screen[ScreenReticleDist]; // Build 61
+                            t->screen[ScreenReticleDepthScale] = HudTune{}.screen[ScreenReticleDepthScale];
                         }
                     } else {
                         const auto inverts = t->groups[row.group].invert;
