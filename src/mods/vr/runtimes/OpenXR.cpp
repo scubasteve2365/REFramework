@@ -469,7 +469,7 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
             if (xrGetInstanceProperties(this->instance, &props) == XR_SUCCESS) {
                 runtime_name = props.runtimeName;
-                // 1.0.2: Picture = AUTO uses STEADY on Virtual Desktop, PANEL elsewhere.
+                // 1.1: Picture = AUTO uses STEADY on Virtual Desktop, PANEL elsewhere.
                 const bool vd = pragmatavr::runtime_is_virtual_desktop(runtime_name);
                 pragmatavr::g_runtime_vd.store(vd ? 1 : 0, std::memory_order_relaxed);
                 spdlog::info("[PragmataVR] Picture: runtime \"{}\" is {}Virtual Desktop, AUTO picks {}", runtime_name, vd ? "" : "not ",
@@ -1638,7 +1638,7 @@ XrResult OpenXR::end_frame() {
     XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad hud_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     std::array<XrCompositionLayerQuad, 12> hud_element_layers{}; // PragmataVR Build 56. Build 61: 8 elements now (subtitles, reticle)
-    XrCompositionLayerProjection steady_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION}; // PragmataVR 1.0.2
+    XrCompositionLayerProjection steady_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION}; // PragmataVR 1.1
     std::array<XrCompositionLayerProjectionView, 2> steady_views{};
 
     // we CANT push the layers every time, it cause some layer error
@@ -1664,7 +1664,7 @@ XrResult OpenXR::end_frame() {
 
         // HUD elements (PragmataVR Build 17, Build 56: one quad per element), under the menu. The UI buffer holds
         // premultiplied alpha. Fixed: room space. Follows Head: view space.
-        // PragmataVR 1.0.2, Picture = STEADY: the HUD and the menu were drawn into one transparent projection layer
+        // PragmataVR 1.1, Picture = STEADY: the HUD and the menu were drawn into one transparent projection layer
         // (pragmata_update_steady) with the same views as the game image, and replace the quads below.
         const auto& sl = this->steady;
         if (sl.active && sl.visible && sl.owner == this->session && sl.swapchains[0] != XR_NULL_HANDLE && sl.swapchains[1] != XR_NULL_HANDLE &&

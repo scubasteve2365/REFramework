@@ -215,7 +215,7 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
 // a fixed pose in stage space. The runtime's compositor draws it with full perspective for each eye at display time,
 // so the panel stays exactly where it was placed whatever the head does.
 struct PragmataMenuQuad {
-    D3D12_BOX last_box{}; // 1.0.2: the menu rectangle in the ImGui target copied this frame (Picture = STEADY reads it)
+    D3D12_BOX last_box{}; // 1.1: the menu rectangle in the ImGui target copied this frame (Picture = STEADY reads it)
     std::vector<XrSwapchainImageD3D12KHR> images{};
     std::vector<std::unique_ptr<d3d12::CommandContext>> cmds{};
     bool failed{false};
@@ -452,7 +452,7 @@ struct PragmataHudPanel {
     Microsoft::WRL::ComPtr<ID3D12Resource> good{};
     // Build 34: left-eye frames spent in Follows Head mode with the Fixed textures still allocated.
     int idle_frames{0};
-    // 1.0.2: the image the element quads show this frame (comp, or the capture itself), in COMMON state; Picture = STEADY
+    // 1.1: the image the element quads show this frame (comp, or the capture itself), in COMMON state; Picture = STEADY
     // draws the elements from it. nullptr when the HUD quads are not shown.
     ID3D12Resource* steady_src{nullptr};
 };
@@ -1120,7 +1120,7 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     }
 }
 
-// PragmataVR 1.0.2: Picture = STEADY (cross-mod standard, 2026-11-08). Virtual Desktop's compositor stretches and shears
+// PragmataVR 1.1: Picture = STEADY (cross-mod standard, 2026-11-08). Virtual Desktop's compositor stretches and shears
 // quad layers when the head turns, so in STEADY the HUD elements and the menu are not submitted as quads: each frame
 // they are drawn into a second, transparent projection layer (one image per eye) from the very views that layer is
 // submitted with, the same way the game image reaches the headset. Every quad keeps its pose and size, and its picture
@@ -2268,7 +2268,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #if defined(PRAGMATA)
             pragmata_update_hud_quad(vr->m_openxr.get());
             pragmata_update_menu_quad(vr->m_openxr.get());
-            pragmata_update_steady(vr->m_openxr.get()); // 1.0.2: Picture = STEADY
+            pragmata_update_steady(vr->m_openxr.get()); // 1.1: Picture = STEADY
 #endif
 
             auto result = vr->m_openxr->end_frame();
@@ -2283,7 +2283,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 // only if frames keep being rejected while it is shown.
                 static int hud_rejections = 0;
                 if (vr->m_openxr->steady.active && vr->m_openxr->steady.visible) {
-                    // 1.0.2: same rule for the STEADY layer: drop it for the retry; after 120 rejections use PANEL.
+                    // 1.1: same rule for the STEADY layer: drop it for the retry; after 120 rejections use PANEL.
                     vr->m_openxr->steady.visible = false;
                     if (++g_pragmata_steady.rejections >= 120) {
                         spdlog::error("[PragmataVR] Runtime keeps rejecting frames with the STEADY picture layer; Picture switched to PANEL");

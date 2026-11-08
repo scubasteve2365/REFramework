@@ -151,7 +151,7 @@ public:
     };
     std::vector<HudElementQuad> hud_elements{};
     bool hud_head_locked{false}; // Follows Head: the element quads are in view space
-    // PragmataVR 1.0.2, Picture = STEADY: the HUD elements and the menu are drawn into a second, transparent projection
+    // PragmataVR 1.1, Picture = STEADY: the HUD elements and the menu are drawn into a second, transparent projection
     // layer (one image per eye, drawn from the same views it is submitted with) instead of quad layers. `active` = STEADY
     // is in effect (the quads are not submitted); `visible` = the layer was drawn this frame.
     struct SteadyLayer {
