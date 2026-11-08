@@ -13,6 +13,8 @@
 #include <wincodec.h>
 #include <../../directxtk12-src/Inc/ScreenGrab.h>
 #include <../../directxtk12-src/Inc/DescriptorHeap.h>
+#include <../../directxtk12-src/Inc/CommonStates.h>
+#include <stdexcept>
 #include "PragmataHud.hpp"
 #include "PragmataGpuTrace.hpp"
 #include "PragmataDepthProbe.hpp"
@@ -213,6 +215,7 @@ void pragmata_composite_menu(VR* vr, ID3D12Resource* backbuffer, UINT bb_index, 
 // a fixed pose in stage space. The runtime's compositor draws it with full perspective for each eye at display time,
 // so the panel stays exactly where it was placed whatever the head does.
 struct PragmataMenuQuad {
+    D3D12_BOX last_box{}; // 1.0.2: the menu rectangle in the ImGui target copied this frame (Picture = STEADY reads it)
     std::vector<XrSwapchainImageD3D12KHR> images{};
     std::vector<std::unique_ptr<d3d12::CommandContext>> cmds{};
     bool failed{false};
@@ -394,6 +397,7 @@ bool pragmata_update_menu_quad(runtimes::OpenXR* openxr) {
     cmds.wait(INFINITE);
 
     D3D12_BOX box{src_left, src_top, 0, src_right, src_bottom, 1};
+    q.last_box = box;
     cmds.copy_region(imgui_rt.Get(), q.images[index].texture, &box, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
     cmds.execute();
 
@@ -448,6 +452,9 @@ struct PragmataHudPanel {
     Microsoft::WRL::ComPtr<ID3D12Resource> good{};
     // Build 34: left-eye frames spent in Follows Head mode with the Fixed textures still allocated.
     int idle_frames{0};
+    // 1.0.2: the image the element quads show this frame (comp, or the capture itself), in COMMON state; Picture = STEADY
+    // draws the elements from it. nullptr when the HUD quads are not shown.
+    ID3D12Resource* steady_src{nullptr};
 };
 
 PragmataHudPanel g_pragmata_hud{};
@@ -756,6 +763,7 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
     auto& p = g_pragmata_hud;
     auto& hud = pragmatavr::HudTuning::get();
     hq.visible = false;
+    p.steady_src = nullptr;
 
     const auto tune = hud.tune();
     // Build 34: Follows Head mode drops the quad swapchain (made again on the next switch to Fixed).
@@ -966,8 +974,10 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         tr(p.images[index].texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
         tr(p.comp.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         cmds.has_commands = true;
+        p.steady_src = p.comp.Get();
     } else {
         cmds.copy(cap, p.images[index].texture, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        p.steady_src = cap;
     }
     cmds.execute();
 
@@ -1107,6 +1117,460 @@ void pragmata_update_hud_quad(runtimes::OpenXR* openxr) {
         logged = true;
         spdlog::info("[PragmataVR] HUD panel shown: {:.2f} x {:.2f} m at ({:.2f}, {:.2f}, {:.2f})",
             placement.width_m, placement.height_m, placement.position.x, placement.position.y, placement.position.z);
+    }
+}
+
+// PragmataVR 1.0.2: Picture = STEADY (cross-mod standard, 2026-11-08). Virtual Desktop's compositor stretches and shears
+// quad layers when the head turns, so in STEADY the HUD elements and the menu are not submitted as quads: each frame
+// they are drawn into a second, transparent projection layer (one image per eye) from the very views that layer is
+// submitted with, the same way the game image reaches the headset. Every quad keeps its pose and size, and its picture
+// comes from the same source the quad is filled from (the HUD panel image, the menu rectangle of the ImGui target).
+// Runs right before end_frame, after the HUD and menu quads were prepared, so it is outside the frame warp (no AFW
+// doubling). A SpriteBatch draws each quad with a full world-view-projection matrix (rotation UNSPECIFIED = the
+// matrix is used as is), so the panels have true perspective.
+struct PragmataSteady {
+    std::array<std::vector<XrSwapchainImageD3D12KHR>, 2> images{};
+    std::array<std::unique_ptr<DirectX::DescriptorHeap>, 2> rtv{};
+    std::array<std::unique_ptr<d3d12::CommandContext>, 3> cmds{};
+    uint32_t cmd_index{0};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    std::unique_ptr<DirectX::DX12::SpriteBatch> batch{};
+    // Shader-visible SRVs: slot 0 = HUD source, slot 1 = menu copy.
+    std::unique_ptr<DirectX::DescriptorHeap> srv{};
+    ID3D12Resource* hud_srv_res{nullptr};
+    DXGI_FORMAT hud_srv_format{DXGI_FORMAT_UNKNOWN};
+    Microsoft::WRL::ComPtr<ID3D12Resource> menu_tex{};
+    int32_t menu_w{0};
+    int32_t menu_h{0};
+    bool failed{false};
+    int rejections{0};
+};
+
+PragmataSteady g_pragmata_steady{};
+
+void pragmata_wait_steady() {
+    for (auto& c : g_pragmata_steady.cmds) {
+        if (c != nullptr) {
+            c->wait(INFINITE);
+        }
+    }
+}
+
+void pragmata_drop_steady(runtimes::OpenXR* openxr) {
+    auto& sl = openxr->steady;
+    auto& s = g_pragmata_steady;
+    pragmata_wait_steady();
+    for (auto& h : sl.swapchains) {
+        if (h != XR_NULL_HANDLE && sl.owner == openxr->session) {
+            xrDestroySwapchain(h);
+        }
+        h = XR_NULL_HANDLE;
+    }
+    sl.owner = XR_NULL_HANDLE;
+    sl.width = {};
+    sl.height = {};
+    sl.visible = false;
+    for (auto& v : s.images) v.clear();
+    for (auto& r : s.rtv) r.reset();
+    s.menu_tex.Reset();
+    s.menu_w = 0;
+    s.menu_h = 0;
+    s.hud_srv_res = nullptr;
+}
+
+bool pragmata_create_steady(runtimes::OpenXR* openxr) {
+    auto& sl = openxr->steady;
+    auto& s = g_pragmata_steady;
+    auto& hook = g_framework->get_d3d12_hook();
+    auto device = hook->get_device();
+
+    if (openxr->swapchains.size() < 2) {
+        return false;
+    }
+
+    uint32_t format_count = 0;
+    xrEnumerateSwapchainFormats(openxr->session, 0, &format_count, nullptr);
+    std::vector<int64_t> formats(format_count);
+    if (format_count > 0) {
+        xrEnumerateSwapchainFormats(openxr->session, format_count, &format_count, formats.data());
+    }
+    // Same choice as the menu quad: the sources are sampled with the formats their quads used, and an _SRGB target makes
+    // the compositor see the same colors the quads showed.
+    int64_t format = 0;
+    for (const auto wanted : {(int64_t)DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, (int64_t)DXGI_FORMAT_R8G8B8A8_UNORM}) {
+        if (std::find(formats.begin(), formats.end(), wanted) != formats.end()) {
+            format = wanted;
+            break;
+        }
+    }
+    if (format == 0) {
+        spdlog::error("[PragmataVR] Picture STEADY: the runtime offers no R8G8B8A8 swapchain format; using PANEL");
+        s.failed = true;
+        return false;
+    }
+
+    for (int eye = 0; eye < 2; ++eye) {
+        XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.format = format;
+        ci.sampleCount = 1;
+        ci.width = (uint32_t)openxr->swapchains[eye].width;
+        ci.height = (uint32_t)openxr->swapchains[eye].height;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        XrSwapchain handle{XR_NULL_HANDLE};
+        auto result = xrCreateSwapchain(openxr->session, &ci, &handle);
+        if (result != XR_SUCCESS) {
+            spdlog::error("[PragmataVR] Picture STEADY: could not create the {} eye swapchain ({} x {}): {}; using PANEL",
+                eye == 0 ? "left" : "right", ci.width, ci.height, openxr->get_result_string(result));
+            sl.owner = openxr->session;
+            pragmata_drop_steady(openxr);
+            s.failed = true;
+            return false;
+        }
+        sl.swapchains[eye] = handle;
+        sl.owner = openxr->session;
+        sl.width[eye] = (int32_t)ci.width;
+        sl.height[eye] = (int32_t)ci.height;
+
+        uint32_t image_count = 0;
+        xrEnumerateSwapchainImages(handle, 0, &image_count, nullptr);
+        s.images[eye].assign(image_count, XrSwapchainImageD3D12KHR{XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        result = xrEnumerateSwapchainImages(handle, image_count, &image_count, (XrSwapchainImageBaseHeader*)s.images[eye].data());
+        if (result != XR_SUCCESS || image_count == 0) {
+            spdlog::error("[PragmataVR] Picture STEADY: could not get the swapchain images: {}; using PANEL", openxr->get_result_string(result));
+            pragmata_drop_steady(openxr);
+            s.failed = true;
+            return false;
+        }
+        try {
+            s.rtv[eye] = std::make_unique<DirectX::DescriptorHeap>(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, image_count);
+        } catch (...) {
+            spdlog::error("[PragmataVR] Picture STEADY: could not create the RTV heap; using PANEL");
+            pragmata_drop_steady(openxr);
+            s.failed = true;
+            return false;
+        }
+        for (uint32_t i = 0; i < image_count; ++i) {
+            D3D12_RENDER_TARGET_VIEW_DESC rd{};
+            rd.Format = (DXGI_FORMAT)format;
+            rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+            device->CreateRenderTargetView(s.images[eye][i].texture, &rd, s.rtv[eye]->GetCpuHandle(i));
+        }
+    }
+
+    try {
+        if (s.batch == nullptr || s.format != (DXGI_FORMAT)format) {
+            auto queue = hook->get_command_queue();
+            DirectX::ResourceUploadBatch upload{device};
+            upload.Begin();
+            DirectX::RenderTargetState output_state{(DXGI_FORMAT)format, DXGI_FORMAT_UNKNOWN};
+            // Premultiplied alpha (the HUD buffer and the menu are premultiplied, as the quads were submitted), no depth,
+            // no culling (the sprite is mirrored vertically by its matrix).
+            DirectX::SpriteBatchPipelineStateDescription pd{output_state, &DirectX::CommonStates::AlphaBlend,
+                &DirectX::CommonStates::DepthNone, &DirectX::CommonStates::CullNone};
+            s.batch = std::make_unique<DirectX::DX12::SpriteBatch>(device, upload, pd);
+            upload.End(queue).wait();
+            s.batch->SetRotation(DXGI_MODE_ROTATION_UNSPECIFIED);
+            s.format = (DXGI_FORMAT)format;
+        }
+        if (s.srv == nullptr) {
+            s.srv = std::make_unique<DirectX::DescriptorHeap>(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 2);
+        }
+        for (auto& c : s.cmds) {
+            if (c == nullptr) {
+                c = std::make_unique<d3d12::CommandContext>();
+                if (!c->setup(L"PragmataVR steady picture")) {
+                    throw std::runtime_error{"command list"};
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("[PragmataVR] Picture STEADY: setup failed ({}); using PANEL", e.what());
+        pragmata_drop_steady(openxr);
+        s.failed = true;
+        return false;
+    } catch (...) {
+        spdlog::error("[PragmataVR] Picture STEADY: setup failed; using PANEL");
+        pragmata_drop_steady(openxr);
+        s.failed = true;
+        return false;
+    }
+
+    spdlog::info("[PragmataVR] Picture STEADY: projection layer ready, {} x {} and {} x {}, format {}, {} / {} images",
+        sl.width[0], sl.height[0], sl.width[1], sl.height[1], format, s.images[0].size(), s.images[1].size());
+    return true;
+}
+
+DirectX::XMMATRIX pragmata_pose_matrix(const XrPosef& p) {
+    return DirectX::XMMatrixRotationQuaternion(DirectX::XMVectorSet(p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w)) *
+        DirectX::XMMatrixTranslation(p.position.x, p.position.y, p.position.z);
+}
+
+// Sprite units: a quad is drawn as a 1000 x 1000 sprite (y down); this maps it onto the quad's plane in its own space
+// (meters, centered, y up).
+constexpr float STEADY_SPRITE = 1000.0f;
+DirectX::XMMATRIX pragmata_quad_local(const XrExtent2Df& size) {
+    return DirectX::XMMatrixScaling(size.width / STEADY_SPRITE, -size.height / STEADY_SPRITE, 1.0f) *
+        DirectX::XMMatrixTranslation(-size.width * 0.5f, size.height * 0.5f, 0.0f);
+}
+
+// Called right before OpenXR::end_frame, after pragmata_update_hud_quad and pragmata_update_menu_quad.
+void pragmata_update_steady(runtimes::OpenXR* openxr) {
+    auto& sl = openxr->steady;
+    auto& s = g_pragmata_steady;
+    auto& p = g_pragmata_hud;
+    auto& hud = pragmatavr::HudTuning::get();
+    const auto tune = hud.tune();
+
+    sl.visible = false;
+    const bool want = pragmatavr::picture_steady(*tune) && !s.failed;
+
+    static int last_mode = -1;
+    const int mode = want ? 1 : 0;
+    if (mode != last_mode) {
+        spdlog::info("[PragmataVR] Picture: {} (setting {}, runtime {}){}", want ? "STEADY (projection layer)" : "PANEL (quad layers)",
+            tune->picture == pragmatavr::PictureSteady ? "STEADY" : (tune->picture == pragmatavr::PicturePanel ? "PANEL" : "AUTO"),
+            pragmatavr::g_runtime_vd.load() == 1 ? "Virtual Desktop" : (pragmatavr::g_runtime_vd.load() == 0 ? "not Virtual Desktop" : "unknown"),
+            s.failed ? ", STEADY failed earlier" : "");
+        last_mode = mode;
+    }
+
+    if (!want) {
+        sl.active = false;
+        if (sl.swapchains[0] != XR_NULL_HANDLE || s.menu_tex != nullptr) {
+            pragmata_drop_steady(openxr);
+            spdlog::info("[PragmataVR] Picture: STEADY layer released");
+        }
+        return;
+    }
+    if (!openxr->ready() || openxr->frame_state.shouldRender != XR_TRUE) {
+        return; // keep the current mode; nothing is submitted this frame
+    }
+
+    if (sl.swapchains[0] != XR_NULL_HANDLE && (sl.owner != openxr->session || openxr->swapchains.size() < 2 ||
+        sl.width[0] != (int32_t)openxr->swapchains[0].width || sl.height[0] != (int32_t)openxr->swapchains[0].height ||
+        sl.width[1] != (int32_t)openxr->swapchains[1].width || sl.height[1] != (int32_t)openxr->swapchains[1].height)) {
+        pragmata_drop_steady(openxr);
+    }
+    if (sl.swapchains[0] == XR_NULL_HANDLE && !pragmata_create_steady(openxr)) {
+        sl.active = false; // PANEL this frame (and for the rest of the session if it failed for good)
+        return;
+    }
+    sl.active = true;
+
+    auto& hook = g_framework->get_d3d12_hook();
+    auto device = hook->get_device();
+
+    // What to draw: the HUD element quads and the menu quad prepared this frame.
+    const auto& hq = openxr->hud_quad;
+    ID3D12Resource* hud_src = p.steady_src;
+    const bool hud_on = hq.visible && !openxr->hud_elements.empty() && hud_src != nullptr;
+    const auto& mq = openxr->menu_quad;
+    auto& imgui_rt = g_framework->get_rendertarget_d3d12();
+    const auto& box = g_pragmata_quad.last_box;
+    const int32_t mw = (int32_t)(box.right - box.left);
+    const int32_t mh = (int32_t)(box.bottom - box.top);
+    bool menu_on = mq.visible && imgui_rt != nullptr && mw > 0 && mh > 0;
+
+    if (hud_on && (s.hud_srv_res != hud_src || s.hud_srv_format != p.src_format)) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = p.src_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : p.src_format;
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(hud_src, &sd, s.srv->GetCpuHandle(0));
+        s.hud_srv_res = hud_src;
+        s.hud_srv_format = p.src_format;
+    }
+    if (menu_on && (s.menu_tex == nullptr || mw > s.menu_w || mh > s.menu_h)) {
+        // The menu rectangle is copied here each frame (ImGui's target is R8G8B8A8_UNORM holding sRGB-encoded colors;
+        // an _SRGB copy decodes them as the menu quad's _SRGB swapchain did).
+        pragmata_wait_steady();
+        s.menu_tex.Reset();
+        const int32_t w = ((std::max)(mw, 512) + 255) / 256 * 256;
+        const int32_t h = ((std::max)(mh, 512) + 255) / 256 * 256;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = (UINT64)w;
+        rd.Height = (UINT)h;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&s.menu_tex)))) {
+            spdlog::error("[PragmataVR] Picture STEADY: could not create the menu texture");
+            s.menu_tex.Reset();
+            menu_on = false;
+        } else {
+            s.menu_w = w;
+            s.menu_h = h;
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2D.MipLevels = 1;
+            device->CreateShaderResourceView(s.menu_tex.Get(), &sd, s.srv->GetCpuHandle(1));
+        }
+    }
+
+    if (!hud_on && !menu_on) {
+        return; // nothing to show: no layer this frame (and no quads, STEADY is in effect)
+    }
+
+    // The views the layer is drawn for and submitted with, and the head pose for view-space quads.
+    std::array<XrView, 2> views{};
+    XrPosef head{{0.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 0.0f}};
+    {
+        std::scoped_lock _{openxr->sync_mtx};
+        if (openxr->stage_views.size() < 2) {
+            return;
+        }
+        views[0] = openxr->stage_views[0];
+        views[1] = openxr->stage_views[1];
+        head = openxr->view_space_location.pose;
+    }
+
+    // Acquire both eye images.
+    std::array<uint32_t, 2> index{};
+    std::array<bool, 2> acquired{};
+    bool ok = true;
+    for (int eye = 0; eye < 2 && ok; ++eye) {
+        XrSwapchainImageAcquireInfo acquire_info{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (xrAcquireSwapchainImage(sl.swapchains[eye], &acquire_info, &index[eye]) != XR_SUCCESS || index[eye] >= s.images[eye].size()) {
+            ok = false;
+            break;
+        }
+        acquired[eye] = true;
+        XrSwapchainImageWaitInfo wait_info{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wait_info.timeout = XR_INFINITE_DURATION;
+        if (xrWaitSwapchainImage(sl.swapchains[eye], &wait_info) != XR_SUCCESS) {
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        auto& ctx = *s.cmds[s.cmd_index];
+        s.cmd_index = (s.cmd_index + 1) % (uint32_t)s.cmds.size();
+        ctx.wait(INFINITE);
+        p.src_cmds.wait(INFINITE); // the HUD capture copy must be finished
+
+        std::scoped_lock _{ctx.mtx};
+        auto cl = ctx.cmd_list.Get();
+        const auto tr = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b) {
+            D3D12_RESOURCE_BARRIER br{};
+            br.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            br.Transition.pResource = r;
+            br.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            br.Transition.StateBefore = a;
+            br.Transition.StateAfter = b;
+            cl->ResourceBarrier(1, &br);
+        };
+
+        if (menu_on) {
+            tr(imgui_rt.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            tr(s.menu_tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = imgui_rt.Get();
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = s.menu_tex.Get();
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            cl->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
+            tr(s.menu_tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            tr(imgui_rt.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+        if (hud_on) {
+            tr(hud_src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+
+        ID3D12DescriptorHeap* heaps[] = {s.srv->Heap()};
+        const auto hud_desc = hud_on ? hud_src->GetDesc() : D3D12_RESOURCE_DESC{};
+        const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+        const XrSpace hud_space = openxr->hud_head_locked && openxr->view_space != XR_NULL_HANDLE ? openxr->view_space : openxr->stage_space;
+        const DirectX::XMMATRIX head_m = pragmata_pose_matrix(head);
+        const RECT dst{0, 0, (LONG)STEADY_SPRITE, (LONG)STEADY_SPRITE};
+
+        for (int eye = 0; eye < 2; ++eye) {
+            const auto rtv = s.rtv[eye]->GetCpuHandle(index[eye]);
+            cl->ClearRenderTargetView(rtv, clear, 0, nullptr);
+            cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            D3D12_VIEWPORT viewport{0.0f, 0.0f, (float)sl.width[eye], (float)sl.height[eye], D3D12_MIN_DEPTH, D3D12_MAX_DEPTH};
+            D3D12_RECT scissor{0, 0, (LONG)sl.width[eye], (LONG)sl.height[eye]};
+            cl->RSSetViewports(1, &viewport);
+            cl->RSSetScissorRects(1, &scissor);
+            cl->SetDescriptorHeaps(1, heaps);
+            s.batch->SetViewport(viewport);
+
+            // This eye's view and projection (right-handed, looking down -z, depth 0..1).
+            const auto& v = views[eye];
+            const float n = 0.05f;
+            const DirectX::XMMATRIX view = DirectX::XMMatrixInverse(nullptr, pragmata_pose_matrix(v.pose));
+            const DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveOffCenterRH(n * std::tan(v.fov.angleLeft), n * std::tan(v.fov.angleRight),
+                n * std::tan(v.fov.angleDown), n * std::tan(v.fov.angleUp), n, 1000.0f);
+            const DirectX::XMMATRIX view_proj = view * proj;
+
+            const auto draw = [&](D3D12_GPU_DESCRIPTOR_HANDLE srv, DirectX::XMUINT2 tex_size, const RECT& src_rect, const XrPosef& pose,
+                                  const XrExtent2Df& size, bool in_view_space) {
+                DirectX::XMMATRIX world = pragmata_quad_local(size) * pragmata_pose_matrix(pose);
+                if (in_view_space) {
+                    world = world * head_m;
+                }
+                s.batch->Begin(cl, DirectX::DX12::SpriteSortMode::SpriteSortMode_Immediate, world * view_proj);
+                s.batch->Draw(srv, tex_size, dst, &src_rect, DirectX::Colors::White);
+                s.batch->End();
+            };
+
+            // Same order as the quads: HUD elements under the menu.
+            if (hud_on) {
+                const size_t count = (std::min)(openxr->hud_elements.size(), (size_t)12);
+                for (size_t i = 0; i < count; ++i) {
+                    const auto& e = openxr->hud_elements[i];
+                    const RECT r{e.rect.offset.x, e.rect.offset.y, e.rect.offset.x + e.rect.extent.width, e.rect.offset.y + e.rect.extent.height};
+                    const bool in_view = (e.view_space && openxr->view_space != XR_NULL_HANDLE) || (!e.view_space && hud_space == openxr->view_space);
+                    draw(s.srv->GetGpuHandle(0), DirectX::XMUINT2{(uint32_t)hud_desc.Width, (uint32_t)hud_desc.Height}, r, e.pose, e.size, in_view);
+                }
+            }
+            if (menu_on) {
+                const RECT r{0, 0, (LONG)mw, (LONG)mh};
+                draw(s.srv->GetGpuHandle(1), DirectX::XMUINT2{(uint32_t)s.menu_w, (uint32_t)s.menu_h}, r, mq.pose, mq.size, false);
+            }
+        }
+
+        if (hud_on) {
+            tr(hud_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        }
+        ctx.has_commands = true;
+        ctx.execute();
+    }
+
+    for (int eye = 0; eye < 2; ++eye) {
+        if (acquired[eye]) {
+            XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            if (xrReleaseSwapchainImage(sl.swapchains[eye], &release_info) != XR_SUCCESS) {
+                ok = false;
+            }
+        }
+    }
+    if (!ok) {
+        return; // nothing drawn this frame: neither the layer nor the quads are submitted
+    }
+
+    for (int eye = 0; eye < 2; ++eye) {
+        sl.poses[eye] = views[eye].pose;
+        sl.fovs[eye] = views[eye].fov;
+    }
+    sl.visible = true;
+
+    static bool logged = false;
+    if (!logged && (hud_on || menu_on)) {
+        logged = true;
+        spdlog::info("[PragmataVR] Picture STEADY: first frame drawn ({} HUD elements, menu {})", hud_on ? openxr->hud_elements.size() : 0,
+            menu_on ? "shown" : "closed");
     }
 }
 } // namespace
@@ -1804,6 +2268,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 #if defined(PRAGMATA)
             pragmata_update_hud_quad(vr->m_openxr.get());
             pragmata_update_menu_quad(vr->m_openxr.get());
+            pragmata_update_steady(vr->m_openxr.get()); // 1.0.2: Picture = STEADY
 #endif
 
             auto result = vr->m_openxr->end_frame();
@@ -1817,7 +2282,18 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 // HUD panel for those and switched it off for good). Drop the HUD panel for this retry, and give up on it
                 // only if frames keep being rejected while it is shown.
                 static int hud_rejections = 0;
-                if (vr->m_openxr->hud_quad.visible) {
+                if (vr->m_openxr->steady.active && vr->m_openxr->steady.visible) {
+                    // 1.0.2: same rule for the STEADY layer: drop it for the retry; after 120 rejections use PANEL.
+                    vr->m_openxr->steady.visible = false;
+                    if (++g_pragmata_steady.rejections >= 120) {
+                        spdlog::error("[PragmataVR] Runtime keeps rejecting frames with the STEADY picture layer; Picture switched to PANEL");
+                        g_pragmata_steady.failed = true;
+                        vr->m_openxr->steady.active = false;
+                    } else if (g_pragmata_steady.rejections == 1 || g_pragmata_steady.rejections % 30 == 0) {
+                        spdlog::warn("[PragmataVR] Frame rejected while the STEADY picture layer was shown ({} so far); retrying without it",
+                            g_pragmata_steady.rejections);
+                    }
+                } else if (vr->m_openxr->hud_quad.visible) {
                     vr->m_openxr->hud_quad.visible = false;
                     if (++hud_rejections >= 120) {
                         spdlog::error("[PragmataVR] Runtime keeps rejecting frames with the HUD panel layer; HUD panel turned off");

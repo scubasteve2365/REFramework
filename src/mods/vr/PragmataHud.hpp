@@ -39,6 +39,7 @@
 #pragma comment(lib, "winmm.lib")
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <array>
 #include <atomic>
@@ -247,6 +248,22 @@ inline ReticleDepth g_reticle_depth{};
 // needs the AFW render mode (that is where the depth buffer and per-eye matrices are); with NATIVE it is not offered,
 // and a saved Depth-based setting acts as ORIGINAL (no AFW smearing to fix there).
 enum ReticleMode : int { ReticleModeOriginal = 0, ReticleModeNew = 1, ReticleModeDepth = 2 };
+// 1.0.2: Picture setting (cross-mod standard, 2026-11-08). How the HUD elements and this menu reach the headset:
+// STEADY = drawn into a projection layer (one image per eye, like the game view), PANEL = OpenXR quad layers (as before).
+// AUTO = STEADY on Virtual Desktop (its compositor stretches and shears quad layers on head turns), PANEL elsewhere.
+enum PictureMode : int { PictureAuto = 0, PictureSteady = 1, PicturePanel = 2 };
+// -1 = runtime not known yet, 0 = not Virtual Desktop, 1 = Virtual Desktop. Set by the OpenXR runtime at startup.
+inline std::atomic<int> g_runtime_vd{-1};
+// Virtual Desktop reports "VirtualDesktopXR" (also seen: "VirtualDesktopXR (Bundled)"). Loose match: lower case, without
+// spaces, hyphens and underscores, containing "virtualdesktop" or "vdxr".
+inline bool runtime_is_virtual_desktop(const std::string& name) {
+    std::string n{};
+    for (const char ch : name) {
+        if (ch == ' ' || ch == '-' || ch == '_') continue;
+        n += (char)std::tolower((unsigned char)ch);
+    }
+    return n.find("virtualdesktop") != std::string::npos || n.find("vdxr") != std::string::npos;
+}
 
 // Build 57: while a snapshot is taken, the GUI draw callbacks collect the names of every GUI drawn (steady clock ms;
 // PragmataFixes logs them), to identify effects such as the low health screen edges.
@@ -324,6 +341,7 @@ struct HudTune {
     bool subtitle_pin{true};
     // Build 62: developer switch, like Reticle: true = NEW (subtitles on their own panel), false = ORIGINAL (as v0.9.1).
     bool subtitles_new{true}; // Build 63: ORIGINAL by default (experimental). Build 68: NEW by default (fresh installs)
+    int picture{0}; // 1.0.2: PictureMode (AUTO by default)
     // Build 66: 1 = objective banner and subtitles take turns in their shared capture spot (both stay on their panels);
     // 0 = Build 62 behaviour (the subtitles give way, drawn in the eyes, while the objective banner shows).
     bool subtitle_share{true};
@@ -520,6 +538,12 @@ inline bool reticle_layer_on(const HudTune& t) {
 }
 inline bool reticle_depth_on(const HudTune& t) {
     return reticle_mode(t) == ReticleModeDepth;
+}
+// 1.0.2: the Picture mode in effect: true = STEADY (projection layer), false = PANEL (quad layers).
+inline bool picture_steady(const HudTune& t) {
+    if (t.picture == PictureSteady) return true;
+    if (t.picture == PicturePanel) return false;
+    return g_runtime_vd.load(std::memory_order_relaxed) == 1;
 }
 inline int reticle_mode_next(const HudTune& t) {
     switch (reticle_mode(t)) {
@@ -808,6 +832,7 @@ enum MenuAction : int {
     ActionToggleSubtitleMode,   // Build 62
     ActionReloadTextures,       // Build 62 (developer test)
     ActionToggleMaxDetail,      // Build 68
+    ActionTogglePicture,        // 1.0.2
 };
 
 class HudTuning {
@@ -1245,6 +1270,8 @@ private:
             "A = Native (both eyes from the same moment, best 3D) or AFW (one eye per frame, the other warped, faster)");
         add_row(MenuRow::Kind::Toggle, -1, -1, ActionToggleHudPanel, "HUD mode",
             "A = Fixed (the HUD stays put in one place in front of you) or Follows Head (the HUD moves with your headset)");
+        add_row(MenuRow::Kind::Toggle, -1, -1, ActionTogglePicture, "Picture",
+            "A = Auto (Steady on Virtual Desktop, Panel elsewhere), Steady (HUD and menu drawn into the view) or Panel (own layers)");
         add_row(MenuRow::Kind::Action, -1, -1, ActionRecenterView, "Recenter",
             "A = recenter everything where you are now: the game view (like SteamVR or Quest recenter), the HUD and this menu");
         column = 1;
@@ -1532,6 +1559,9 @@ private:
         s += "# subtitle_pin: 1 = subtitles held at their screen spot while shown on their panel (not next to the speaker).\n";
         s += fmt::format("subtitle_gui={}\n", t.subtitle_gui.empty() ? std::string{"none"} : t.subtitle_gui);
         s += fmt::format("subtitle_pin={}\n", t.subtitle_pin ? 1 : 0);
+        s += "# picture (1.0.2): 0 = AUTO (STEADY on Virtual Desktop, PANEL elsewhere), 1 = STEADY (HUD and menu drawn into a\n";
+        s += "#   projection layer), 2 = PANEL (HUD elements and menu as OpenXR quad layers).\n";
+        s += fmt::format("picture={}\n", t.picture);
         s += "# subtitles_new: 1 = subtitles on their own panel, 0 = original drawing (Build 62).\n";
         s += fmt::format("subtitles_new={}\n", t.subtitles_new ? 1 : 0);
         s += "# subtitle_share: 1 = objective banner and subtitles take turns in their shared capture spot, both on their\n";
@@ -1774,6 +1804,7 @@ private:
                 else if (key == "reticle_depth_smooth") t->reticle_depth_smooth = std::clamp(val, 0.0f, 1.0f);
                 else if (key == "subtitle_pin") t->subtitle_pin = val != 0.0f;
                 else if (key == "subtitles_new") t->subtitles_new = val != 0.0f;
+                else if (key == "picture") t->picture = std::clamp((int)std::lround(val), 0, 2);
                 else if (key == "subtitle_share") t->subtitle_share = val != 0.0f;
                 else if (key == "subtitle_menu_native") t->subtitle_menu_native = val != 0.0f;
                 else if (key == "items_area") t->items_area = std::clamp((int)val, 0, 2);
@@ -2288,6 +2319,13 @@ private:
                     t->subtitles_new = !t->subtitles_new;
                     commit(t);
                     spdlog::info("[PragmataVR] Menu: subtitles {}", t->subtitles_new ? "new" : "original");
+                    play_click(true);
+                } else if (row.action == ActionTogglePicture) {
+                    // 1.0.2: AUTO -> STEADY -> PANEL -> AUTO.
+                    t->picture = (t->picture + 1) % 3;
+                    commit(t);
+                    spdlog::info("[PragmataVR] Menu: picture {} (now {})", t->picture == PictureSteady ? "steady" : (t->picture == PicturePanel ? "panel" : "auto"),
+                        picture_steady(*t) ? "STEADY" : "PANEL");
                     play_click(true);
                 } else if (row.action == ActionToggleReticleMode) {
                     // Build 69: ORIGINAL -> NEW -> DEPTH-BASED (AFW render mode only) -> ORIGINAL.

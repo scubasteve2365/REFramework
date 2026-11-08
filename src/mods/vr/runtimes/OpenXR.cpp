@@ -469,6 +469,11 @@ VRRuntime::Error OpenXR::update_matrices(float nearz, float farz) {
             XrInstanceProperties props{XR_TYPE_INSTANCE_PROPERTIES};
             if (xrGetInstanceProperties(this->instance, &props) == XR_SUCCESS) {
                 runtime_name = props.runtimeName;
+                // 1.0.2: Picture = AUTO uses STEADY on Virtual Desktop, PANEL elsewhere.
+                const bool vd = pragmatavr::runtime_is_virtual_desktop(runtime_name);
+                pragmatavr::g_runtime_vd.store(vd ? 1 : 0, std::memory_order_relaxed);
+                spdlog::info("[PragmataVR] Picture: runtime \"{}\" is {}Virtual Desktop, AUTO picks {}", runtime_name, vd ? "" : "not ",
+                    vd ? "STEADY (projection layer)" : "PANEL (quad layers)");
                 spdlog::info("[PragmataVR] Headset: OpenXR runtime {} {}.{}.{}", props.runtimeName,
                     XR_VERSION_MAJOR(props.runtimeVersion), XR_VERSION_MINOR(props.runtimeVersion), XR_VERSION_PATCH(props.runtimeVersion));
             }
@@ -1633,6 +1638,8 @@ XrResult OpenXR::end_frame() {
     XrCompositionLayerQuad menu_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     XrCompositionLayerQuad hud_layer{XR_TYPE_COMPOSITION_LAYER_QUAD};
     std::array<XrCompositionLayerQuad, 12> hud_element_layers{}; // PragmataVR Build 56. Build 61: 8 elements now (subtitles, reticle)
+    XrCompositionLayerProjection steady_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION}; // PragmataVR 1.0.2
+    std::array<XrCompositionLayerProjectionView, 2> steady_views{};
 
     // we CANT push the layers every time, it cause some layer error
     // in xrEndFrame, so we must only do it when shouldRender is true
@@ -1657,8 +1664,30 @@ XrResult OpenXR::end_frame() {
 
         // HUD elements (PragmataVR Build 17, Build 56: one quad per element), under the menu. The UI buffer holds
         // premultiplied alpha. Fixed: room space. Follows Head: view space.
+        // PragmataVR 1.0.2, Picture = STEADY: the HUD and the menu were drawn into one transparent projection layer
+        // (pragmata_update_steady) with the same views as the game image, and replace the quads below.
+        const auto& sl = this->steady;
+        if (sl.active && sl.visible && sl.owner == this->session && sl.swapchains[0] != XR_NULL_HANDLE && sl.swapchains[1] != XR_NULL_HANDLE &&
+            projection_layer_views.size() == 2) {
+            for (size_t i = 0; i < 2; ++i) {
+                auto& v = steady_views[i];
+                v = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                v.pose = sl.poses[i];
+                v.fov = sl.fovs[i];
+                v.subImage.swapchain = sl.swapchains[i];
+                v.subImage.imageRect.offset = {0, 0};
+                v.subImage.imageRect.extent = {sl.width[i], sl.height[i]};
+                v.subImage.imageArrayIndex = 0;
+            }
+            steady_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT; // premultiplied alpha
+            steady_layer.space = this->stage_space;
+            steady_layer.viewCount = 2;
+            steady_layer.views = steady_views.data();
+            layers.push_back((XrCompositionLayerBaseHeader*)&steady_layer);
+        }
+
         const auto& hq = this->hud_quad;
-        if (hq.visible && hq.swapchain != XR_NULL_HANDLE && hq.owner == this->session && hq.used_width > 0 && hq.used_height > 0) {
+        if (!sl.active && hq.visible && hq.swapchain != XR_NULL_HANDLE && hq.owner == this->session && hq.used_width > 0 && hq.used_height > 0) {
             const XrSpace hud_space = this->hud_head_locked && this->view_space != XR_NULL_HANDLE ? this->view_space : this->stage_space;
             const size_t n = (std::min)(this->hud_elements.size(), hud_element_layers.size());
             for (size_t i = 0; i < n; ++i) {
@@ -1679,7 +1708,7 @@ XrResult OpenXR::end_frame() {
 
         // Room-fixed menu panel, composited by the runtime on top of the eye images (PragmataVR mod menu).
         const auto& mq = this->menu_quad;
-        if (mq.visible && mq.swapchain != XR_NULL_HANDLE && mq.owner == this->session && mq.used_width > 0 && mq.used_height > 0) {
+        if (!sl.active && mq.visible && mq.swapchain != XR_NULL_HANDLE && mq.owner == this->session && mq.used_width > 0 && mq.used_height > 0) {
             menu_layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
             menu_layer.space = this->stage_space;
             menu_layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
