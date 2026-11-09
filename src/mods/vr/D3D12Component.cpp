@@ -1849,6 +1849,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                     if (SUCCEEDED(hr)) {
                         spdlog::info("[PragmataVR] Snapshot saved: {}", png.string());
+                        // 1.1.1: a JPG too, the only picture type RigA's VRDrop watcher can send to the test rig.
+                        const auto jpg = dir / (hud.snapshot_stem + (i == 0 ? "_left.jpg" : "_right.jpg"));
+                        const auto jhr = DirectX::SaveWICTextureToFile(command_queue, snap_tex[i].Get(), GUID_ContainerFormatJpeg, jpg.wstring().c_str(),
+                            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, &GUID_WICPixelFormat24bppBGR);
+                        if (FAILED(jhr)) {
+                            spdlog::info("[PragmataVR] Snapshot JPG failed: {}", jpg.string());
+                        }
                     } else {
                         const auto dds = dir / (hud.snapshot_stem + (i == 0 ? "_left.dds" : "_right.dds"));
                         hr = DirectX::SaveDDSTextureToFile(command_queue, snap_tex[i].Get(), dds.wstring().c_str(),

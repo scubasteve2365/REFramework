@@ -31,6 +31,10 @@
 //   zzzzzz_pragmata_door_hack_inspect.lua  ui3500Gui, ui3510Gui: VFXtex effect textures hidden
 //   zzzzzzzz_pragmata_hud_orange_test.lua  ui2130Gui: hackingGauge_VFX effect texture hidden
 //   Build 42                               ui3500Gui, ui3510Gui: dimming overlays PNL_1, PNL_, rect_1, rect_ hidden
+//   1.1.1                                  ui3400Gui (hacking grid): via.gui.EffectTexture / via.gui.Effect pieces hidden.
+//                                          Late game the grid gets a cyan swirl, an orange / pink smear and a yellow
+//                                          stroke that cover it (Steve's snapshots 1794192763 to 1794192770). Found by
+//                                          type, because their names are not known yet; each one is logged when hidden.
 
 #include <algorithm>
 #include <array>
@@ -189,6 +193,7 @@ private:
         KindDoor = 1u << 2,
         KindLabel = 1u << 3,
         KindSubtitle = 1u << 4, // Build 58
+        KindHack = 1u << 5,     // 1.1.1
     };
 
     struct Target {
@@ -197,7 +202,7 @@ private:
         uint32_t kinds;
     };
 
-    static inline const std::array<Target, 10> TARGETS{{
+    static inline const std::array<Target, 11> TARGETS{{
         {"ui2100Gui", "ui2100Gui"_fnv, KindGhost},
         {"ui2110Gui", "ui2110Gui"_fnv, KindGhost},
         {"ui2120Gui", "ui2120Gui"_fnv, KindGhost},
@@ -208,12 +213,13 @@ private:
         {"ui3500Gui", "ui3500Gui"_fnv, KindDoor},
         {"ui3510Gui", "ui3510Gui"_fnv, KindDoor},
         {"ui3010Gui", "ui3010Gui"_fnv, KindLabel},
+        {"ui3400Gui", "ui3400Gui"_fnv, KindHack},
     }};
 
     // Only elements drawn within this window are looked up (absent HUD screens cost nothing).
     static constexpr int64_t SEEN_WINDOW_MS = 2000;
 
-    static inline std::array<std::atomic<int64_t>, 10> s_seen_ms{};
+    static inline std::array<std::atomic<int64_t>, 11> s_seen_ms{};
     // Build 61: the subtitle GUI (named in the ini, so it is not in TARGETS).
     static inline std::atomic<int64_t> s_subtitle_seen_ms{0};
     static inline bool s_announced{false};
@@ -283,7 +289,11 @@ private:
                 }
                 spdlog::info("[PragmataVR] Snapshot texts in {}:{}", n, line);
             }
-            if (snapshots <= 4 && (n == tune->subtitle_gui || n == "ui2120Gui")) {
+            // 1.1.1: the hacking grid and the one GUI drawn with it that we have no notes on.
+            static int hack_dumps = 0;
+            const bool hack_dump = (n == "ui3400Gui" || n == "ui6050Gui") && hack_dumps < 10;
+            hack_dumps += hack_dump ? 1 : 0;
+            if (hack_dump || (snapshots <= 4 && (n == tune->subtitle_gui || n == "ui2120Gui"))) {
                 spdlog::info("[PragmataVR] Layout dump {} (snapshot) (view type {}):", n, sdk::call_object_func<uint32_t>(view, "get_ViewType", ctx, view));
                 int count = 0;
                 dump_node(view, 0, count, ctx);
@@ -429,8 +439,11 @@ private:
             }
             // Build 54: one-time layout dumps of the objective banner and the item pickups element, to find the piece
             // that clips them when Size is below 1.
-            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv) { // Build 55: tutorial too
+            if (tg.hash == "ui2110Gui"_fnv || tg.hash == "ui2120Gui"_fnv || tg.hash == "ui2100Gui"_fnv || tg.hash == "ui3400Gui"_fnv) { // Build 55: tutorial too; 1.1.1: hacking grid
                 maybe_dump(view, tg, now, ctx);
+            }
+            if (tg.kinds & KindHack) {
+                hack_vfx(view, tg, tune->fix_hack_vfx, ctx); // 1.1.1: after the dump, so a dump shows the pieces as the game left them
             }
         }
 
@@ -705,6 +718,59 @@ private:
                     dump_node(child, depth + 1, count, ctx);
                 }
             }
+            if (depth == 0) {
+                break; // the view itself has no siblings to list
+            }
+            c = sdk::call_object_func<REManagedObject*>(c, "get_Next", ctx, c);
+        }
+    }
+
+    // 1.1.1: every via.gui.EffectTexture / via.gui.Effect piece of the hacking grid, hidden while it is shown (the game
+    // shows them again as the puzzle plays, so this runs each frame the grid is drawn; only visible ones are written).
+    // Main thread. Pieces this fix hid are shown again when fix_hack_vfx is turned off.
+    static inline std::set<REManagedObject*> s_hack_vfx_hidden{};
+
+    static void hack_vfx(REManagedObject* view, const Target& tg, bool hide, sdk::VMContext* ctx) {
+        if (!hide && s_hack_vfx_hidden.empty()) {
+            return;
+        }
+        static auto effect_tex = sdk::find_type_definition("via.gui.EffectTexture");
+        static auto effect = sdk::find_type_definition("via.gui.Effect");
+        std::vector<REManagedObject*> chain{};
+        int nodes = 0;
+        hack_vfx_walk(view, 0, chain, nodes, tg, hide, effect_tex, effect, ctx);
+    }
+
+    static void hack_vfx_walk(REManagedObject* o, int depth, std::vector<REManagedObject*>& chain, int& nodes, const Target& tg, bool hide,
+                              sdk::RETypeDefinition* effect_tex, sdk::RETypeDefinition* effect, sdk::VMContext* ctx) {
+        for (auto c = o; c != nullptr && nodes < 800; ) {
+            ++nodes;
+            const auto td = utility::re_managed_object::get_type_definition(c);
+            chain.push_back(c);
+            if (td != nullptr && (td == effect_tex || td == effect)) {
+                if (hide) {
+                    if (sdk::call_object_func<bool>(c, "get_Visible", ctx, c)) {
+                        sdk::call_object_func<void*>(c, "set_Visible", ctx, c, false);
+                        if (s_hack_vfx_hidden.insert(c).second) {
+                            std::string path{};
+                            for (auto p : chain) {
+                                auto nm = sdk::call_object_func<SystemString*>(p, "get_Name", ctx, p);
+                                path += "/" + (nm != nullptr ? utility::re_string::get_string(nm) : std::string{"?"});
+                            }
+                            log_once(utility::hash(path), fmt::format("{}: effect piece {} [{}] hidden", tg.name, path, td->get_full_name()));
+                        }
+                    }
+                } else if (s_hack_vfx_hidden.erase(c) != 0) {
+                    sdk::call_object_func<void*>(c, "set_Visible", ctx, c, true);
+                }
+            }
+            if (depth < 16) {
+                auto child = sdk::call_object_func<REManagedObject*>(c, "get_Child", ctx, c);
+                if (child != nullptr) {
+                    hack_vfx_walk(child, depth + 1, chain, nodes, tg, hide, effect_tex, effect, ctx);
+                }
+            }
+            chain.pop_back();
             if (depth == 0) {
                 break; // the view itself has no siblings to list
             }

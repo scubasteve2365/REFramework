@@ -421,6 +421,7 @@ struct HudTune {
     bool fix_label{true};     // ui3010Gui location label brightness
     bool fix_door_vfx{true};  // ui3500Gui / ui3510Gui VFXtex effect textures hidden
     bool fix_gauge_vfx{true}; // ui2130Gui hackingGauge_VFX effect texture hidden
+    bool fix_hack_vfx{true};  // 1.1.1: ui3400Gui hacking grid effect pieces hidden
     bool marker_fix{true};      // Build 50: correct enemy bars / damage numbers / world markers for the headset projection
     float marker_vscale{1.6f};  // Build 50: vertical factor of that correction (1.6 matched the Quest 3 by eye)
     bool screen_probe{false}; // Build 48: diagnostic, find the game's world-to-screen function for the enemy markers (ini only)
@@ -1611,6 +1612,7 @@ private:
         s += fmt::format("fix_label={}\n", t.fix_label ? 1 : 0);
         s += fmt::format("fix_door_vfx={}\n", t.fix_door_vfx ? 1 : 0);
         s += fmt::format("fix_gauge_vfx={}\n", t.fix_gauge_vfx ? 1 : 0);
+        s += fmt::format("fix_hack_vfx={}\n", t.fix_hack_vfx ? 1 : 0);
         s += "# screen_probe (Build 48, diagnostic): 1 = log which game functions turn world positions into screen positions.\n";
         s += fmt::format("screen_probe={}\n", t.screen_probe ? 1 : 0);
         s += fmt::format("enemy_bar.locked={}\n", t.enemy_locked ? 1 : 0);
@@ -1830,6 +1832,7 @@ private:
                 else if (key == "fix_label") t->fix_label = val != 0.0f;
                 else if (key == "fix_door_vfx") t->fix_door_vfx = val != 0.0f;
                 else if (key == "fix_gauge_vfx") t->fix_gauge_vfx = val != 0.0f;
+                else if (key == "fix_hack_vfx") t->fix_hack_vfx = val != 0.0f;
                 else if (key == "screen_probe") t->screen_probe = val != 0.0f;
                 else if (key == "marker_fix") t->marker_fix = val != 0.0f;
                 else if (key == "damage_locked") t->damage_locked = val != 0.0f;
